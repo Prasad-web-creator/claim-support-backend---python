@@ -4,7 +4,7 @@ Mock authentication for testing.
 """
 
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, status
 from pydantic import BaseModel
 
 from app.core.security import create_access_token, generate_refresh_token, get_refresh_token_expiry
@@ -15,7 +15,7 @@ from app.middleware.auth import get_current_user
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
 
-@router.post("/register", response_model=TokenResponse)
+@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(request: RegisterRequest):
     """Register a new user (mock implementation)."""
     # Check if user exists
