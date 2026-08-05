@@ -318,3 +318,219 @@ PRESCRIPTION_FIELDS = [
 ]
 
 REQUIRED_PRESCRIPTION_FIELDS = ["patientName", "diagnosis"]
+
+# Unified metadata extraction prompt for Policy and Prescription documents
+METADATA_EXTRACTION_PROMPT = """
+You are an expert Health Insurance Document Information Extraction AI.
+
+Your task is to extract structured metadata from the provided Policy document or Prescription/Medical document.
+
+This is NOT a coverage analysis task.
+
+Do NOT explain anything.
+Do NOT summarize.
+Do NOT infer missing information.
+Do NOT guess values.
+Extract only information explicitly present in the document.
+
+----------------------------------------
+GENERAL RULES
+----------------------------------------
+
+1. Return ONLY valid JSON.
+2. Never include markdown.
+3. Never include comments.
+4. Never fabricate values.
+5. If a field cannot be found, return null.
+6. Preserve original spellings.
+7. Preserve numbers exactly.
+8. Convert all dates into YYYY-MM-DD format whenever possible.
+9. If multiple values exist, choose the most relevant value.
+10. If confidence is low, return null.
+11. Do not invent hospital names, policy numbers, patient names, or dates.
+12. Empty strings are not allowed.
+13. Arrays should be empty when no values exist.
+14. Currency should be numeric whenever possible.
+15. Return only the JSON object.
+
+==================================================
+SECTION A
+POLICY METADATA
+==================================================
+
+Extract the following fields only if they are present.
+
+{
+  "document_type": "policy",
+
+  "provider_name": null,
+
+  "policy_number": null,
+
+  "policy_type": null,
+
+  "plan_name": null,
+
+  "policy_holder_name": null,
+
+  "insured_person_name": null,
+
+  "member_id": null,
+
+  "certificate_number": null,
+
+  "customer_id": null,
+
+  "sum_insured": null,
+
+  "available_sum_insured": null,
+
+  "cumulative_bonus": null,
+
+  "policy_start_date": null,
+
+  "policy_expiry_date": null,
+
+  "policy_issue_date": null,
+
+  "renewal_date": null,
+
+  "waiting_period": null,
+
+  "pre_existing_waiting_period": null,
+
+  "room_rent_limit": null,
+
+  "icu_limit": null,
+
+  "co_payment_percentage": null,
+
+  "deductible_amount": null,
+
+  "network_type": null,
+
+  "cashless_available": null,
+
+  "coverage_type": null,
+
+  "policy_status": null,
+
+  "nominee_name": null,
+
+  "agent_name": null,
+
+  "agent_code": null,
+
+  "policy_branch": null,
+
+  "contact_number": null,
+
+  "email": null,
+
+  "address": null
+}
+
+==================================================
+SECTION B
+PRESCRIPTION / MEDICAL METADATA
+==================================================
+
+Extract the following fields only if they are present.
+
+{
+  "document_type": "prescription",
+
+  "patient_name": null,
+
+  "patient_age": null,
+
+  "patient_gender": null,
+
+  "patient_id": null,
+
+  "hospital_name": null,
+
+  "clinic_name": null,
+
+  "doctor_name": null,
+
+  "doctor_registration_number": null,
+
+  "department": null,
+
+  "specialization": null,
+
+  "hospital_visit_date": null,
+
+  "consultation_date": null,
+
+  "admission_date": null,
+
+  "discharge_date": null,
+
+  "follow_up_date": null,
+
+  "diagnosis": [],
+
+  "icd_codes": [],
+
+  "symptoms": [],
+
+  "medical_history": [],
+
+  "allergies": [],
+
+  "vital_signs": {
+      "blood_pressure": null,
+      "pulse": null,
+      "temperature": null,
+      "oxygen_saturation": null,
+      "weight": null,
+      "height": null,
+      "bmi": null
+  },
+
+  "prescribed_medicines": [],
+
+  "recommended_tests": [],
+
+  "recommended_procedures": [],
+
+  "surgeries": [],
+
+  "hospitalization_required": null,
+
+  "emergency_case": null,
+
+  "estimated_cost": null,
+
+  "insurance_reference_number": null
+}
+
+==================================================
+OUTPUT RULES
+==================================================
+
+Return ONLY one JSON object.
+
+If the uploaded document is a Policy,
+return only the Policy metadata object.
+
+If the uploaded document is a Prescription,
+return only the Prescription metadata object.
+
+Do not return both.
+
+If a field is missing, return null.
+
+If an array has no values, return [].
+
+Do not add additional fields.
+
+Do not rename fields.
+
+Do not change field casing.
+
+The response must be valid JSON that can be directly parsed by the backend.
+"""
+

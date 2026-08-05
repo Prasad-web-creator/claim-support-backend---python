@@ -38,7 +38,15 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
         
     async def get_recent_analyses():
         reports = await AnalysisReport.find(AnalysisReport.user_id == user_id).sort("-_id").limit(5).to_list()
-        return [{"id": str(r.id), "status": r.status, "overallStatus": r.overall_status, "dominanceScore": r.dominance_score, "processingTimeMs": r.processing_time_ms, "createdAt": r.id.generation_time} for r in reports]
+        return [{
+            "id": str(r.id),
+            "status": r.status,
+            "overallStatus": r.overall_status,
+            "dominanceScore": r.dominance_score,
+            "processingTimeMs": r.processing_time_ms,
+            "reportNumber": r.report_number,
+            "createdAt": r.created_at.isoformat() if r.created_at else r.id.generation_time.isoformat()
+        } for r in reports]
 
     results = await asyncio.gather(
         get_total_policies(),

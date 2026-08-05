@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from beanie import PydanticObjectId as ObjectId
 from app.core.logging import logger
 from app.models.stored_file import StoredFile
 from app.services.storage.gridfs_provider import GridFSProvider
@@ -112,7 +113,6 @@ class FileUploadService:
     @staticmethod
     async def delete_file(stored_file_id: str, deleted_by_user_id: str) -> None:
         """Delete a file from storage and metadata."""
-        from bson import ObjectId
         record = await StoredFile.get(ObjectId(stored_file_id))
         if not record:
             raise ValueError(f"StoredFile not found: {stored_file_id}")
@@ -127,7 +127,6 @@ class FileUploadService:
     @staticmethod
     async def generate_signed_url(stored_file_id: str) -> str:
         """Generate a temporary signed URL (or stream route) for download."""
-        from bson import ObjectId
         record = await StoredFile.get(ObjectId(stored_file_id))
         if not record or record.is_deleted:
             raise ValueError(f"StoredFile not found or deleted: {stored_file_id}")

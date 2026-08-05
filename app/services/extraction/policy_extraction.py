@@ -39,16 +39,29 @@ async def extract_policy_details(policy_text: str) -> dict:
     total_llm_processing = 0.0
     total_json_parsing = 0.0
     
-    for i, chunk in enumerate(chunks):
+    import asyncio
+    
+    async def extract_chunk(i, chunk):
         logger.info(f"[PolicyExtraction] Processing chunk {i+1}/{len(chunks)}...")
         try:
-            # Restored max_tokens to 4000 to prevent JSON truncation
             result = await extract_json_with_retry(
                 system_prompt=POLICY_EXTRACTION_PROMPT,
                 user_content=chunk,
                 max_tokens=4000
             )
-            
+            return i, result
+        except Exception as e:
+            logger.error(f"[PolicyExtraction] Error extracting chunk {i+1}: {e}")
+            return i, None
+
+    tasks = [extract_chunk(i, chunk) for i, chunk in enumerate(chunks)]
+    results = await asyncio.gather(*tasks)
+
+    # Sort results to ensure original order
+    results.sort(key=lambda x: x[0])
+    
+    for _, result in results:
+        if result:
             if "timing" in result:
                 total_prompt_prep += result["timing"].get("promptPreparationSec", 0)
                 total_llm_processing += result["timing"].get("llmProcessingSec", 0)
@@ -56,8 +69,6 @@ async def extract_policy_details(policy_text: str) -> dict:
                 
             if result.get("extractedJson"):
                 extracted_jsons.append(result["extractedJson"])
-        except Exception as e:
-            logger.error(f"[PolicyExtraction] Error extracting chunk {i+1}: {e}")
             
     if not extracted_jsons:
         return {

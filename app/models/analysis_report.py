@@ -3,6 +3,7 @@ AnalysisReport document model — migrated from AnalysisReport.js (Mongoose).
 Stores the complete output of the 11-stage AI analysis pipeline.
 """
 
+from datetime import datetime
 from typing import Any, Optional
 
 from beanie import Document, Indexed, before_event, Insert
@@ -25,9 +26,11 @@ class AnalysisReport(Document):
 
     # ─── Stage 4: Extracted Policy JSON ───────────────────────────────────────
     policy_json: Optional[dict] = Field(default=None, alias="policyJson")
+    policy_metadata: Optional[dict] = Field(default=None, alias="policyMetadata")
 
     # ─── Stage 5: Extracted Prescription JSON ─────────────────────────────────
     prescription_json: Optional[dict] = Field(default=None, alias="prescriptionJson")
+    prescription_metadata: Optional[dict] = Field(default=None, alias="prescriptionMetadata")
 
     # ─── Stage 7: Business Rule Engine Results ────────────────────────────────
     business_rules: Optional[dict] = Field(default=None, alias="businessRules")
@@ -60,6 +63,8 @@ class AnalysisReport(Document):
     report_number: Optional[int] = Field(default=None, alias="reportNumber")
 
     # Base schema fields
+    created_at: Optional[datetime] = Field(default_factory=datetime.utcnow, alias="createdAt")
+    updated_at: Optional[datetime] = Field(default_factory=datetime.utcnow, alias="updatedAt")
     created_by: Optional[str] = Field(default=None, alias="createdBy")
     updated_by: Optional[str] = Field(default=None, alias="updatedBy")
     is_deleted: bool = Field(default=False, alias="isDeleted")

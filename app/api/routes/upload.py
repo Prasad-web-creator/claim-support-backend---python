@@ -62,7 +62,7 @@ async def upload_file(
 @router.get("/{file_id}")
 async def stream_file(file_id: str, current_user: dict = Depends(get_current_user)):
     """Stream a file from GridFS."""
-    from bson import ObjectId
+    from beanie import PydanticObjectId as ObjectId
     
     try:
         stored_file = await StoredFile.get(ObjectId(file_id))

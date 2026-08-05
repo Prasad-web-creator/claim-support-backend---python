@@ -17,6 +17,8 @@ class Prescription(Document):
     user_id: Indexed(str) = Field(alias="userId")  # type: ignore[valid-type]
     hospital_name: Optional[str] = Field(default=None, alias="hospitalName", max_length=255)
     doctor_name: Optional[str] = Field(default=None, alias="doctorName", max_length=255)
+    patient_name: Optional[str] = Field(default=None, alias="patientName", max_length=255)
+    prescription_number: Optional[str] = Field(default=None, alias="prescriptionNumber", max_length=255)
     visit_date: Optional[datetime] = Field(default=None, alias="visitDate")
     diagnosis: Optional[str] = Field(default=None, alias="diagnosis", max_length=1000)
     grid_fs_file_id: Optional[str] = Field(default=None, alias="gridFsFileId")
@@ -25,10 +27,18 @@ class Prescription(Document):
     file_size: Optional[int] = Field(default=None, alias="fileSize", ge=0)
     sequence_number: Optional[int] = Field(default=None, alias="sequenceNumber", ge=0)
 
+    # Extraction & Metadata Data
+    extracted_prescription_text: Optional[str] = Field(default=None, alias="extractedPrescriptionText")
+    extracted_prescription_json: Optional[dict] = Field(default=None, alias="extractedPrescriptionJson")
+    metadata: Optional[dict] = Field(default=None, alias="metadata")
+    processing_status: str = Field(default="completed", alias="processingStatus") # pending, processing, completed, failed
+
     # Agreement subdocument
     agreement: Optional[dict] = None
 
     # Base schema fields
+    created_at: Optional[datetime] = Field(default_factory=datetime.utcnow, alias="createdAt")
+    updated_at: Optional[datetime] = Field(default_factory=datetime.utcnow, alias="updatedAt")
     created_by: Optional[str] = Field(default=None, alias="createdBy")
     updated_by: Optional[str] = Field(default=None, alias="updatedBy")
     is_deleted: bool = Field(default=False, alias="isDeleted")

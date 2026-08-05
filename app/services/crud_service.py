@@ -4,8 +4,7 @@ Handles generic create, read, update, delete operations for Models.
 """
 
 from typing import TypeVar, Type, Any
-from bson import ObjectId
-from beanie import Document
+from beanie import Document, PydanticObjectId as ObjectId
 from pydantic import BaseModel
 
 from app.core.logging import logger
@@ -40,7 +39,6 @@ class CrudService:
         # Link StoredFile if applicable
         file_id = data.get("gridFsFileId") or data.get("grid_fs_file_id")
         if file_id:
-            from bson import ObjectId
             from app.models.stored_file import StoredFile
             try:
                 sf = await StoredFile.get(ObjectId(file_id))
@@ -190,6 +188,11 @@ class CrudService:
             dct = d.dict(by_alias=True)
             if "_id" in dct and dct["_id"] is not None:
                 dct["_id"] = str(dct["_id"])
+            if not dct.get("createdAt") and hasattr(d, "id") and d.id:
+                try:
+                    dct["createdAt"] = d.id.generation_time.isoformat()
+                except Exception:
+                    pass
             return dct
 
         return {

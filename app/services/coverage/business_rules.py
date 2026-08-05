@@ -154,9 +154,29 @@ def _parse_date(date_str: str | None) -> datetime | None:
     if not date_str:
         return None
     
-    from dateutil import parser
+    # Try dateutil if available
     try:
-        # Ignore timezone info for basic comparisons
-        return parser.parse(date_str).replace(tzinfo=None)
+        from dateutil import parser
+        return parser.parse(str(date_str)).replace(tzinfo=None)
     except Exception:
-        return None
+        pass
+
+    # Standard formats fallback
+    clean_str = str(date_str).strip()
+    for fmt in (
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%m/%d/%Y",
+        "%Y/%m/%d",
+        "%d.%m.%Y",
+        "%d-%b-%Y",
+        "%d-%B-%Y",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+    ):
+        try:
+            return datetime.strptime(clean_str.split("T")[0] if "T" not in fmt and "T" in clean_str else clean_str, fmt)
+        except Exception:
+            continue
+    return None

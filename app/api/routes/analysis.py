@@ -40,7 +40,8 @@ async def start_analysis(
             user_id=current_user["id"],
             policy_file_id=request.policyPath,
             policy_doc_id=request.policyId,
-            prescription_id=request.prescriptionPath
+            prescription_id=request.prescriptionPath,
+            background_tasks=background_tasks
         )
         # The mobile app expects `success: true` and `reportId` at the root, along with all data.
         return {
@@ -85,6 +86,15 @@ async def list_analyses(
         elif "id" in d and d["id"]:
             d["_id"] = str(d["id"])
             d["id"] = d["_id"]
+            
+        if not d.get("createdAt") and r.id:
+            try:
+                d["createdAt"] = r.id.generation_time.isoformat()
+            except Exception:
+                pass
+        if not d.get("updatedAt") and d.get("createdAt"):
+            d["updatedAt"] = d["createdAt"]
+
         reports_dict.append(d)
     
     return {
@@ -108,7 +118,7 @@ async def get_analysis(
 ):
     """Get full analysis report by ID."""
     from app.models.analysis_report import AnalysisReport
-    from bson import ObjectId
+    from beanie import PydanticObjectId as ObjectId
     try:
         report = await AnalysisReport.get(ObjectId(report_id))
     except Exception:
@@ -124,6 +134,15 @@ async def get_analysis(
     elif "id" in d and d["id"]:
         d["_id"] = str(d["id"])
         d["id"] = d["_id"]
+        
+    if not d.get("createdAt") and report.id:
+        try:
+            d["createdAt"] = report.id.generation_time.isoformat()
+        except Exception:
+            pass
+    if not d.get("updatedAt") and d.get("createdAt"):
+        d["updatedAt"] = d["createdAt"]
+        
     return d
 
 

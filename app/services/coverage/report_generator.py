@@ -62,14 +62,19 @@ def generate_report(
     # Determine status based on dates
     policy_status = "Active"
     if policy_json.get("policyEndDate"):
+        end_date = None
         try:
             from dateutil import parser
-            from datetime import datetime
-            end_date = parser.parse(policy_json["policyEndDate"]).replace(tzinfo=None)
-            if end_date < datetime.now():
-                policy_status = "Expired"
-        except:
-            pass
+            end_date = parser.parse(str(policy_json["policyEndDate"])).replace(tzinfo=None)
+        except Exception:
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y", "%Y/%m/%d", "%d.%m.%Y", "%d-%b-%Y"):
+                try:
+                    end_date = datetime.strptime(str(policy_json["policyEndDate"]).strip().split("T")[0], fmt)
+                    break
+                except Exception:
+                    continue
+        if end_date and end_date < datetime.now():
+            policy_status = "Expired"
 
     policy_summary = {
         "company": policy_json.get("insuranceCompany", "Unknown"),

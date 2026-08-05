@@ -117,3 +117,29 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         name=user.name,
         email=user.email
     )
+
+class UpdateProfileRequest(BaseModel):
+    name: str
+    email: str
+
+@router.put("/me", response_model=UserResponse)
+async def update_me(request: UpdateProfileRequest, current_user: dict = Depends(get_current_user)):
+    """Update current user details."""
+    user = await User.get(current_user["id"])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    if request.email != user.email:
+        existing = await User.find_one(User.email == request.email)
+        if existing:
+            raise HTTPException(status_code=400, detail="Email address is already in use by another account")
+        
+    user.name = request.name
+    user.email = request.email
+    await user.save()
+    
+    return UserResponse(
+        id=str(user.id),
+        name=user.name,
+        email=user.email
+    )

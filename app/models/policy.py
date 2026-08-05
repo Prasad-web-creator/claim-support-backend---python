@@ -18,6 +18,7 @@ class Policy(Document):
     user_id: Indexed(str) = Field(alias="userId")  # type: ignore[valid-type]
     policy_number: Optional[str] = Field(default=None, alias="policyNumber", max_length=255)
     policy_name: Optional[str] = Field(default=None, alias="policyName", max_length=255)
+    policy_holder_name: Optional[str] = Field(default=None, alias="policyHolderName", max_length=255)
     insurance_company: Optional[str] = Field(default=None, alias="insuranceCompany", max_length=255)
     policy_type: Optional[str] = Field(default=None, alias="policyType", max_length=255)
     policy_start_date: Optional[datetime] = Field(default=None, alias="policyStartDate")
@@ -33,12 +34,15 @@ class Policy(Document):
     # Extraction Data
     extracted_policy_text: Optional[str] = Field(default=None, alias="extractedPolicyText")
     extracted_policy_json: Optional[dict] = Field(default=None, alias="extractedPolicyJson")
+    metadata: Optional[dict] = Field(default=None, alias="metadata")
     processing_status: str = Field(default="pending", alias="processingStatus") # pending, processing, completed, failed
 
     # Agreement subdocument
     agreement: Optional[dict] = None
 
     # Base schema fields
+    created_at: Optional[datetime] = Field(default_factory=datetime.utcnow, alias="createdAt")
+    updated_at: Optional[datetime] = Field(default_factory=datetime.utcnow, alias="updatedAt")
     created_by: Optional[str] = Field(default=None, alias="createdBy")
     updated_by: Optional[str] = Field(default=None, alias="updatedBy")
     is_deleted: bool = Field(default=False, alias="isDeleted")
