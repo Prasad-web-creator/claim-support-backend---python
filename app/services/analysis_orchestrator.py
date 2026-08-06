@@ -198,6 +198,20 @@ async def _background_post_processing(
                     Prescription.user_id == user_id
                 )
 
+            is_manual_rx = bool(
+                (report.prescription_json and (
+                    report.prescription_json.get("isManual")
+                    or report.prescription_json.get("prescriptionSource") == "Self-entered Prescription"
+                    or report.prescription_json.get("manualText")
+                ))
+                or (target_rx_doc and target_rx_doc.is_manual)
+            )
+            manual_text = (
+                (report.prescription_json.get("manualText") if report.prescription_json else None)
+                or (target_rx_doc.manual_text if target_rx_doc else None)
+                or (report.prescription_text if is_manual_rx else None)
+            )
+
             rx_diag = rx_meta.get("diagnosis")
             if isinstance(rx_diag, list):
                 diag_str = ", ".join(str(d) for d in rx_diag if d)
@@ -216,6 +230,10 @@ async def _background_post_processing(
                 target_rx_doc.metadata = rx_meta
                 target_rx_doc.extracted_prescription_text = report.prescription_text
                 target_rx_doc.extracted_prescription_json = report.prescription_json
+                if is_manual_rx:
+                    target_rx_doc.is_manual = True
+                    target_rx_doc.manual_text = manual_text or report.prescription_text
+                    target_rx_doc.prescription_source = "Self-entered Prescription"
                 if rx_hospital:
                     target_rx_doc.hospital_name = str(rx_hospital)
                 if rx_doctor:
@@ -240,7 +258,10 @@ async def _background_post_processing(
                     prescription_number=str(rx_number) if rx_number else None,
                     visit_date=rx_visit_date,
                     diagnosis=str(diag_str) if diag_str else None,
-                    grid_fs_file_id=prescription_id,
+                    is_manual=is_manual_rx,
+                    manual_text=manual_text or (report.prescription_text if is_manual_rx else None),
+                    prescription_source="Self-entered Prescription" if is_manual_rx else "PDF Upload",
+                    grid_fs_file_id=None if is_manual_rx else prescription_id,
                     extracted_prescription_text=report.prescription_text,
                     extracted_prescription_json=report.prescription_json,
                     metadata=rx_meta,
@@ -316,6 +337,37 @@ async def run_analysis_pipeline(
             raw_text = await extract_text_from_document(bytes_data, mime)
             return clean_text(raw_text)
 
+        # Check if prescription_id refers to a Prescription document or manual prescription
+        is_manual_rx = False
+        manual_rx_text = None
+        rx_doc = None
+        target_rx_file_id = prescription_id
+
+        if prescription_id:
+            try:
+                if len(str(prescription_id)) == 24:
+                    rx_doc = await Prescription.get(ObjectId(prescription_id))
+            except Exception:
+                rx_doc = None
+
+        if rx_doc:
+            if rx_doc.is_manual or rx_doc.manual_text:
+                is_manual_rx = True
+                manual_rx_text = rx_doc.manual_text or rx_doc.extracted_prescription_text or ""
+            elif rx_doc.grid_fs_file_id:
+                target_rx_file_id = rx_doc.grid_fs_file_id
+
+        async def load_rx_text():
+            if is_manual_rx and manual_rx_text:
+                return clean_text(manual_rx_text)
+            try:
+                return await process_document(target_rx_file_id)
+            except Exception as e:
+                # If target_rx_file_id is raw manual text directly passed
+                if prescription_id and len(prescription_id) > 10 and not prescription_id.isalnum():
+                    return clean_text(prescription_id)
+                raise e
+
         policy_text = ""
         existing_policy_json = None
         
@@ -328,18 +380,18 @@ async def run_analysis_pipeline(
             if policy_doc.extracted_policy_text:
                 policy_text = policy_doc.extracted_policy_text
                 existing_policy_json = policy_doc.extracted_policy_json or {}
-                rx_text = await process_document(prescription_id)
+                rx_text = await load_rx_text()
             else:
                 logger.info("[Orchestrator] Policy has no extracted text, extracting now")
                 policy_text, rx_text = await asyncio.gather(
                     process_document(policy_doc.grid_fs_file_id),
-                    process_document(prescription_id)
+                    load_rx_text()
                 )
         else:
             logger.info("[Orchestrator] Extracting new policy and prescription from files")
             policy_text, rx_text = await asyncio.gather(
                 process_document(policy_file_id),
-                process_document(prescription_id)
+                load_rx_text()
             )
         
         report.policy_text = policy_text
@@ -365,8 +417,66 @@ async def run_analysis_pipeline(
             rx_data.get("extractedJson")
         )
         
-        report.policy_json = validation["validatedPolicyJson"]
-        report.prescription_json = validation["validatedPrescriptionJson"]
+        policy_json = validation["validatedPolicyJson"]
+        prescription_json = validation["validatedPrescriptionJson"]
+
+        if is_manual_rx:
+            prescription_json["isManual"] = True
+            prescription_json["prescriptionSource"] = "Self-entered Prescription"
+            prescription_json["manualText"] = rx_text
+            if rx_doc:
+                rx_doc.extracted_prescription_text = rx_text
+                rx_doc.extracted_prescription_json = prescription_json
+                await rx_doc.save()
+
+        report.policy_json = policy_json
+        report.prescription_json = prescription_json
+
+        # Early check for document validity
+        is_policy_valid = validation.get("isPolicyValid", True)
+        is_rx_valid = validation.get("isPrescriptionValid", True)
+        
+        if not is_policy_valid or not is_rx_valid:
+            logger.warning(f"[Orchestrator] Document validation failed: policyValid={is_policy_valid}, prescriptionValid={is_rx_valid}")
+            if not is_policy_valid and not is_rx_valid:
+                inv_status = "Invalid Policy and Prescription"
+            elif not is_policy_valid:
+                inv_status = "Invalid Policy"
+            else:
+                inv_status = "Invalid Prescription"
+
+            processing_time = int((time.time() - start_time) * 1000)
+            final_report = generate_report(
+                policy_json=report.policy_json,
+                prescription_json=report.prescription_json,
+                business_rule_results={},
+                coverage_analysis={
+                    "documentValidity": {
+                        "policyValid": is_policy_valid,
+                        "prescriptionValid": is_rx_valid,
+                        "isPolicyValid": is_policy_valid,
+                        "isPrescriptionValid": is_rx_valid
+                    },
+                    "overallStatus": inv_status,
+                    "comparison": []
+                },
+                processing_time_ms=processing_time
+            )
+            report.status = "completed"
+            report.document_validity = final_report.get("documentValidity")
+            report.overall_status = final_report.get("overallStatus")
+            report.dominance_score = 0.0
+            report.coverage_breakdown = final_report.get("coverageBreakdown")
+            report.summary = final_report.get("summary")
+            report.summary_text = final_report.get("summaryText")
+            report.comparison = []
+            report.processing_time_ms = processing_time
+            report.matched_items = []
+            report.excluded_items = []
+            await report.save()
+            fresh = await AnalysisReport.get(report.id)
+            return fresh.dict(by_alias=True)
+
         report.status = "analyzing"
         await report.save()
         

@@ -6,6 +6,7 @@ AI-powered prescription JSON extraction with chunking.
 from app.core.logging import logger
 from app.services.llm.ai_client import extract_json_with_retry
 from app.services.llm.prompts import PRESCRIPTION_EXTRACTION_PROMPT, PRESCRIPTION_FIELDS, REQUIRED_PRESCRIPTION_FIELDS
+from app.services.llm.schemas import PrescriptionSchema
 from app.utils.document_splitter import split_text_intelligently, merge_extracted_json
 from app.utils.extraction_validator import validate_extraction
 
@@ -37,7 +38,8 @@ async def extract_prescription_details(prescription_text: str) -> dict:
             result = await extract_json_with_retry(
                 system_prompt=PRESCRIPTION_EXTRACTION_PROMPT,
                 user_content=chunk,
-                max_tokens=1500
+                max_tokens=1500,
+                response_schema=PrescriptionSchema
             )
             if result.get("extractedJson"):
                 extracted_jsons.append(result["extractedJson"])

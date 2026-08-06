@@ -34,13 +34,18 @@ class PolicyUpdate(PolicyCreate):
 class PrescriptionCreate(BaseModel):
     hospitalName: Optional[str] = None
     doctorName: Optional[str] = None
+    patientName: Optional[str] = None
     visitDate: Optional[datetime] = None
     diagnosis: Optional[str] = None
     gridFsFileId: Optional[str] = None
     originalFileName: Optional[str] = None
     mimeType: Optional[str] = None
     fileSize: Optional[int] = None
+    isManual: Optional[bool] = False
+    manualText: Optional[str] = None
+    prescriptionSource: Optional[str] = None
     agreement: Optional[AgreementSchema] = None
 
 class PrescriptionUpdate(PrescriptionCreate):
     pass
+

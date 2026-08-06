@@ -76,6 +76,7 @@ async def extract_json_with_retry(
     user_content: str,
     model_name: str | None = None,
     max_tokens: int = 4000,
+    response_schema: Any = None,
 ) -> dict:
     """
     Extracts structured JSON using Gemini API with automatic retry and exponential backoff.
@@ -94,7 +95,7 @@ async def extract_json_with_retry(
 
     start_time = time.time()
     retry_count = 0
-    max_retries = 3
+    max_retries = 6  # Increased to handle transient 503 surges
 
     # Enforce "JSON" in prompt to help guide the model
     enforced_prompt = system_prompt
@@ -123,6 +124,7 @@ async def extract_json_with_retry(
                         response_mime_type="application/json",
                         temperature=0.1,
                         max_output_tokens=max_tokens,
+                        response_schema=response_schema,
                     ),
                 ),
                 timeout=180.0,
@@ -163,9 +165,9 @@ async def extract_json_with_retry(
                 # Exponential backoff with jitter
                 delay_ms = (2**retry_count * 1000) + (random.random() * 1000)
 
-                # If explicit rate limit (429)
-                if "429" in str(error):
-                    delay_ms = max(delay_ms, 5000)
+                # Extended backoff for rate limit (429) and service unavailable (503)
+                if "429" in str(error) or "503" in str(error):
+                    delay_ms = max(delay_ms, 8000)
 
                 logger.warning(f"[AI Client] Backing off for {int(delay_ms)}ms...")
                 await asyncio.sleep(delay_ms / 1000)
@@ -204,7 +206,7 @@ async def extract_json_multimodal(
 
     start_time = time.time()
     retry_count = 0
-    max_retries = 3
+    max_retries = 6  # Increased to handle transient 503 surges
 
     enforced_prompt = system_prompt
     if "json" not in enforced_prompt.lower():
@@ -273,8 +275,9 @@ async def extract_json_multimodal(
 
             if retry_count <= max_retries:
                 delay_ms = (2**retry_count * 1000) + (random.random() * 1000)
-                if "429" in str(error):
-                    delay_ms = max(delay_ms, 5000)
+                # Extended backoff for rate limit (429) and service unavailable (503)
+                if "429" in str(error) or "503" in str(error):
+                    delay_ms = max(delay_ms, 8000)
 
                 logger.warning(f"[MultimodalAI] Backing off for {int(delay_ms)}ms...")
                 await asyncio.sleep(delay_ms / 1000)

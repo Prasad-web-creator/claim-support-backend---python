@@ -85,6 +85,24 @@ def create_crud_router(
              raise HTTPException(status_code=404, detail=f"{entity_name} not found")
         return _serialize(result)
 
+    class BatchDeleteRequest(BaseModel):
+        ids: list[str]
+
+    @router.post("/batch-delete")
+    async def batch_delete_entities(
+        request: Request,
+        body: BatchDeleteRequest,
+        current_user: dict = Depends(get_current_user)
+    ):
+        """Batch delete entities."""
+        result = await service.delete_batch(current_user["id"], body.ids)
+        return {
+            "success": True,
+            "deletedCount": result["deletedCount"],
+            "skippedCount": result["skippedCount"],
+            "message": f"Successfully deleted {result['deletedCount']} {entity_name.lower()}(s)"
+        }
+
     @router.delete("/{entity_id}")
     async def delete_entity(
         request: Request,

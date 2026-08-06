@@ -28,6 +28,9 @@ class Prescription(Document):
     sequence_number: Optional[int] = Field(default=None, alias="sequenceNumber", ge=0)
 
     # Extraction & Metadata Data
+    is_manual: bool = Field(default=False, alias="isManual")
+    manual_text: Optional[str] = Field(default=None, alias="manualText")
+    prescription_source: Optional[str] = Field(default="PDF Upload", alias="prescriptionSource")
     extracted_prescription_text: Optional[str] = Field(default=None, alias="extractedPrescriptionText")
     extracted_prescription_json: Optional[dict] = Field(default=None, alias="extractedPrescriptionJson")
     metadata: Optional[dict] = Field(default=None, alias="metadata")

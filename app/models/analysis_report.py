@@ -60,6 +60,14 @@ class AnalysisReport(Document):
     error_message: Optional[str] = Field(default=None, alias="errorMessage")
     failed_at_stage: Optional[str] = Field(default=None, alias="failedAtStage")
 
+    # ─── Report Metadata ──────────────────────────────────────────────────────
+    decision_type: Optional[str] = Field(default=None, alias="decisionType") # Automatic | Manual Review
+    confidence_score: Optional[int] = Field(default=None, alias="confidenceScore")
+    policy_clauses_used: Optional[list] = Field(default=None, alias="policyClausesUsed")
+    prescription_evidence: Optional[list] = Field(default=None, alias="prescriptionEvidence")
+    clarification_answers_used: Optional[list] = Field(default=None, alias="clarificationAnswersUsed")
+    session_id: Optional[str] = Field(default=None, alias="sessionId")
+
     report_number: Optional[int] = Field(default=None, alias="reportNumber")
 
     # Base schema fields

@@ -41,6 +41,8 @@ async def connect_to_mongodb() -> None:
     from app.models.counter import Counter
     from app.models.stored_file import StoredFile
     from app.models.document_chunk import DocumentChunk
+    from app.models.analysis_session import AnalysisSession
+    from app.models.analysis_audit_log import AnalysisAuditLog
 
     await init_beanie(
         database=db,
@@ -52,6 +54,8 @@ async def connect_to_mongodb() -> None:
             ActivityLog,
             Counter,
             StoredFile,
+            AnalysisSession,
+            AnalysisAuditLog,
         ],
     )
 

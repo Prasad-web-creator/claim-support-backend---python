@@ -68,38 +68,39 @@ Do NOT determine coverage or make decisions. Extract ONLY what is explicitly sta
 
 CRITICAL RULES:
 1. Return ONLY JSON. Never return markdown blocks, explanations, or introductory text.
-2. Return null ONLY if information truly does not exist.
-3. NEVER return strings like "Unknown", "N/A", "Not specified", or "None". If missing, return null.
-4. Never invent values.
-5. Preserve dates exactly.
-6. Preserve monetary values.
+2. Policy metadata fields (insuranceCompany, policyHolder, policyNumber, policyStartDate, policyEndDate, coverageAmount) are OPTIONAL. If not present in the text, return null. Missing metadata must NEVER invalidate the document.
+3. Extract all available insurance clauses, benefits, covered treatments/diseases, exclusions, waiting periods, room rent, hospitalization conditions, and special conditions.
+4. Return null ONLY if information truly does not exist in the document.
+5. NEVER return strings like "Unknown", "N/A", "Not specified", or "None". If missing, return null.
+6. Never invent values.
+7. Preserve dates and monetary values exactly when present.
 
 Return ONLY a valid JSON object with the following fields:
-- insuranceCompany (string)
-- policyHolder (string)
-- policyNumber (string)
-- policyType (string)
-- policyStartDate (string)
-- policyEndDate (string)
-- coverageAmount (number)
-- waitingPeriodDays (number) - MUST BE RAW NUMBER, NO MATH EXPRESSIONS (e.g., use 1440 instead of 48 * 30)
-- roomEligibility (string)
+- insuranceCompany (string or null)
+- policyHolder (string or null)
+- policyNumber (string or null)
+- policyType (string or null)
+- policyStartDate (string or null)
+- policyEndDate (string or null)
+- coverageAmount (number or null)
+- waitingPeriodDays (number or null) - MUST BE RAW NUMBER, NO MATH EXPRESSIONS (e.g., use 1440 instead of 48 * 30)
+- roomEligibility (string or null)
 - coveredDiseases (array of strings)
 - excludedDiseases (array of strings)
 - coveredTreatments (array of strings)
 - excludedTreatments (array of strings)
-- medicinesCoverage (string)
-- medicalTestsCoverage (string)
-- hospitalization (string)
-- icu (string)
-- emergency (string)
-- dayCare (string)
-- preExistingDiseases (string)
-- networkHospitalRules (string)
-- coPay (string)
-- deductibles (string)
+- medicinesCoverage (string or null)
+- medicalTestsCoverage (string or null)
+- hospitalization (string or null)
+- icu (string or null)
+- emergency (string or null)
+- dayCare (string or null)
+- preExistingDiseases (string or null)
+- networkHospitalRules (string or null)
+- coPay (string or null)
+- deductibles (string or null)
 - specialConditions (array of strings)
-- notes (string)"""
+- notes (string or null)"""
 
 # Prescription extraction prompt
 PRESCRIPTION_EXTRACTION_PROMPT = """You are a strict medical data extraction AI. Your task is to extract structured medical information from the given prescription/medical document text.
@@ -297,7 +298,7 @@ Output schema:
 }""",
 }
 
-# Policy extraction field lists
+# Policy extraction field lists — metadata fields are optional
 POLICY_FIELDS = [
     "insuranceCompany", "policyHolder", "policyNumber", "policyType",
     "policyStartDate", "policyEndDate", "coverageAmount", "waitingPeriodDays",
@@ -307,7 +308,8 @@ POLICY_FIELDS = [
     "networkHospitalRules", "coPay", "deductibles", "specialConditions", "notes",
 ]
 
-REQUIRED_POLICY_FIELDS = ["insuranceCompany", "policyNumber", "coveredTreatments"]
+# Policy metadata is optional; validation is content-based (substantive insurance terms/clauses)
+REQUIRED_POLICY_FIELDS = []
 
 # Prescription extraction field lists
 PRESCRIPTION_FIELDS = [

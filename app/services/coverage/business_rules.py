@@ -43,7 +43,7 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
     # 1. Policy Expiry Check
     try:
         policy_end = _parse_date(policy.get("policyEndDate"))
-        visit_date = _parse_date(prescription.get("visitDate"))
+        visit_date = _parse_date(prescription.get("visitDate") or prescription.get("consultationDate"))
 
         if policy_end and visit_date:
             passed = visit_date <= policy_end
@@ -66,7 +66,7 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
     # 2. Waiting Period Check
     try:
         policy_start = _parse_date(policy.get("policyStartDate"))
-        visit_date = _parse_date(prescription.get("visitDate"))
+        visit_date = _parse_date(prescription.get("visitDate") or prescription.get("consultationDate"))
         waiting_days = policy.get("waitingPeriodDays")
 
         if policy_start and visit_date and waiting_days is not None:
@@ -131,22 +131,141 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
     else:
         evaluate_rule("hospitalizationCovered", True, "Hospitalization not required")
         
-    # 6. Coverage Amount Check
-    est_cost = prescription.get("estimatedCost")
-    cov_amt = policy.get("coverageAmount")
-    
-    if est_cost is not None and cov_amt is not None:
+    # 7. Patient Name Match Check
+    p_name = (prescription.get("patientName") or "").strip().lower()
+    members = policy.get("insuredMembers") or policy.get("familyMembers") or []
+    policyholder = (policy.get("policyholderName") or "").strip().lower()
+
+    if p_name:
+        matched_member = None
+        for m in members:
+            m_name = (m.get("name") or m.get("fullName") or "").strip().lower()
+            if m_name and (m_name in p_name or p_name in m_name):
+                matched_member = m
+                break
+
+        if not matched_member and policyholder and (policyholder in p_name or p_name in policyholder):
+            matched_member = {"name": policyholder}
+
+        if not matched_member and (members or policyholder):
+            evaluate_rule(
+                "patientNameMatch",
+                False,
+                f"Patient '{prescription.get('patientName')}' is not listed as an insured member on this policy.",
+                blocker=True,
+            )
+        else:
+            evaluate_rule(
+                "patientNameMatch",
+                True,
+                f"Patient '{prescription.get('patientName')}' is an active insured member.",
+            )
+
+    # 8. Patient Age Match Check
+    p_age_raw = prescription.get("patientAge")
+    if p_age_raw is not None:
         try:
-             est = float(est_cost)
-             cov = float(cov_amt)
-             if est > cov:
-                 evaluate_rule("coverageAmountSufficient", False, f"Estimated cost ({est}) exceeds coverage amount ({cov})", blocker=False) # Not a strict blocker, user pays diff
-             else:
-                 evaluate_rule("coverageAmountSufficient", True, "Estimated cost within coverage limits")
-        except ValueError:
-             evaluate_rule("coverageAmountSufficient", False, "Could not parse cost or coverage amounts", blocker=False)
-    else:
-         evaluate_rule("coverageAmountSufficient", False, "Missing estimated cost or coverage amount", blocker=False)
+            import re
+            p_age_digits = re.sub(r"\D", "", str(p_age_raw))
+            presc_age = int(p_age_digits) if p_age_digits else None
+
+            matched_member = None
+            for m in members:
+                m_name = (m.get("name") or m.get("fullName") or "").strip().lower()
+                if m_name and p_name and (m_name in p_name or p_name in m_name):
+                    matched_member = m
+                    break
+            if not matched_member and len(members) == 1:
+                matched_member = members[0]
+
+            if matched_member and matched_member.get("age") is not None:
+                pol_age_digits = re.sub(r"\D", "", str(matched_member.get("age")))
+                pol_age = int(pol_age_digits) if pol_age_digits else None
+
+                if presc_age is not None and pol_age is not None and presc_age != pol_age:
+                    evaluate_rule(
+                        "patientAgeMatch",
+                        False,
+                        f"Patient age mismatch: Prescription lists {presc_age} Yrs, but policy records {pol_age} Yrs for {matched_member.get('name', 'insured member')}.",
+                        blocker=True,
+                    )
+                else:
+                    evaluate_rule(
+                        "patientAgeMatch",
+                        True,
+                        f"Patient age ({presc_age} Yrs) matches policy records.",
+                    )
+        except Exception as e:
+            evaluate_rule("patientAgeMatch", True, f"Could not parse age: {e}")
+
+    # 9. Patient Gender Match Check
+    p_gender = (prescription.get("patientGender") or "").strip().lower()
+    if p_gender:
+        matched_member = None
+        for m in members:
+            m_name = (m.get("name") or m.get("fullName") or "").strip().lower()
+            if m_name and p_name and (m_name in p_name or p_name in m_name):
+                matched_member = m
+                break
+
+        if matched_member and matched_member.get("gender"):
+            pol_gender = str(matched_member.get("gender")).strip().lower()
+            p_is_male = p_gender.startswith("m")
+            pol_is_male = pol_gender.startswith("m")
+
+            if p_is_male != pol_is_male:
+                evaluate_rule(
+                    "patientGenderMatch",
+                    False,
+                    f"Patient gender mismatch: Prescription lists {prescription.get('patientGender')}, but policy records {matched_member.get('gender')} for {matched_member.get('name', 'insured member')}.",
+                    blocker=True,
+                )
+            else:
+                evaluate_rule(
+                    "patientGenderMatch",
+                    True,
+                    "Patient gender matches policy records.",
+                )
+
+    # 10. Consultation Date Check
+    c_date_raw = prescription.get("consultationDate") or prescription.get("visitDate")
+    if c_date_raw:
+        try:
+            c_date = _parse_date(c_date_raw)
+            p_start = _parse_date(policy.get("policyStartDate"))
+            p_end = _parse_date(policy.get("policyEndDate"))
+            now = datetime.now()
+
+            if c_date:
+                if c_date > now:
+                    evaluate_rule(
+                        "consultationDateValid",
+                        False,
+                        f"Consultation date ({c_date_raw}) is in the future.",
+                        blocker=True,
+                    )
+                elif p_start and c_date < p_start:
+                    evaluate_rule(
+                        "consultationDateValid",
+                        False,
+                        f"Consultation date ({c_date_raw}) is prior to policy start date ({policy.get('policyStartDate')}).",
+                        blocker=True,
+                    )
+                elif p_end and c_date > p_end:
+                    evaluate_rule(
+                        "consultationDateValid",
+                        False,
+                        f"Consultation date ({c_date_raw}) is after policy expiration date ({policy.get('policyEndDate')}).",
+                        blocker=True,
+                    )
+                else:
+                    evaluate_rule(
+                        "consultationDateValid",
+                        True,
+                        "Consultation date is within valid active policy period.",
+                    )
+        except Exception as e:
+            evaluate_rule("consultationDateValid", True, f"Date check note: {e}")
 
     return results
 

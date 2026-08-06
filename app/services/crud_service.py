@@ -109,12 +109,8 @@ class CrudService:
         
         # Cascade Hard Deletes
         if self.entity_name in ["Policy", "Prescription"]:
-            field_name = "policy_id" if self.entity_name == "Policy" else "prescription_id"
-            # Delete associated reports
-            await AnalysisReport.find(
-                getattr(AnalysisReport, field_name) == str(doc.id),
-                AnalysisReport.user_id == user_id
-            ).delete()
+            # Note: We intentionally do NOT delete associated Analysis Reports 
+            # so users can retain their historical analyses.
             
             # Delete associated files from GridFS AND metadata
             from app.services.storage.file_upload_service import FileUploadService
@@ -137,6 +133,31 @@ class CrudService:
         ).insert()
         
         return True
+
+    async def delete_batch(self, user_id: str, doc_ids: list[str]) -> dict:
+        """Batch delete multiple documents belonging to the user."""
+        if not doc_ids:
+            return {"deletedCount": 0, "skippedCount": 0, "totalRequested": 0}
+
+        deleted_count = 0
+        skipped_count = 0
+
+        for doc_id in doc_ids:
+            try:
+                success = await self.delete(user_id, str(doc_id))
+                if success:
+                    deleted_count += 1
+                else:
+                    skipped_count += 1
+            except Exception as e:
+                logger.error(f"Error batch deleting {self.entity_name} ID {doc_id}: {e}")
+                skipped_count += 1
+
+        return {
+            "deletedCount": deleted_count,
+            "skippedCount": skipped_count,
+            "totalRequested": len(doc_ids)
+        }
 
     async def list_paginated(
         self,

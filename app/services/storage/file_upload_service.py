@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from beanie import PydanticObjectId as ObjectId
+from app.core.database import get_gridfs_bucket
 from app.core.logging import logger
 from app.models.stored_file import StoredFile
 from app.services.storage.gridfs_provider import GridFSProvider

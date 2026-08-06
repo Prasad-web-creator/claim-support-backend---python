@@ -5,8 +5,8 @@ Analysis routes — migrated from analysisController.js.
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 
 from app.middleware.auth import get_current_user
-from app.services.analysis_orchestrator import run_analysis_pipeline
-from typing import Optional
+from app.services.analysis_interactive_orchestrator import start_analysis_session, resume_analysis_session
+from typing import Optional, List, Any
 from pydantic import BaseModel, root_validator
 
 router = APIRouter(prefix="/analysis", tags=["Analysis"])
@@ -33,20 +33,46 @@ async def start_analysis(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Start the analysis pipeline asynchronously.
+    Start the interactive analysis pipeline asynchronously.
     """
     try:
-        result = await run_analysis_pipeline(
+        result = await start_analysis_session(
             user_id=current_user["id"],
             policy_file_id=request.policyPath,
             policy_doc_id=request.policyId,
             prescription_id=request.prescriptionPath,
             background_tasks=background_tasks
         )
-        # The mobile app expects `success: true` and `reportId` at the root, along with all data.
+        # It could be needs_clarification or complete
         return {
             "success": True,
-            "reportId": str(result.get("_id", result.get("id"))),
+            **result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class AnswerRequest(BaseModel):
+    answers: dict
+
+@router.post("/{session_id}/answer")
+async def answer_clarification(
+    session_id: str,
+    request: AnswerRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Resume the analysis pipeline with answers.
+    """
+    try:
+        result = await resume_analysis_session(
+            session_id=session_id,
+            user_id=current_user["id"],
+            answers=request.answers,
+            background_tasks=background_tasks
+        )
+        return {
+            "success": True,
             **result
         }
     except Exception as e:
@@ -146,6 +172,30 @@ async def get_analysis(
     return d
 
 
+class BatchDeleteReportsRequest(BaseModel):
+    ids: list[str]
+
+
+@router.post("/reports/batch-delete")
+@router.post("/batch-delete")
+async def batch_delete_analysis_reports(
+    body: BatchDeleteReportsRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Batch delete analysis reports."""
+    from app.services.crud_service import CrudService
+    from app.models.analysis_report import AnalysisReport
+
+    service = CrudService(AnalysisReport, "AnalysisReport", [])
+    result = await service.delete_batch(current_user["id"], body.ids)
+    return {
+        "success": True,
+        "deletedCount": result["deletedCount"],
+        "skippedCount": result["skippedCount"],
+        "message": f"Successfully deleted {result['deletedCount']} report(s)"
+    }
+
+
 @router.delete("/{report_id}")
 async def delete_analysis(
     report_id: str,
@@ -161,4 +211,5 @@ async def delete_analysis(
         raise HTTPException(status_code=404, detail="Analysis report not found")
         
     return {"success": True, "message": "Analysis report deleted successfully"}
+
 

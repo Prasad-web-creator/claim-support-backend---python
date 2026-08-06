@@ -15,6 +15,8 @@ async def process_and_index_document(
     Chunks a document's text, generates embeddings, and saves to MongoDB.
     Skips if chunks for this document already exist.
     """
+    # Temporarily stop RAG indexing
+    return
     if not text or not text.strip():
         logger.info(f"[{document_type}] No text to index for {document_id}")
         return
