@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional, List
 from beanie import Document, Indexed
 from pydantic import Field
@@ -26,7 +26,7 @@ class AnalysisAuditLog(Document):
     confidence_score: Optional[int] = Field(default=None, alias="confidenceScore")
     final_decision: Optional[str] = Field(default=None, alias="finalDecision")
     
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     class Settings:
         name = "analysisauditlogs"

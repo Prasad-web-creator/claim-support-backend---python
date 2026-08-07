@@ -34,7 +34,7 @@ async def get_policies_summary(current_user: dict = Depends(get_current_user)):
         Policy.user_id == user_id,
         Policy.is_deleted == False,
         Policy.processing_status == "completed"
-    ).sort("-id").to_list()
+    ).sort("-_id").to_list()
     
     # Format according to spec, returning holder name, start and end dates (DD-MM-YYYY)
     formatted_policies = []
@@ -80,16 +80,16 @@ async def get_policies_summary(current_user: dict = Depends(get_current_user)):
 
         formatted_policies.append({
             "id": str(p.id),
-            "providerName": p.insurance_company or meta.get("provider_name") or p_json.get("insuranceCompany") or "Unknown Provider",
-            "policyNumber": p.policy_number or meta.get("policy_number") or p_json.get("policyNumber") or "Unknown Number",
-            "policyType": p.policy_type or meta.get("policy_type") or p_json.get("policyType") or "Unknown Type",
-            "planName": p.policy_name or meta.get("plan_name") or p_json.get("policyName"),
-            "policyHolderName": holder_name,
-            "startDate": start_date,
-            "endDate": end_date,
-            "expiryDate": end_date,
+            "providerName": p.insurance_company or meta.get("provider_name") or p_json.get("insuranceCompany") or "---",
+            "policyNumber": p.policy_number or meta.get("policy_number") or p_json.get("policyNumber") or "---",
+            "policyType": p.policy_type or meta.get("policy_type") or p_json.get("policyType") or "---",
+            "planName": p.policy_name or meta.get("plan_name") or p_json.get("policyName") or "---",
+            "policyHolderName": holder_name or "---",
+            "startDate": start_date or "---",
+            "endDate": end_date or "---",
+            "expiryDate": end_date or "---",
             "coverageAmount": p.coverage_amount or meta.get("sum_insured") or p_json.get("sumInsured"),
-            "originalFileName": p.original_file_name or "Unknown File",
+            "originalFileName": p.original_file_name or "---",
             "displayId": f"PCY{p.sequence_number:04d}" if getattr(p, "sequence_number", None) is not None else str(p.id)[:8].upper()
         })
         

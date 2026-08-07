@@ -143,3 +143,9 @@ async def update_me(request: UpdateProfileRequest, current_user: dict = Depends(
         name=user.name,
         email=user.email
     )
+
+
+@router.post("/logout")
+async def logout():
+    """Logout current user."""
+    return {"success": True, "message": "Logged out successfully"}

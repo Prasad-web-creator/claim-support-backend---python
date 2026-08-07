@@ -15,8 +15,33 @@ async def analyze_coverage(
 ) -> dict:
     logger.info("[Coverage Analysis] Starting AI coverage analysis...")
 
+    from datetime import datetime
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    # Determine prescription source so the LLM applies the correct validation path
+    is_manual_prescription = bool(
+        prescription_json and (
+            prescription_json.get("isManual")
+            or prescription_json.get("prescriptionSource") == "Self-entered Prescription"
+            or prescription_json.get("manualText")
+        )
+    )
+    source_label = (
+        "Self-entered Prescription (Manual Text — prospective query for current sudden illness / symptoms before or during clinic/hospital visit)"
+        if is_manual_prescription
+        else "Uploaded Prescription (PDF / Image / OCR — standard extracted document)"
+    )
+
     # Build the prompt
     user_prompt = f"""
+PRESCRIPTION SOURCE
+
+{source_label}
+
+CURRENT EVALUATION DATE: {today_str}
+
+==================================================
+
 PRESCRIPTION TEXT
 
 {prescription_text}

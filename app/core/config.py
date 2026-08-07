@@ -24,7 +24,6 @@ class Settings(BaseSettings):
 
     # ─── Database ─────────────────────────────────────────────────────────────
     MONGODB_URI: str = Field(..., description="MongoDB connection URI")
-    MONGO_ATLAS_URI: Optional[str] = Field(default=None, description="Atlas URI for RAG Vector Search")
 
     # ─── AI / LLM ─────────────────────────────────────────────────────────────
     GEMINI_API_KEY: str = Field(..., description="Google Gemini API key")

@@ -274,29 +274,6 @@ async def _background_post_processing(
         except Exception as meta_err:
             logger.error(f"[Orchestrator Background] Error during metadata extraction/persistence: {meta_err}", exc_info=True)
 
-        # Stage 10.5: Index documents for RAG
-        logger.info("[Orchestrator] Stage 10.5: Indexing documents for RAG")
-        from app.services.rag.indexing import process_and_index_document
-        
-        try:
-            if report.policy_id and report.policy_text:
-                await process_and_index_document(
-                    user_id=user_id,
-                    document_id=report.policy_id,
-                    document_type="policy",
-                    text=report.policy_text
-                )
-            
-            if report.prescription_id and report.prescription_text:
-                await process_and_index_document(
-                    user_id=user_id,
-                    document_id=report.prescription_id,
-                    document_type="prescription",
-                    text=report.prescription_text
-                )
-        except Exception as rag_err:
-            logger.error(f"[Orchestrator Background] Error during RAG indexing: {rag_err}", exc_info=True)
-            
         logger.info("[Orchestrator Background] Post-processing complete.")
 
     except Exception as e:
@@ -421,9 +398,15 @@ async def run_analysis_pipeline(
         prescription_json = validation["validatedPrescriptionJson"]
 
         if is_manual_rx:
+            from datetime import datetime
+            today_str = datetime.now().strftime("%Y-%m-%d")
             prescription_json["isManual"] = True
             prescription_json["prescriptionSource"] = "Self-entered Prescription"
             prescription_json["manualText"] = rx_text
+            if not prescription_json.get("visitDate"):
+                prescription_json["visitDate"] = today_str
+            if not prescription_json.get("consultationDate"):
+                prescription_json["consultationDate"] = today_str
             if rx_doc:
                 rx_doc.extracted_prescription_text = rx_text
                 rx_doc.extracted_prescription_json = prescription_json
@@ -438,6 +421,16 @@ async def run_analysis_pipeline(
         
         if not is_policy_valid or not is_rx_valid:
             logger.warning(f"[Orchestrator] Document validation failed: policyValid={is_policy_valid}, prescriptionValid={is_rx_valid}")
+            p_reason = ""
+            rx_reason = ""
+            if not is_policy_valid:
+                p_reason = "The uploaded policy document contains no recognizable insurance policy clauses, covered treatments, benefit rules, or insurance terms."
+            if not is_rx_valid:
+                if is_manual_rx:
+                    rx_reason = "The self-entered text contains no recognizable medical details (no diagnosis, symptoms, diseases, medicines, or medical tests)."
+                else:
+                    rx_reason = "The uploaded document contains no valid diagnosis, medicines, medical tests, procedures, or symptoms."
+
             if not is_policy_valid and not is_rx_valid:
                 inv_status = "Invalid Policy and Prescription"
             elif not is_policy_valid:
@@ -455,27 +448,24 @@ async def run_analysis_pipeline(
                         "policyValid": is_policy_valid,
                         "prescriptionValid": is_rx_valid,
                         "isPolicyValid": is_policy_valid,
-                        "isPrescriptionValid": is_rx_valid
+                        "isPrescriptionValid": is_rx_valid,
+                        "policyInvalidReason": p_reason,
+                        "prescriptionInvalidReason": rx_reason,
+                        "errors": validation.get("errors", [])
                     },
                     "overallStatus": inv_status,
                     "comparison": []
                 },
                 processing_time_ms=processing_time
             )
-            report.status = "completed"
-            report.document_validity = final_report.get("documentValidity")
-            report.overall_status = final_report.get("overallStatus")
-            report.dominance_score = 0.0
-            report.coverage_breakdown = final_report.get("coverageBreakdown")
-            report.summary = final_report.get("summary")
-            report.summary_text = final_report.get("summaryText")
-            report.comparison = []
-            report.processing_time_ms = processing_time
-            report.matched_items = []
-            report.excluded_items = []
-            await report.save()
-            fresh = await AnalysisReport.get(report.id)
-            return fresh.dict(by_alias=True)
+            # Do NOT store invalid coverage summary report in DB as per user requirement
+            try:
+                await report.delete()
+                logger.info(f"[Orchestrator] Removed invalid report {report.id} from DB.")
+            except Exception as del_err:
+                logger.warning(f"[Orchestrator] Could not delete invalid report: {del_err}")
+
+            return final_report
 
         report.status = "analyzing"
         await report.save()
@@ -533,6 +523,13 @@ async def run_analysis_pipeline(
             
         # Stage 11: Finalize and Save AnalysisReport
         logger.info("[Orchestrator] Stage 11: Finalizing and Saving Report")
+        if str(final_report.get("overallStatus", "")).startswith("Invalid"):
+            try:
+                await report.delete()
+                logger.info(f"[Orchestrator] Removed invalid analysis report {report.id} from DB.")
+            except Exception:
+                pass
+            return final_report
         report.status = "completed"
         report.document_validity = final_report.get("documentValidity")
         report.overall_status = final_report.get("overallStatus")

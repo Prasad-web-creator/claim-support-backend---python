@@ -147,7 +147,17 @@ def generate_report(
             summary_text = "The uploaded Policy document could not be analyzed because it is invalid, unreadable, or unsupported."
         else:
             overall_status = "Invalid Prescription"
-            summary_text = "The uploaded Prescription document could not be analyzed because it is invalid, unreadable, or unsupported."
+            is_manual_rx = bool(
+                prescription_json and (
+                    prescription_json.get("isManual")
+                    or prescription_json.get("prescriptionSource") == "Self-entered Prescription"
+                    or prescription_json.get("manualText")
+                )
+            )
+            if is_manual_rx:
+                summary_text = "The self-entered prescription is not valid. Please provide valid medical details (such as diagnosis, symptoms, diseases, medicines, or medical tests) and try again."
+            else:
+                summary_text = "The uploaded Prescription document could not be analyzed because it is invalid, unreadable, or unsupported."
     else:
         coverage_breakdown = {
             "covered": covered_count,
@@ -173,11 +183,27 @@ def generate_report(
         if end_date and end_date < datetime.now():
             policy_status = "Expired"
 
+    policy_company = policy_json.get("insuranceCompany")
+    if not policy_company or str(policy_company).strip().lower() in ("none", "null", "unknown", "unknown policy", "unknown company"):
+        policy_company = "---"
+
+    policy_name = policy_json.get("policyName")
+    if not policy_name or str(policy_name).strip().lower() in ("none", "null", "unknown", "unknown policy"):
+        policy_name = "---"
+
+    policy_num = policy_json.get("policyNumber")
+    if not policy_num or str(policy_num).strip().lower() in ("none", "null", "unknown"):
+        policy_num = "---"
+
+    policy_type = policy_json.get("policyType")
+    if not policy_type or str(policy_type).strip().lower() in ("none", "null", "unknown"):
+        policy_type = "---"
+
     policy_summary = {
-        "company": policy_json.get("insuranceCompany", "Unknown"),
-        "policyName": policy_json.get("policyName", "Unknown"),
-        "policyNumber": policy_json.get("policyNumber", "Unknown"),
-        "policyType": policy_json.get("policyType", "Unknown"),
+        "company": policy_company,
+        "policyName": policy_name,
+        "policyNumber": policy_num,
+        "policyType": policy_type,
         "coverageAmount": policy_json.get("coverageAmount", 0),
         "status": policy_status
     }
@@ -189,11 +215,37 @@ def generate_report(
     )
     prescription_source = "Self-entered Prescription" if is_manual_rx else prescription_json.get("prescriptionSource", "PDF Upload")
 
+    # Clean fallback for diagnosis
+    extracted_diag = prescription_json.get("diagnosis")
+    if not extracted_diag or str(extracted_diag).strip().lower() in ("none", "null", "unknown"):
+        symptoms_list = prescription_json.get("symptoms")
+        if isinstance(symptoms_list, list) and len(symptoms_list) > 0:
+            extracted_diag = ", ".join(str(s) for s in symptoms_list if s)
+        elif prescription_json.get("manualText"):
+            extracted_diag = prescription_json.get("manualText")
+        else:
+            extracted_diag = None
+
+    p_name = prescription_json.get("patientName")
+    if not p_name or str(p_name).strip().lower() in ("none", "null", "unknown", "unknown patient"):
+        p_name = None
+
+    h_name = prescription_json.get("hospitalName")
+    if not h_name or str(h_name).strip().lower() in ("none", "null", "unknown", "unknown hospital"):
+        h_name = None
+
+    d_name = prescription_json.get("doctorName")
+    if not d_name or str(d_name).strip().lower() in ("none", "null", "unknown", "unknown doctor"):
+        d_name = None
+
+    if extracted_diag and not prescription_json.get("diagnosis"):
+        prescription_json["diagnosis"] = extracted_diag
+
     prescription_summary = {
-        "patientName": prescription_json.get("patientName", "Unknown"),
-        "hospital": prescription_json.get("hospitalName", "Unknown"),
-        "doctor": prescription_json.get("doctorName", "Unknown"),
-        "diagnosis": prescription_json.get("diagnosis", "Unknown"),
+        "patientName": p_name or "---",
+        "hospital": h_name or "---",
+        "doctor": d_name or "---",
+        "diagnosis": extracted_diag or "---",
         "hospitalizationRequired": prescription_json.get("hospitalizationRequired"),
         "isManual": is_manual_rx,
         "prescriptionSource": prescription_source,
@@ -204,9 +256,12 @@ def generate_report(
     excluded_items = coverage_analysis.get("excludedTreatments", [c["item"] for c in comparison if not c.get("isCovered")]) if not is_doc_invalid else []
 
     if not is_doc_invalid:
+        patient_clause = f"Patient {p_name}" if p_name else "Member"
+        diag_clause = f"diagnosed with {extracted_diag}" if extracted_diag else "requesting medical coverage"
+
         summary_text = (
             f"Analysis complete with status: {overall_status}. "
-            f"Patient {prescription_summary['patientName']} diagnosed with {prescription_summary['diagnosis']}. "
+            f"{patient_clause} {diag_clause}. "
             f"{len(matched_items)} items are covered, while {len(excluded_items)} items are not covered or excluded. "
             f"Dominance Score: {dominance_score}."
         )
@@ -215,11 +270,34 @@ def generate_report(
     if coverage_analysis.get("nextSteps") and isinstance(coverage_analysis["nextSteps"], list):
         recommendations += " " + " ".join(coverage_analysis["nextSteps"])
 
+    policy_invalid_reason = ""
+    prescription_invalid_reason = ""
+
+    if not p_valid:
+        policy_invalid_reason = (
+            doc_validity.get("policyInvalidReason")
+            or "The uploaded document contains no recognizable insurance policy clauses, covered treatments, benefit rules, or insurance terms."
+        )
+    if not rx_valid:
+        if is_manual_rx:
+            prescription_invalid_reason = (
+                doc_validity.get("prescriptionInvalidReason")
+                or "The self-entered text contains no recognizable medical details (no diagnosis, symptoms, diseases, medicines, or medical tests)."
+            )
+        else:
+            prescription_invalid_reason = (
+                doc_validity.get("prescriptionInvalidReason")
+                or "The uploaded document contains no valid diagnosis, medicines, medical tests, procedures, or symptoms."
+            )
+
     final_doc_validity = {
         "prescriptionValid": rx_valid,
         "policyValid": p_valid,
         "isPrescriptionValid": rx_valid,
         "isPolicyValid": p_valid,
+        "policyInvalidReason": policy_invalid_reason,
+        "prescriptionInvalidReason": prescription_invalid_reason,
+        "errors": doc_validity.get("errors", []),
         "injectionAttemptDetected": doc_validity.get("injectionAttemptDetected", False),
         "injectionAttemptDetails": doc_validity.get("injectionAttemptDetails", ""),
         "detectedDocumentTypeIfInvalid": doc_validity.get("detectedDocumentTypeIfInvalid", "")

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional, List
 from beanie import Document, Indexed
 from pydantic import Field, BaseModel
@@ -20,7 +20,7 @@ class ClarificationQuestion(BaseModel):
 class ClarificationAnswer(BaseModel):
     question_id: str = Field(alias="questionId")
     answer: Any
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class AnalysisSession(Document):
     """
@@ -49,8 +49,8 @@ class AnalysisSession(Document):
 
     report_id: Optional[str] = Field(default=None, alias="reportId") # Once completed
     
-    created_at: datetime = Field(default_factory=datetime.utcnow, alias="createdAt")
-    updated_at: datetime = Field(default_factory=datetime.utcnow, alias="updatedAt")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), alias="createdAt")
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), alias="updatedAt")
 
     class Settings:
         name = "analysissessions"

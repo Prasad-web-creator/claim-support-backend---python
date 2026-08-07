@@ -45,7 +45,7 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
             "dominanceScore": r.dominance_score,
             "processingTimeMs": r.processing_time_ms,
             "reportNumber": r.report_number,
-            "createdAt": r.created_at.isoformat() if r.created_at else r.id.generation_time.isoformat()
+            "createdAt": (r.created_at.isoformat() + "Z") if r.created_at else (r.id.generation_time.isoformat() if (r.id.generation_time.isoformat().endswith("Z") or "+" in r.id.generation_time.isoformat()) else r.id.generation_time.isoformat() + "Z")
         } for r in reports]
 
     results = await asyncio.gather(

@@ -18,12 +18,12 @@ async def extract_prescription_details(prescription_text: str) -> dict:
     """
     logger.info("[PrescriptionExtraction] Starting prescription extraction...")
     
-    if not prescription_text or len(prescription_text.strip()) < 20:
+    if not prescription_text or not prescription_text.strip():
         return {
             "isValid": False,
             "confidence": 0,
             "extractedJson": None,
-            "errors": ["Prescription text is too short or empty."],
+            "errors": ["Prescription text is empty."],
             "warnings": []
         }
         

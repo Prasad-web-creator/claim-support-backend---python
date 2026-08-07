@@ -17,9 +17,13 @@ async def validate_upload(file: UploadFile) -> UploadFile:
     settings = get_settings()
 
     # 1. Validate File Size
-    # In FastAPI, you typically limit body size via middleware, but we can check the file stream if possible
-    # A robust way is to read the file, check size, then seek(0). 
-    # For very large files this is memory intensive, but our max is 20MB.
+    content = await file.read()
+    if len(content) > settings.max_file_size_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File size exceeds maximum limit of {settings.MAX_FILE_SIZE_MB}MB"
+        )
+    await file.seek(0)
     
     # 2. Validate Extension
     if not file.filename:

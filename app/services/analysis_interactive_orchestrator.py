@@ -117,9 +117,15 @@ async def start_analysis_session(
         prescription_json = validation["validatedPrescriptionJson"]
 
         if is_manual_rx:
+            from datetime import datetime
+            today_str = datetime.now().strftime("%Y-%m-%d")
             prescription_json["isManual"] = True
             prescription_json["prescriptionSource"] = "Self-entered Prescription"
             prescription_json["manualText"] = rx_text
+            if not prescription_json.get("visitDate"):
+                prescription_json["visitDate"] = today_str
+            if not prescription_json.get("consultationDate"):
+                prescription_json["consultationDate"] = today_str
             if rx_doc:
                 rx_doc.extracted_prescription_text = rx_text
                 rx_doc.extracted_prescription_json = prescription_json
@@ -134,6 +140,16 @@ async def start_analysis_session(
         
         if not is_policy_valid or not is_rx_valid:
             logger.warning(f"[Interactive Orchestrator] Document validation failed: policyValid={is_policy_valid}, prescriptionValid={is_rx_valid}")
+            p_reason = ""
+            rx_reason = ""
+            if not is_policy_valid:
+                p_reason = "The uploaded policy document contains no recognizable insurance policy clauses, covered treatments, benefit rules, or insurance terms."
+            if not is_rx_valid:
+                if is_manual_rx:
+                    rx_reason = "The self-entered text contains no recognizable medical details (no diagnosis, symptoms, diseases, medicines, or medical tests)."
+                else:
+                    rx_reason = "The uploaded document contains no valid diagnosis, medicines, medical tests, procedures, or symptoms."
+
             if not is_policy_valid and not is_rx_valid:
                 inv_status = "Invalid Policy and Prescription"
             elif not is_policy_valid:
@@ -155,7 +171,10 @@ async def start_analysis_session(
                         "policyValid": is_policy_valid,
                         "prescriptionValid": is_rx_valid,
                         "isPolicyValid": is_policy_valid,
-                        "isPrescriptionValid": is_rx_valid
+                        "isPrescriptionValid": is_rx_valid,
+                        "policyInvalidReason": p_reason,
+                        "prescriptionInvalidReason": rx_reason,
+                        "errors": validation.get("errors", [])
                     },
                     "overallStatus": inv_status,
                     "comparison": []
@@ -163,42 +182,9 @@ async def start_analysis_session(
                 processing_time_ms=extraction_time_ms
             )
 
-            report = AnalysisReport(
-                user_id=session.user_id,
-                policy_id=session.policy_id,
-                prescription_id=session.prescription_id,
-                status="completed",
-                analysis_version="2.1.0",
-                policy_text=session.policy_text,
-                prescription_text=session.prescription_text,
-                policy_json=policy_json,
-                prescription_json=prescription_json,
-                business_rules={},
-                coverage_analysis={},
-                document_validity=final_report.get("documentValidity"),
-                overall_status=final_report.get("overallStatus"),
-                dominance_score=0.0,
-                coverage_breakdown=final_report.get("coverageBreakdown"),
-                summary=final_report.get("summary"),
-                summary_text=final_report.get("summaryText"),
-                comparison=[],
-                processing_time_ms=extraction_time_ms,
-                decision_type="Automatic",
-                confidence_score=0,
-                policy_clauses_used=[],
-                prescription_evidence=[],
-                clarification_answers_used=[],
-                session_id=str(session.id),
-                error_message=None
-            )
-            await report.insert()
-            session.report_id = str(report.id)
-            await session.save()
-
-            fresh = await AnalysisReport.get(report.id)
-            result = fresh.dict(by_alias=True)
-            result["status"] = "complete"
-            return result
+            # Do NOT store invalid coverage summary report in DB as per user requirement
+            final_report["status"] = "complete"
+            return final_report
         
         br_results = enforce_business_rules(policy_json, prescription_json)
         session.business_rules = br_results
@@ -337,6 +323,10 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
         coverage_analysis=analysis_data,
         processing_time_ms=total_processing_time
     )
+
+    if str(final_report.get("overallStatus", "")).startswith("Invalid"):
+        logger.info("[Interactive Orchestrator] Invalid report status; skipping DB insertion as requested.")
+        return final_report
 
     report = AnalysisReport(
         user_id=session.user_id,

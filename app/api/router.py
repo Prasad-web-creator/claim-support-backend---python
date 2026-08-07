@@ -3,7 +3,7 @@ API Router configuration.
 """
 
 from fastapi import APIRouter
-from app.api.routes import auth, upload, analysis, dashboard, policy_custom, rag
+from app.api.routes import auth, upload, analysis, dashboard, policy_custom
 from app.api.routes.crud_factory import create_crud_router
 from app.models.policy import Policy
 from app.models.prescription import Prescription
@@ -19,7 +19,7 @@ api_router.include_router(auth.router)
 api_router.include_router(upload.router)
 api_router.include_router(analysis.router)
 api_router.include_router(dashboard.router)
-api_router.include_router(rag.router)
+# RAG router removed — RAG feature disabled
 
 # Include custom policy routes FIRST so they override generic CRUD
 api_router.include_router(policy_custom.router)

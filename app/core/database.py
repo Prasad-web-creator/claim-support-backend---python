@@ -21,6 +21,16 @@ async def connect_to_mongodb() -> None:
 
     settings = get_settings()
 
+    # Ensure dnspython uses fallback public DNS resolvers (8.8.8.8, 1.1.1.1) to prevent SRV lookup timeouts on restricted local DNS
+    try:
+        import dns.resolver
+        resolver = dns.resolver.get_default_resolver()
+        for ns in ["8.8.8.8", "1.1.1.1", "8.8.4.4"]:
+            if ns not in resolver.nameservers:
+                resolver.nameservers.append(ns)
+    except Exception:
+        pass
+
     logger.info("Connecting to MongoDB...")
     client_kwargs = {}
     if "mongodb+srv" in settings.MONGODB_URI or "tls=true" in settings.MONGODB_URI.lower():
@@ -40,7 +50,6 @@ async def connect_to_mongodb() -> None:
     from app.models.activity_log import ActivityLog
     from app.models.counter import Counter
     from app.models.stored_file import StoredFile
-    from app.models.document_chunk import DocumentChunk
     from app.models.analysis_session import AnalysisSession
     from app.models.analysis_audit_log import AnalysisAuditLog
 
@@ -61,26 +70,6 @@ async def connect_to_mongodb() -> None:
 
     # Initialize GridFS bucket
     _gridfs_bucket = AsyncIOMotorGridFSBucket(db, bucket_name="fs")
-
-    # Connect to Atlas for Vector Search if configured
-    if settings.MONGO_ATLAS_URI:
-        logger.info("Connecting to MongoDB Atlas for Vector Search...")
-        atlas_kwargs = {}
-        if "mongodb+srv" in settings.MONGO_ATLAS_URI or "tls=true" in settings.MONGO_ATLAS_URI.lower():
-            atlas_kwargs["tlsCAFile"] = certifi.where()
-        _atlas_client = AsyncIOMotorClient(settings.MONGO_ATLAS_URI, **atlas_kwargs)
-        atlas_db = _atlas_client.get_default_database("claim_support")
-        await init_beanie(
-            database=atlas_db,
-            document_models=[DocumentChunk],
-        )
-        logger.info("MongoDB Atlas connected successfully")
-    else:
-        # Fallback to local DB if Atlas URI is not provided (vector search won't work)
-        await init_beanie(
-            database=db,
-            document_models=[DocumentChunk],
-        )
 
     logger.info("MongoDB connected successfully")
 

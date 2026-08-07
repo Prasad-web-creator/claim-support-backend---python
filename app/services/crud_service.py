@@ -3,6 +3,7 @@ Generic CRUD Service — replaces crudControllerFactory.js.
 Handles generic create, read, update, delete operations for Models.
 """
 
+from datetime import datetime
 from typing import TypeVar, Type, Any
 from beanie import Document, PydanticObjectId as ObjectId
 from pydantic import BaseModel
@@ -195,12 +196,13 @@ class CrudService:
                 query_conditions.append(Or(*or_conditions))
                 
         # Execute query
+        actual_sort_by = "_id" if sort_by in ("id", "_id") else sort_by
         sort_direction = -1 if sort_order.lower() == "desc" else 1
         
         total = await self.model.find(*query_conditions).count()
         
         docs = await self.model.find(*query_conditions).sort(
-            [(sort_by, sort_direction)]
+            [(actual_sort_by, sort_direction)]
         ).skip((page - 1) * limit).limit(limit).to_list()
         
         total_pages = (total + limit - 1) // limit if total > 0 else 1
@@ -209,9 +211,19 @@ class CrudService:
             dct = d.dict(by_alias=True)
             if "_id" in dct and dct["_id"] is not None:
                 dct["_id"] = str(dct["_id"])
+            for k in ("createdAt", "updatedAt", "created_at", "updated_at"):
+                v = dct.get(k)
+                if isinstance(v, datetime):
+                    if v.tzinfo is None:
+                        dct[k] = v.isoformat() + "Z"
+                    else:
+                        dct[k] = v.isoformat()
+                elif isinstance(v, str) and "T" in v and not v.endswith("Z") and "+" not in v:
+                    dct[k] = v + "Z"
             if not dct.get("createdAt") and hasattr(d, "id") and d.id:
                 try:
-                    dct["createdAt"] = d.id.generation_time.isoformat()
+                    iso = d.id.generation_time.isoformat()
+                    dct["createdAt"] = iso if (iso.endswith("Z") or "+" in iso) else iso + "Z"
                 except Exception:
                     pass
             return dct

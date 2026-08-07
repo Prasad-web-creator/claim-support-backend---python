@@ -2,12 +2,16 @@
 Analysis routes — migrated from analysisController.js.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+import math
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from typing import Optional, List, Any
+from pydantic import BaseModel, model_validator
 
 from app.middleware.auth import get_current_user
+from app.middleware.rate_limiter import limiter
 from app.services.analysis_interactive_orchestrator import start_analysis_session, resume_analysis_session
-from typing import Optional, List, Any
-from pydantic import BaseModel, root_validator
+from app.models.analysis_report import AnalysisReport
+from app.services.crud_service import CrudService
 
 router = APIRouter(prefix="/analysis", tags=["Analysis"])
 
@@ -17,18 +21,22 @@ class AnalysisRequest(BaseModel):
     policyId: Optional[str] = None
     prescriptionPath: str
 
-    @root_validator(pre=True)
+    @model_validator(mode='before')
+    @classmethod
     def check_exactly_one_policy_source(cls, values):
-        has_path = bool(values.get('policyPath'))
-        has_id = bool(values.get('policyId'))
-        if has_path == has_id:
-            raise ValueError('Exactly one of policyPath or policyId must be provided.')
+        if isinstance(values, dict):
+            has_path = bool(values.get('policyPath'))
+            has_id = bool(values.get('policyId'))
+            if has_path == has_id:
+                raise ValueError('Exactly one of policyPath or policyId must be provided.')
         return values
 
 
 @router.post("/start")
+@limiter.limit("5/minute")
 async def start_analysis(
-    request: AnalysisRequest,
+    request: Request,
+    body: AnalysisRequest,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
@@ -38,9 +46,9 @@ async def start_analysis(
     try:
         result = await start_analysis_session(
             user_id=current_user["id"],
-            policy_file_id=request.policyPath,
-            policy_doc_id=request.policyId,
-            prescription_id=request.prescriptionPath,
+            policy_file_id=body.policyPath,
+            policy_doc_id=body.policyId,
+            prescription_id=body.prescriptionPath,
             background_tasks=background_tasks
         )
         # It could be needs_clarification or complete
@@ -55,9 +63,11 @@ class AnswerRequest(BaseModel):
     answers: dict
 
 @router.post("/{session_id}/answer")
+@limiter.limit("5/minute")
 async def answer_clarification(
+    request: Request,
     session_id: str,
-    request: AnswerRequest,
+    body: AnswerRequest,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
@@ -68,7 +78,7 @@ async def answer_clarification(
         result = await resume_analysis_session(
             session_id=session_id,
             user_id=current_user["id"],
-            answers=request.answers,
+            answers=body.answers,
             background_tasks=background_tasks
         )
         return {
@@ -176,7 +186,6 @@ class BatchDeleteReportsRequest(BaseModel):
     ids: list[str]
 
 
-@router.post("/reports/batch-delete")
 @router.post("/batch-delete")
 async def batch_delete_analysis_reports(
     body: BatchDeleteReportsRequest,
