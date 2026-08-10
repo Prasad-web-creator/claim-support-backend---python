@@ -3,7 +3,7 @@ StoredFile document model — migrated from StoredFile.js (Mongoose).
 Stores metadata for ALL uploaded documents. S3 references removed per requirements.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Literal
 
 from beanie import Document, Indexed
@@ -54,6 +54,10 @@ class StoredFile(Document):
     is_deleted: bool = Field(default=False, alias="isDeleted")
     deleted_at: Optional[datetime] = Field(default=None, alias="deletedAt")
     deleted_by: Optional[str] = Field(default=None, alias="deletedBy")
+    
+    # ─── Timestamps ───────────────────────────────────────────────────────────
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), alias="createdAt")
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), alias="updatedAt")
 
     class Settings:
         name = "storedfiles"

@@ -19,6 +19,23 @@ from app.middleware.rate_limiter import limiter
 from app.api.router import api_router
 
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from datetime import timezone as dt_timezone
+
+from app.models.activity_log import ActivityLog
+from app.models.analysis_audit_log import AnalysisAuditLog
+from app.models.analysis_report import AnalysisReport
+from app.models.analysis_session import AnalysisSession
+from app.models.policy import Policy
+from app.models.prescription import Prescription
+from app.models.stored_file import StoredFile
+
+from app.services.ttl_service import ensure_ttl_indexes
+from app.services.cleanup_service import run_cleanup
+
+scheduler = AsyncIOScheduler()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle events: startup and shutdown."""
@@ -26,12 +43,31 @@ async def lifespan(app: FastAPI):
     
     # Startup
     logger.info(f"Starting Claim Support API in {settings.ENVIRONMENT} mode")
+    logger.info(f"Data retention enabled: {settings.DATA_CLEANUP_DAYS} days ({settings.ttl_seconds} seconds)")
     await connect_to_mongodb()
+    
+    # Ensure TTL Indexes on all non-permanent models
+    models = [
+        Policy, Prescription, AnalysisReport, AnalysisSession, 
+        AnalysisAuditLog, ActivityLog, StoredFile
+    ]
+    await ensure_ttl_indexes(models)
+    
+    # Start Background Cleanup Scheduler (UTC Midnight)
+    scheduler.add_job(
+        run_cleanup, 
+        CronTrigger(hour=0, minute=0, timezone=dt_timezone.utc), 
+        id="daily_cleanup", 
+        replace_existing=True
+    )
+    scheduler.start()
+    logger.info("Started background APScheduler for daily GridFS cleanup (UTC 00:00).")
     
     yield
     
     # Shutdown
     logger.info("Shutting down...")
+    scheduler.shutdown()
     await close_mongodb_connection()
 
 

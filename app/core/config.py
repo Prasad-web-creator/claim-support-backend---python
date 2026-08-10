@@ -44,6 +44,16 @@ class Settings(BaseSettings):
         description="Comma-separated allowed MIME types",
     )
 
+    # ─── Data Retention ───────────────────────────────────────────────────────
+    DATA_CLEANUP_DAYS: int = Field(default=30, ge=1, le=365, description="Days to retain non-permanent data")
+    DATA_CLEANUP_DRY_RUN: bool = Field(default=False, description="Run cleanup without deleting")
+    DATA_CLEANUP_MAX_PERCENTAGE: float = Field(default=0.05, ge=0.01, le=1.0, description="Max percentage to delete per run")
+    DATA_CLEANUP_MAX_COUNT: int = Field(default=10000, description="Absolute maximum documents to delete per run")
+    DATA_CLEANUP_COLLECTIONS_ALLOWLIST: str = Field(
+        default="policies,prescriptions,analysisreports,analysissessions,analysisauditlogs,activitylogs,storedfiles",
+        description="Comma-separated allowed collections for cleanup"
+    )
+
     @property
     def is_production(self) -> bool:
         return self.ENVIRONMENT == "production"
@@ -61,6 +71,14 @@ class Settings(BaseSettings):
     @property
     def max_file_size_bytes(self) -> int:
         return self.MAX_FILE_SIZE_MB * 1024 * 1024
+
+    @property
+    def ttl_seconds(self) -> int:
+        return self.DATA_CLEANUP_DAYS * 24 * 60 * 60
+
+    @property
+    def collections_allowlist(self) -> list[str]:
+        return [c.strip() for c in self.DATA_CLEANUP_COLLECTIONS_ALLOWLIST.split(",") if c.strip()]
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

@@ -26,7 +26,7 @@ class AnalysisAuditLog(Document):
     confidence_score: Optional[int] = Field(default=None, alias="confidenceScore")
     final_decision: Optional[str] = Field(default=None, alias="finalDecision")
     
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), alias="createdAt")
 
     class Settings:
         name = "analysisauditlogs"

@@ -2,6 +2,7 @@
 ActivityLog document model — migrated from ActivityLog.js (Mongoose).
 """
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from beanie import Document, Indexed
@@ -17,6 +18,7 @@ class ActivityLog(Document):
     entity_id: Optional[str] = Field(default=None, alias="entityId")
 
     # Base schema fields
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), alias="createdAt")
     created_by: Optional[str] = Field(default=None, alias="createdBy")
     updated_by: Optional[str] = Field(default=None, alias="updatedBy")
     is_deleted: bool = Field(default=False, alias="isDeleted")
