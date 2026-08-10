@@ -55,4 +55,7 @@ async def ensure_ttl_indexes(models: list[Type[Document]]):
                 await collection.create_indexes([index])
                 
         except Exception as e:
-            logger.error(f"[TTL Service] Error managing TTL index for {collection_name}: {e}")
+            if getattr(e, "code", None) == 14031 or "OutOfDiskSpace" in str(e):
+                logger.warning(f"[TTL Service] Skipping TTL index for {collection_name}: Low disk space (MongoDB requires 500MB free).")
+            else:
+                logger.error(f"[TTL Service] Error managing TTL index for {collection_name}: {e}")
