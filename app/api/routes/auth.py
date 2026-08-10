@@ -17,7 +17,7 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(request: RegisterRequest):
-    """Register a new user (mock implementation)."""
+
     # Check if user exists
     existing = await User.find_one(User.email == request.email)
     if existing:
@@ -50,21 +50,12 @@ async def login(request: LoginRequest):
     # For mock login, we just find the user by phone or return a default user
     user = await User.find_one(User.phone == request.phone)
     if not user:
-        # Auto-create mock user for easy testing if not found
-        user = User(
-            name="Mock User",
-            email=f"{request.phone}@mock.com",
-            phone=request.phone,
-            created_by="system",
-            refresh_token=generate_refresh_token(),
-            refresh_token_expiry=get_refresh_token_expiry()
-        )
-        await user.insert()
-    else:
-        # Update refresh token
-        user.refresh_token = generate_refresh_token()
-        user.refresh_token_expiry = get_refresh_token_expiry()
-        await user.save()
+        raise HTTPException(status_code=404, detail="User not found. Please register first.")
+        
+    # Update refresh token
+    user.refresh_token = generate_refresh_token()
+    user.refresh_token_expiry = get_refresh_token_expiry()
+    await user.save()
         
     token = create_access_token(str(user.id))
     
@@ -146,6 +137,11 @@ async def update_me(request: UpdateProfileRequest, current_user: dict = Depends(
 
 
 @router.post("/logout")
-async def logout():
+async def logout(current_user: dict = Depends(get_current_user)):
     """Logout current user."""
+    user = await User.get(current_user["id"])
+    if user:
+        user.refresh_token = None
+        user.refresh_token_expiry = None
+        await user.save()
     return {"success": True, "message": "Logged out successfully"}

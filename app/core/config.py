@@ -18,7 +18,7 @@ class Settings(BaseSettings):
 
     # ─── Security ─────────────────────────────────────────────────────────────
     JWT_SECRET: str = Field(..., description="Secret key for JWT signing")
-    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=15, description="Access token TTL")
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=60, description="Access token TTL")
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7, description="Refresh token TTL")
     ALLOWED_ORIGINS: str = Field(default="", description="Comma-separated CORS origins")
 
