@@ -27,9 +27,9 @@ class Settings(BaseSettings):
 
     # ─── AI / LLM ─────────────────────────────────────────────────────────────
     GEMINI_API_KEY: str = Field(..., description="Google Gemini API key")
-    AI_MODEL: str = Field(default="models/gemini-2.5-flash", description="Primary AI model")
+    AI_MODEL: str = Field(default="models/gemini-flash-lite-latest", description="Primary AI model")
     AI_VISION_MODEL: str = Field(
-        default="models/gemini-2.5-flash",
+        default="models/gemini-flash-lite-latest",
         description="Vision/multimodal AI model",
     )
 

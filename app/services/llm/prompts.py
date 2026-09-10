@@ -27,6 +27,22 @@ Return the extracted content as a JSON object:
 
 Preserve document structure. Do NOT summarize. Extract everything visible."""
 
+# Direct Vision OCR prompt — extracts full text preserving layout without JSON wrapper overhead
+DIRECT_OCR_SYSTEM_PROMPT = """You are a high-accuracy document OCR engine.
+
+Extract all readable text from the provided scanned PDF or image exactly as it appears.
+
+Rules:
+- Preserve the original reading order and document structure.
+- Preserve headings, labels, key-value pairs, bullet points, and table content.
+- Preserve numbers, dates, policy numbers, member names, amounts, medicine names, dosages, and other alphanumeric values exactly.
+- Do not summarize, interpret, correct, normalize, or invent text.
+- For tables, preserve row and column relationships as accurately as possible.
+- For multi-page documents, separate pages using:
+--- Page N ---
+- If text is unclear or unreadable, do not guess. Mark it as [UNCLEAR].
+- Output only the extracted document text. Do not add explanations or commentary."""
+
 # Document classification prompt
 CLASSIFICATION_PROMPT = """You are a document classification expert.
 
@@ -74,10 +90,12 @@ CRITICAL RULES:
 5. NEVER return strings like "Unknown", "N/A", "Not specified", or "None". If missing, return null.
 6. Never invent values.
 7. Preserve dates and monetary values exactly when present.
+8. insuredMembers is CRITICAL — extract ALL insured persons listed in the policy, including the policyholder and all dependents/family members.
 
 Return ONLY a valid JSON object with the following fields:
 - insuranceCompany (string or null)
-- policyHolder (string or null)
+- policyHolder (string or null) — the primary policyholder name
+- policyholderName (string or null) — same as policyHolder (duplicate for compatibility)
 - policyNumber (string or null)
 - policyType (string or null)
 - policyStartDate (string or null)
@@ -85,6 +103,7 @@ Return ONLY a valid JSON object with the following fields:
 - coverageAmount (number or null)
 - waitingPeriodDays (number or null) - MUST BE RAW NUMBER, NO MATH EXPRESSIONS (e.g., use 1440 instead of 48 * 30)
 - roomEligibility (string or null)
+- insuredMembers (array of objects) — CRITICAL: list every insured person in the policy. Each object: { "name": string, "dateOfBirth": string or null, "age": number or null, "gender": string or null, "relationship": string or null }
 - coveredDiseases (array of strings)
 - excludedDiseases (array of strings)
 - coveredTreatments (array of strings)
@@ -113,9 +132,12 @@ CRITICAL RULES:
 4. Do not invent or guess any medical values.
 5. Preserve dates exactly.
 6. Preserve medicine names, hospital names, and doctor names exactly.
+7. patientName must be the FULL name exactly as written on the prescription (including any title like Mr./Mrs./Dr.).
 
 Return ONLY a valid JSON object with the following fields:
-- patientName (string)
+- patientName (string) — full name exactly as on the prescription
+- patientAge (number or null) — patient age as a number
+- patientGender (string or null) — patient gender (Male/Female/Other)
 - age (number) - MUST BE RAW NUMBER, NO MATH EXPRESSIONS
 - gender (string)
 - doctor (string)

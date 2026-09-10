@@ -32,6 +32,27 @@ async def analyze_coverage(
         else "Uploaded Prescription (PDF / Image / OCR — standard extracted document)"
     )
 
+    # Build near-match clarification block for the prompt
+    near_matches = business_rule_results.get("nearMatchClarifications", [])
+    near_match_block = ""
+    if near_matches:
+        near_match_block = """
+==================================================
+
+NEAR-MATCH CLARIFICATIONS REQUIRED
+(The business rule engine detected approximate matches that need user confirmation.
+ You MUST ask the user these questions via 'ask_questions' before making a final decision.
+ Use the exact question text provided below — do not rewrite or skip them.)
+
+"""
+        for nm in near_matches:
+            near_match_block += (
+                f"• Field: {nm.get('field')}\n"
+                f"  Prescription value: \"{nm.get('prescriptionValue')}\"\n"
+                f"  Policy value:        \"{nm.get('policyValue')}\"\n"
+                f"  Question to ask:     {nm.get('question')}\n\n"
+            )
+
     # Build the prompt
     user_prompt = f"""
 PRESCRIPTION SOURCE
@@ -58,7 +79,7 @@ BUSINESS RULE RESULTS
 
 {json.dumps(business_rule_results)}
 
-==================================================
+=================================================={near_match_block}
 
 PREVIOUS CLARIFICATION HISTORY
 (Use this to avoid asking duplicate questions. If a question is answered here, DO NOT ask it again.)
@@ -71,7 +92,8 @@ PREVIOUS CLARIFICATION HISTORY
         result = await extract_json_with_retry(
             system_prompt=COVERAGE_ANALYSIS_SYSTEM_PROMPT,
             user_content=user_prompt,
-            max_tokens=8192
+            max_tokens=8192,
+            operation_name="Coverage Analysis & Adjudication",
         )
         
         extracted = result["extractedJson"]

@@ -149,7 +149,8 @@ async def extract_policy_metadata(policy_text: str) -> dict:
             result = await extract_json_with_retry(
                 system_prompt=METADATA_EXTRACTION_PROMPT,
                 user_content=f"Document Type: Policy\n\nDocument Text:\n{chunk}",
-                max_tokens=4000
+                max_tokens=4000,
+                operation_name="Background Policy Metadata",
             )
             if result.get("extractedJson"):
                 extracted_jsons.append(result["extractedJson"])
@@ -178,7 +179,8 @@ async def extract_prescription_metadata(rx_text: str) -> dict:
             result = await extract_json_with_retry(
                 system_prompt=METADATA_EXTRACTION_PROMPT,
                 user_content=f"Document Type: Prescription\n\nDocument Text:\n{chunk}",
-                max_tokens=4000
+                max_tokens=4000,
+                operation_name="Background Prescription Metadata",
             )
             if result.get("extractedJson"):
                 extracted_jsons.append(result["extractedJson"])

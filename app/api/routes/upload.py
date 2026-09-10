@@ -41,6 +41,17 @@ async def upload_file(
     if actual_mime not in settings.allowed_mime_types_list:
          raise HTTPException(status_code=400, detail="File content does not match allowed types.")
          
+    # Detect if image-based (scanned PDF or image)
+    is_image_based = False
+    if actual_mime.startswith("image/"):
+        is_image_based = True
+    elif actual_mime == "application/pdf":
+        try:
+            from app.services.pdf.pdf_extractor import is_scanned_pdf
+            is_image_based = is_scanned_pdf(buffer)
+        except Exception:
+            is_image_based = False
+
     # Upload
     result = await FileUploadService.upload_file(
         buffer=buffer,
@@ -56,7 +67,8 @@ async def upload_file(
         filename=result["storedFilename"],
         originalName=file.filename,
         contentType=actual_mime,
-        size=len(buffer)
+        size=len(buffer),
+        isImageBased=is_image_based
     )
 
 @router.get("/{file_id}")

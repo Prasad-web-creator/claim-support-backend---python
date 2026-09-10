@@ -69,6 +69,10 @@ class ConflictError(AppError):
 # ─── FastAPI Exception Handlers ──────────────────────────────────────────────
 
 
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
     """Handle AppError exceptions with structured JSON responses."""
     logger.error(f"[AppError] {exc.status_code}: {exc.message}")
@@ -78,9 +82,31 @@ async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
     )
 
 
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """Handle standard HTTPExceptions (like 404 Not Found, 401 Unauthorized)."""
+    logger.warning(f"[HTTPException] {exc.status_code}: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"success": False, "message": str(exc.detail)},
+    )
+
+
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Handle Pydantic request body/query validation errors cleanly."""
+    errors = exc.errors()
+    first_error_msg = errors[0].get("msg", "Invalid request parameters") if errors else "Validation Error"
+    field_loc = " -> ".join([str(loc) for loc in errors[0].get("loc", [])]) if errors else ""
+    error_summary = f"{field_loc}: {first_error_msg}" if field_loc else first_error_msg
+    logger.warning(f"[ValidationError] {error_summary}")
+    return JSONResponse(
+        status_code=422,
+        content={"success": False, "message": error_summary, "errors": errors},
+    )
+
+
 async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Catch-all handler — never expose stack traces to clients."""
-    logger.error(f"[Unhandled Exception] {type(exc).__name__}: {exc}")
+    """Catch-all handler — prevents server crashes and avoids exposing stack traces."""
+    logger.error(f"[Unhandled Server Exception] {type(exc).__name__}: {exc}")
     from app.core.config import get_settings
 
     settings = get_settings()

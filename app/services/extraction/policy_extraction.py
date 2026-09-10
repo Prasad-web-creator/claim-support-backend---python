@@ -47,7 +47,8 @@ async def extract_policy_details(policy_text: str) -> dict:
             result = await extract_json_with_retry(
                 system_prompt=POLICY_EXTRACTION_PROMPT,
                 user_content=chunk,
-                max_tokens=4000
+                max_tokens=4000,
+                operation_name="Policy JSON Extraction" if len(chunks) == 1 else f"Policy JSON Extraction (Chunk {i+1}/{len(chunks)})",
             )
             return i, result
         except Exception as e:

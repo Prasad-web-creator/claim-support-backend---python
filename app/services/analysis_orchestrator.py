@@ -105,9 +105,6 @@ async def _background_post_processing(
                 logger.error(f"[Orchestrator] Prescription metadata extraction error: {rx_meta}")
                 rx_meta = {}
 
-            report.policy_metadata = policy_meta
-            report.prescription_metadata = rx_meta
-
             # 1. Update / Insert in `policies` collection
             target_policy_doc = None
             if policy_doc_id:
@@ -131,9 +128,8 @@ async def _background_post_processing(
             )
 
             if target_policy_doc:
-                target_policy_doc.metadata = policy_meta
-                target_policy_doc.extracted_policy_text = report.policy_text
-                target_policy_doc.extracted_policy_json = report.policy_json
+                target_policy_doc.extracted_policy_text = report.policy_text or ""
+                target_policy_doc.extracted_policy_json = report.policy_json or {}
                 if p_holder:
                     target_policy_doc.policy_holder_name = str(p_holder)
                 if policy_meta.get("provider_name"):
@@ -168,18 +164,17 @@ async def _background_post_processing(
             elif policy_file_id:
                 new_policy = Policy(
                     user_id=user_id,
-                    insurance_company=policy_meta.get("provider_name") or (report.policy_json.get("insuranceCompany") if report.policy_json else None),
-                    policy_number=str(policy_meta.get("policy_number")) if policy_meta.get("policy_number") else (str(report.policy_json.get("policyNumber")) if report.policy_json and report.policy_json.get("policyNumber") else None),
-                    policy_name=str(policy_meta.get("plan_name")) if policy_meta.get("plan_name") else None,
-                    policy_holder_name=str(p_holder) if p_holder else None,
-                    policy_type=str(policy_meta.get("policy_type")) if policy_meta.get("policy_type") else (str(report.policy_json.get("policyType")) if report.policy_json and report.policy_json.get("policyType") else None),
-                    coverage_amount=_safe_parse_float(policy_meta.get("sum_insured") or policy_meta.get("available_sum_insured")),
+                    insurance_company=policy_meta.get("provider_name") or (report.policy_json.get("insuranceCompany") if report.policy_json else ""),
+                    policy_number=str(policy_meta.get("policy_number")) if policy_meta.get("policy_number") else (str(report.policy_json.get("policyNumber")) if report.policy_json and report.policy_json.get("policyNumber") else ""),
+                    policy_name=str(policy_meta.get("plan_name")) if policy_meta.get("plan_name") else "",
+                    policy_holder_name=str(p_holder) if p_holder else "",
+                    policy_type=str(policy_meta.get("policy_type")) if policy_meta.get("policy_type") else (str(report.policy_json.get("policyType")) if report.policy_json and report.policy_json.get("policyType") else ""),
+                    coverage_amount=_safe_parse_float(policy_meta.get("sum_insured") or policy_meta.get("available_sum_insured")) or 0.0,
                     policy_start_date=_safe_parse_datetime(policy_meta.get("policy_start_date")),
                     policy_end_date=_safe_parse_datetime(policy_meta.get("policy_expiry_date")),
-                    grid_fs_file_id=policy_file_id,
-                    extracted_policy_text=report.policy_text,
-                    extracted_policy_json=report.policy_json,
-                    metadata=policy_meta,
+                    grid_fs_file_id=policy_file_id or "",
+                    extracted_policy_text=report.policy_text or "",
+                    extracted_policy_json=report.policy_json or {},
                     processing_status="completed"
                 )
                 await new_policy.insert()
@@ -202,14 +197,8 @@ async def _background_post_processing(
                 (report.prescription_json and (
                     report.prescription_json.get("isManual")
                     or report.prescription_json.get("prescriptionSource") == "Self-entered Prescription"
-                    or report.prescription_json.get("manualText")
                 ))
                 or (target_rx_doc and target_rx_doc.is_manual)
-            )
-            manual_text = (
-                (report.prescription_json.get("manualText") if report.prescription_json else None)
-                or (target_rx_doc.manual_text if target_rx_doc else None)
-                or (report.prescription_text if is_manual_rx else None)
             )
 
             rx_diag = rx_meta.get("diagnosis")
@@ -227,13 +216,10 @@ async def _background_post_processing(
             rx_visit_date = _safe_parse_datetime(rx_meta.get("hospital_visit_date") or rx_meta.get("consultation_date") or rx_meta.get("visit_date") or rx_meta.get("admission_date") or (report.prescription_json.get("visitDate") if report.prescription_json else None) or (report.prescription_json.get("consultationDate") if report.prescription_json else None) or (report.prescription_json.get("admissionDate") if report.prescription_json else None))
 
             if target_rx_doc:
-                target_rx_doc.metadata = rx_meta
-                target_rx_doc.extracted_prescription_text = report.prescription_text
-                target_rx_doc.extracted_prescription_json = report.prescription_json
+                target_rx_doc.extracted_prescription_text = report.prescription_text or ""
+                target_rx_doc.extracted_prescription_json = report.prescription_json or {}
                 if is_manual_rx:
                     target_rx_doc.is_manual = True
-                    target_rx_doc.manual_text = manual_text or report.prescription_text
-                    target_rx_doc.prescription_source = "Self-entered Prescription"
                 if rx_hospital:
                     target_rx_doc.hospital_name = str(rx_hospital)
                 if rx_doctor:
@@ -252,19 +238,16 @@ async def _background_post_processing(
             else:
                 new_rx = Prescription(
                     user_id=user_id,
-                    hospital_name=str(rx_hospital) if rx_hospital else None,
-                    doctor_name=str(rx_doctor) if rx_doctor else None,
-                    patient_name=str(rx_patient) if rx_patient else None,
-                    prescription_number=str(rx_number) if rx_number else None,
-                    visit_date=rx_visit_date,
-                    diagnosis=str(diag_str) if diag_str else None,
+                    hospital_name=str(rx_hospital) if rx_hospital else "",
+                    doctor_name=str(rx_doctor) if rx_doctor else "",
+                    patient_name=str(rx_patient) if rx_patient else "",
+                    prescription_number=str(rx_number) if rx_number else "",
+                    visit_date=rx_visit_date or "",
+                    diagnosis=str(diag_str) if diag_str else "",
                     is_manual=is_manual_rx,
-                    manual_text=manual_text or (report.prescription_text if is_manual_rx else None),
-                    prescription_source="Self-entered Prescription" if is_manual_rx else "PDF Upload",
-                    grid_fs_file_id=None if is_manual_rx else prescription_id,
-                    extracted_prescription_text=report.prescription_text,
-                    extracted_prescription_json=report.prescription_json,
-                    metadata=rx_meta,
+                    grid_fs_file_id="" if is_manual_rx else (prescription_id or ""),
+                    extracted_prescription_text=report.prescription_text or "",
+                    extracted_prescription_json=report.prescription_json or {},
                     processing_status="completed"
                 )
                 await new_rx.insert()
@@ -309,9 +292,10 @@ async def run_analysis_pipeline(
         # Stage 2 & 3: Extract & Clean Text
         logger.info("[Orchestrator] Stage 2 & 3: Extracting and Cleaning Text")
         
-        async def process_document(doc_id):
+        async def process_document(doc_id, doc_label="Document"):
+            logger.info(f"[Orchestrator] [DEBUG] Fetching file bytes from GridFS for {doc_label} (ID: {doc_id})...")
             bytes_data, mime = await _fetch_file_bytes_by_gridfs_id(doc_id, user_id)
-            raw_text = await extract_text_from_document(bytes_data, mime)
+            raw_text = await extract_text_from_document(bytes_data, mime, doc_label=doc_label)
             return clean_text(raw_text)
 
         # Check if prescription_id refers to a Prescription document or manual prescription
@@ -328,17 +312,18 @@ async def run_analysis_pipeline(
                 rx_doc = None
 
         if rx_doc:
-            if rx_doc.is_manual or rx_doc.manual_text:
+            if rx_doc.is_manual:
                 is_manual_rx = True
-                manual_rx_text = rx_doc.manual_text or rx_doc.extracted_prescription_text or ""
+                manual_rx_text = rx_doc.extracted_prescription_text or ""
             elif rx_doc.grid_fs_file_id:
                 target_rx_file_id = rx_doc.grid_fs_file_id
 
         async def load_rx_text():
             if is_manual_rx and manual_rx_text:
+                logger.info("[Orchestrator] [DEBUG] Prescription is self-entered manual text by user.")
                 return clean_text(manual_rx_text)
             try:
-                return await process_document(target_rx_file_id)
+                return await process_document(target_rx_file_id, doc_label="Prescription Document")
             except Exception as e:
                 # If target_rx_file_id is raw manual text directly passed
                 if prescription_id and len(prescription_id) > 10 and not prescription_id.isalnum():
@@ -349,25 +334,27 @@ async def run_analysis_pipeline(
         existing_policy_json = None
         
         if policy_doc_id:
-            logger.info(f"[Orchestrator] Reusing existing policy: {policy_doc_id}")
             policy_doc = await Policy.get(ObjectId(policy_doc_id))
             if not policy_doc or policy_doc.user_id != user_id:
                 raise ValueError("Invalid Policy ID or unauthorized")
                 
             if policy_doc.extracted_policy_text:
+                logger.info(
+                    f"[Orchestrator] [DEBUG] [Policy Document] Reusing CACHED text ({len(policy_doc.extracted_policy_text)} chars) on Policy {policy_doc.id}"
+                )
                 policy_text = policy_doc.extracted_policy_text
                 existing_policy_json = policy_doc.extracted_policy_json or {}
                 rx_text = await load_rx_text()
             else:
-                logger.info("[Orchestrator] Policy has no extracted text, extracting now")
+                logger.info("[Orchestrator] [DEBUG] Concurrently extracting Policy and Prescription documents...")
                 policy_text, rx_text = await asyncio.gather(
-                    process_document(policy_doc.grid_fs_file_id),
+                    process_document(policy_doc.grid_fs_file_id, doc_label="Policy Document"),
                     load_rx_text()
                 )
         else:
-            logger.info("[Orchestrator] Extracting new policy and prescription from files")
+            logger.info("[Orchestrator] [DEBUG] Concurrently extracting Policy and Prescription documents...")
             policy_text, rx_text = await asyncio.gather(
-                process_document(policy_file_id),
+                process_document(policy_file_id, doc_label="Policy Document"),
                 load_rx_text()
             )
         
@@ -536,7 +523,6 @@ async def run_analysis_pipeline(
         report.dominance_score = final_report.get("dominanceScore")
         report.coverage_breakdown = final_report.get("coverageBreakdown")
         report.summary = final_report.get("summary")
-        report.summary_text = final_report.get("summaryText")
         report.comparison = final_report.get("comparison")
         report.processing_time_ms = processing_time
         

@@ -23,6 +23,7 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
         "overallEligible": True,
         "blockers": [],
         "warnings": [],
+        "nearMatchClarifications": [],  # Near-matches that need user confirmation
     }
 
     if not policy or not prescription:
@@ -46,159 +47,133 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
         or prescription.get("prescriptionSource") == "Self-entered Prescription"
         or prescription.get("manualText")
     )
-
-    # 1. Policy Expiry Check
-    try:
-        policy_end = _parse_date(policy.get("policyEndDate"))
-        visit_date = _parse_date(prescription.get("visitDate") or prescription.get("consultationDate"))
-
-        # For self-entered queries, default visit_date to today's date if missing
-        if not visit_date and is_self_entered:
-            visit_date = datetime.now()
-
-        if policy_end and visit_date:
-            passed = visit_date <= policy_end
-            evaluate_rule(
-                "policyActive",
-                passed,
-                "Policy active during visit/evaluation date" if passed else "Policy expired before visit/evaluation date",
-                blocker=True,
-            )
-        elif visit_date:
-            evaluate_rule(
-                "policyActive",
-                True,
-                "Policy end date not specified; visit date accepted",
-                blocker=False,
-            )
-        else:
-            evaluate_rule(
-                "policyActive",
-                True,
-                "Missing visit date; assuming active current coverage query",
-                blocker=False,
-            )
-    except Exception as e:
-        evaluate_rule("policyActive", True, f"Date parse note: {e}", blocker=False)
-
-    # 2. Waiting Period Check
-    try:
-        policy_start = _parse_date(policy.get("policyStartDate"))
-        visit_date = _parse_date(prescription.get("visitDate") or prescription.get("consultationDate"))
-        if not visit_date and is_self_entered:
-            visit_date = datetime.now()
-        waiting_days = policy.get("waitingPeriodDays")
-
-        if policy_start and visit_date and waiting_days is not None:
-            # waiting_days is assumed to be an integer (e.g. 30, 90, 1440)
-            days_active = (visit_date - policy_start).days
-            passed = days_active >= int(waiting_days)
-            evaluate_rule(
-                "waitingPeriodCompleted",
-                passed,
-                f"Active for {days_active} days (Required: {waiting_days})" if passed else f"Waiting period not met. Active for {days_active} days (Required: {waiting_days})",
-                blocker=True,
-            )
-        else:
-            evaluate_rule(
-                "waitingPeriodCompleted",
-                False,
-                "Could not verify waiting period due to missing dates or waiting period value",
-                blocker=False, # Treat as warning instead of blocker if unknown
-            )
-    except Exception as e:
-        evaluate_rule("waitingPeriodCompleted", False, f"Waiting period check error: {e}")
-
-    # 3. Diagnosis Covered Check
-    diagnosis = (prescription.get("diagnosis") or "").lower()
-    covered_diseases = [d.lower() for d in (policy.get("coveredDiseases") or []) if d]
-    
-    if diagnosis and covered_diseases:
-        # Simple substring matching
-        passed = any(d in diagnosis or diagnosis in d for d in covered_diseases)
-        if passed:
-             evaluate_rule("diagnosisCovered", True, f"Diagnosis '{prescription.get('diagnosis')}' found in covered list")
-        else:
-             evaluate_rule("diagnosisCovered", False, f"Diagnosis '{prescription.get('diagnosis')}' not explicitly found in covered list", blocker=False)
-    else:
-        evaluate_rule("diagnosisCovered", False, "Missing diagnosis or covered diseases list", blocker=False)
-
-    # 4. Diagnosis Excluded Check
-    excluded_diseases = [d.lower() for d in (policy.get("excludedDiseases") or []) if d]
-    if diagnosis and excluded_diseases:
-        failed = any(d in diagnosis or diagnosis in d for d in excluded_diseases)
-        if failed:
-             evaluate_rule("diagnosisExcluded", False, f"Diagnosis '{prescription.get('diagnosis')}' is explicitly excluded", blocker=True)
-        else:
-             evaluate_rule("diagnosisExcluded", True, "Diagnosis is not in the excluded list")
-    else:
-         evaluate_rule("diagnosisExcluded", True, "No excluded diseases list to check against")
-
-    # 5. Hospitalization Check
-    hosp_req = prescription.get("hospitalizationRequired")
-    hosp_cov_raw = policy.get("hospitalization")
-    hosp_cov = (hosp_cov_raw or "").lower()
-
-    if hosp_req is True:
-        if hosp_cov_raw is None:
-             evaluate_rule("hospitalizationCovered", False, "Policy does not cover hospitalization (Outpatient Policy)", blocker=True)
-        elif "covered" in hosp_cov or "yes" in hosp_cov:
-            evaluate_rule("hospitalizationCovered", True, "Hospitalization is covered")
-        elif "not covered" in hosp_cov or "no" in hosp_cov:
-             evaluate_rule("hospitalizationCovered", False, "Policy explicitly does not cover hospitalization", blocker=True)
-        else:
-             evaluate_rule("hospitalizationCovered", False, "Unclear if hospitalization is covered", blocker=False)
-    else:
-        evaluate_rule("hospitalizationCovered", True, "Hospitalization not required")
-        
     # ===========================================================
-    # STAGE 1 — MEMBER ELIGIBILITY VALIDATION
-    # All rules below are BLOCKERS. If ANY fails, overallEligible
-    # is set to False and coverage analysis stops.
+    # STAGE 1 — MEMBER ELIGIBILITY VALIDATION (HARD GATE #1)
+    # All rules below are BLOCKERS. Must pass before evaluating
+    # dates, waiting periods, or medical coverage.
     # ===========================================================
 
     # --- Shared member reference data ---
     p_name = (prescription.get("patientName") or "").strip().lower()
-    members = policy.get("insuredMembers") or policy.get("familyMembers") or []
+
+    # Gather members from any field the LLM may have used
+    raw_members = (
+        policy.get("insuredMembers")
+        or policy.get("familyMembers")
+        or policy.get("insuredPersons")
+        or policy.get("members")
+        or policy.get("beneficiaries")
+        or []
+    )
+    # Normalise: LLM sometimes returns ["Name1","Name2"] instead of [{"name":"Name1"}]
+    members = []
+    for m in raw_members:
+        if isinstance(m, str):
+            members.append({"name": m})
+        elif isinstance(m, dict):
+            members.append(m)
+
     policyholder = (
         policy.get("policyholderName")
         or policy.get("policyHolder")
         or policy.get("insuredPersonName")
+        or policy.get("insuredName")
+        or policy.get("primaryInsured")
         or ""
     ).strip().lower()
 
-    # 7. Patient Name Match Check
+    # If no members list but policyholder name exists, treat it as a single-member list
+    if not members and policyholder:
+        members = [{"name": policyholder}]
+
+    # DEBUG: log actual members seen (remove after diagnosis is confirmed)
+    from app.core.logging import logger as _br_logger
+    _br_logger.info(
+        f"[BizRules DEBUG] p_name={repr(p_name)} | "
+        f"policyholder={repr(policyholder)} | "
+        f"members={[m.get('name','?') for m in members[:5]]}"
+    )
+
+    # 1. Patient Name Match Check
     if p_name:
         matched_member = None
+        match_is_exact = False
+
+        # Clean honorifics from prescription name before matching
+        p_name_clean = _strip_titles(p_name)
+
         for m in members:
-            m_name = (
+            m_name_raw = (
                 m.get("name")
                 or m.get("fullName")
                 or m.get("memberName")
                 or ""
             ).strip().lower()
-            if m_name and (
-                m_name in p_name
-                or p_name in m_name
-                or _fuzzy_name_match(p_name, m_name)
+            m_name_clean = _strip_titles(m_name_raw)
+
+            # Exact substring match
+            if m_name_raw and (
+                m_name_raw in p_name or p_name in m_name_raw
             ):
                 matched_member = m
+                match_is_exact = True
                 break
 
-        if not matched_member and policyholder and (
-            policyholder in p_name
-            or p_name in policyholder
-            or _fuzzy_name_match(p_name, policyholder)
-        ):
-            matched_member = {"name": policyholder}
+            # Fuzzy match (after title stripping)
+            if m_name_clean and (
+                m_name_clean in p_name_clean
+                or p_name_clean in m_name_clean
+                or _fuzzy_name_match(p_name_clean, m_name_clean)
+            ):
+                matched_member = m
+                match_is_exact = False
+                break
+
+        if not matched_member and policyholder:
+            ph_clean = _strip_titles(policyholder)
+            if policyholder in p_name or p_name in policyholder:
+                matched_member = {"name": policyholder}
+                match_is_exact = True
+            elif (
+                ph_clean in p_name_clean
+                or p_name_clean in ph_clean
+                or _fuzzy_name_match(p_name_clean, ph_clean)
+            ):
+                matched_member = {"name": policyholder}
+                match_is_exact = False
 
         if not matched_member and (members or policyholder):
+            # Hard fail: no match at all — even with fuzzy
             evaluate_rule(
                 "patientNameMatch",
                 False,
                 f"Patient '{prescription.get('patientName')}' is not listed as an insured member on this policy.",
                 blocker=True,
             )
+        elif matched_member and not match_is_exact:
+            # Near-match — pass the rule but flag for user confirmation
+            policy_name_display = (
+                matched_member.get("name")
+                or matched_member.get("fullName")
+                or matched_member.get("memberName")
+                or policyholder
+            )
+            evaluate_rule(
+                "patientNameMatch",
+                True,  # Don't hard-block; let LLM ask the user
+                f"Patient name near-match: prescription '{prescription.get('patientName')}' "
+                f"approximately matches policy insured '{policy_name_display}'. User confirmation required.",
+            )
+            results["nearMatchClarifications"].append({
+                "field": "patientName",
+                "prescriptionValue": prescription.get("patientName", ""),
+                "policyValue": policy_name_display,
+                "question": (
+                    f"The policy lists an insured member as \"\u200b{policy_name_display}\" "
+                    f"but the prescription shows the patient as \"\u200b{prescription.get('patientName', '')}\". "
+                    f"Are these the same person?"
+                ),
+            })
         else:
             evaluate_rule(
                 "patientNameMatch",
@@ -206,7 +181,7 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
                 f"Patient '{prescription.get('patientName')}' is an active insured member.",
             )
 
-    # 8. Patient Age Match Check
+    # 2. Patient Age Match Check
     p_age_raw = prescription.get("patientAge")
     if p_age_raw is not None:
         try:
@@ -228,12 +203,32 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
                 pol_age = int(pol_age_digits) if pol_age_digits else None
 
                 if presc_age is not None and pol_age is not None and presc_age != pol_age:
-                    evaluate_rule(
-                        "patientAgeMatch",
-                        False,
-                        f"Patient age mismatch: Prescription lists {presc_age} Yrs, but policy records {pol_age} Yrs for {matched_member.get('name', 'insured member')}.",
-                        blocker=True,
-                    )
+                    age_diff = abs(presc_age - pol_age)
+                    if age_diff <= 2:
+                        evaluate_rule(
+                            "patientAgeMatch",
+                            True,
+                            f"Minor age discrepancy: prescription lists {presc_age} Yrs, policy records {pol_age} Yrs "
+                            f"for {matched_member.get('name', 'insured member')}. User confirmation required.",
+                        )
+                        results["nearMatchClarifications"].append({
+                            "field": "patientAge",
+                            "prescriptionValue": str(presc_age),
+                            "policyValue": str(pol_age),
+                            "question": (
+                                f"The policy records the insured member \"{matched_member.get('name', 'insured')}\" "
+                                f"as {pol_age} years old, but the prescription lists the patient as {presc_age} years old. "
+                                f"Can you confirm this is the same person?"
+                            ),
+                        })
+                    else:
+                        evaluate_rule(
+                            "patientAgeMatch",
+                            False,
+                            f"Patient age mismatch: Prescription lists {presc_age} Yrs, but policy records {pol_age} Yrs "
+                            f"for {matched_member.get('name', 'insured member')}.",
+                            blocker=True,
+                        )
                 else:
                     evaluate_rule(
                         "patientAgeMatch",
@@ -243,7 +238,7 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
         except Exception as e:
             evaluate_rule("patientAgeMatch", True, f"Could not parse age: {e}")
 
-    # 9. Patient Gender Match Check
+    # 3. Patient Gender Match Check
     p_gender = (prescription.get("patientGender") or "").strip().lower()
     if p_gender:
         matched_member = None
@@ -261,10 +256,21 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
             if p_is_male != pol_is_male:
                 evaluate_rule(
                     "patientGenderMatch",
-                    False,
-                    f"Patient gender mismatch: Prescription lists {prescription.get('patientGender')}, but policy records {matched_member.get('gender')} for {matched_member.get('name', 'insured member')}.",
-                    blocker=True,
+                    True,
+                    f"Gender discrepancy: prescription lists {prescription.get('patientGender')}, "
+                    f"policy records {matched_member.get('gender')} for {matched_member.get('name', 'insured member')}. "
+                    f"User confirmation required.",
                 )
+                results["nearMatchClarifications"].append({
+                    "field": "patientGender",
+                    "prescriptionValue": prescription.get("patientGender", ""),
+                    "policyValue": str(matched_member.get("gender", "")),
+                    "question": (
+                        f"The policy lists the insured member \"{matched_member.get('name', 'insured')}\" "
+                        f"as {matched_member.get('gender')}, but the prescription records the patient as "
+                        f"{prescription.get('patientGender')}. Can you confirm the patient's gender?"
+                    ),
+                })
             else:
                 evaluate_rule(
                     "patientGenderMatch",
@@ -272,19 +278,9 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
                     "Patient gender matches policy records.",
                 )
 
-    # 11. Member ID / Policy Member Number — Exact Match
-    rx_member_id = (
-        prescription.get("memberId")
-        or prescription.get("memberNumber")
-        or prescription.get("policyMemberNumber")
-        or ""
-    ).strip()
-    pol_member_id = (
-        policy.get("memberId")
-        or policy.get("memberNumber")
-        or policy.get("policyMemberNumber")
-        or ""
-    ).strip()
+    # 4. Member ID Match
+    rx_member_id = (prescription.get("memberId") or prescription.get("memberNumber") or prescription.get("policyMemberNumber") or "").strip()
+    pol_member_id = (policy.get("memberId") or policy.get("memberNumber") or policy.get("policyMemberNumber") or "").strip()
     if rx_member_id and pol_member_id:
         if rx_member_id.lower() != pol_member_id.lower():
             evaluate_rule(
@@ -296,195 +292,7 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
         else:
             evaluate_rule("memberIdMatch", True, f"Member ID matched: {rx_member_id}")
 
-    # 12. Employee ID / Corporate Employee Number — Exact Match
-    rx_emp_id = (
-        prescription.get("employeeId")
-        or prescription.get("corporateEmployeeNumber")
-        or prescription.get("empId")
-        or ""
-    ).strip()
-    pol_emp_id = (
-        policy.get("employeeId")
-        or policy.get("corporateEmployeeNumber")
-        or policy.get("empId")
-        or ""
-    ).strip()
-    if rx_emp_id and pol_emp_id:
-        if rx_emp_id.lower() != pol_emp_id.lower():
-            evaluate_rule(
-                "employeeIdMatch",
-                False,
-                f"Employee ID mismatch: Prescription '{rx_emp_id}' vs Policy '{pol_emp_id}'.",
-                blocker=True,
-            )
-        else:
-            evaluate_rule("employeeIdMatch", True, f"Employee ID matched: {rx_emp_id}")
-
-    # 13. Health Card / Insurance Card Number — Exact Match
-    rx_card = (
-        prescription.get("healthCardNumber")
-        or prescription.get("insuranceCardNumber")
-        or ""
-    ).strip()
-    pol_card = (
-        policy.get("healthCardNumber")
-        or policy.get("insuranceCardNumber")
-        or ""
-    ).strip()
-    if rx_card and pol_card:
-        if rx_card.lower() != pol_card.lower():
-            evaluate_rule(
-                "healthCardMatch",
-                False,
-                f"Health/Insurance card number mismatch: Prescription '{rx_card}' vs Policy '{pol_card}'.",
-                blocker=True,
-            )
-        else:
-            evaluate_rule("healthCardMatch", True, f"Health/Insurance card matched: {rx_card}")
-
-    # 14. Group Member Number — Exact Match
-    rx_group = (prescription.get("groupMemberNumber") or "").strip()
-    pol_group = (policy.get("groupMemberNumber") or "").strip()
-    if rx_group and pol_group:
-        if rx_group.lower() != pol_group.lower():
-            evaluate_rule(
-                "groupMemberNumberMatch",
-                False,
-                f"Group member number mismatch: Prescription '{rx_group}' vs Policy '{pol_group}'.",
-                blocker=True,
-            )
-        else:
-            evaluate_rule("groupMemberNumberMatch", True, f"Group member number matched: {rx_group}")
-
-    # 15. Aadhaar Number — Exact Match (digits only)
-    rx_aadhaar = (prescription.get("aadhaarNumber") or "").strip().replace(" ", "").replace("-", "")
-    pol_aadhaar = (policy.get("aadhaarNumber") or "").strip().replace(" ", "").replace("-", "")
-    if rx_aadhaar and pol_aadhaar:
-        if rx_aadhaar != pol_aadhaar:
-            evaluate_rule(
-                "aadhaarMatch",
-                False,
-                f"Aadhaar number mismatch between prescription and policy records.",
-                blocker=True,
-            )
-        else:
-            evaluate_rule("aadhaarMatch", True, "Aadhaar number matched.")
-
-    # 16. Passport Number — Exact Match (case-insensitive)
-    rx_passport = (prescription.get("passportNumber") or "").strip().upper().replace(" ", "")
-    pol_passport = (policy.get("passportNumber") or "").strip().upper().replace(" ", "")
-    if rx_passport and pol_passport:
-        if rx_passport != pol_passport:
-            evaluate_rule(
-                "passportMatch",
-                False,
-                f"Passport number mismatch: Prescription '{rx_passport}' vs Policy '{pol_passport}'.",
-                blocker=True,
-            )
-        else:
-            evaluate_rule("passportMatch", True, "Passport number matched.")
-
-    # 17. National ID — Exact Match (case-insensitive)
-    rx_national_id = (
-        prescription.get("nationalId")
-        or prescription.get("nationalID")
-        or prescription.get("panNumber")
-        or ""
-    ).strip().upper().replace(" ", "")
-    pol_national_id = (
-        policy.get("nationalId")
-        or policy.get("nationalID")
-        or policy.get("panNumber")
-        or ""
-    ).strip().upper().replace(" ", "")
-    if rx_national_id and pol_national_id:
-        if rx_national_id != pol_national_id:
-            evaluate_rule(
-                "nationalIdMatch",
-                False,
-                f"National ID mismatch: Prescription '{rx_national_id}' vs Policy '{pol_national_id}'.",
-                blocker=True,
-            )
-        else:
-            evaluate_rule("nationalIdMatch", True, "National ID matched.")
-
-    # 18. Relationship Validation
-    rx_relationship = (prescription.get("relationship") or "").strip().lower()
-    policy_coverage_for = policy.get("coverageFor") or policy.get("insuredRelationships") or []
-    if isinstance(policy_coverage_for, str):
-        policy_coverage_for = [policy_coverage_for]
-    policy_coverage_for_lower = [r.strip().lower() for r in policy_coverage_for if r]
-
-    if rx_relationship and policy_coverage_for_lower:
-        # Normalise common relationship aliases
-        rel_aliases = {
-            "self": ["self", "primary", "policyholder", "policy holder"],
-            "spouse": ["spouse", "wife", "husband", "partner"],
-            "son": ["son", "child", "children", "dependent", "son/daughter"],
-            "daughter": ["daughter", "child", "children", "dependent", "son/daughter"],
-            "mother": ["mother", "parent", "parents", "mom"],
-            "father": ["father", "parent", "parents", "dad"],
-        }
-        rx_rel_normalised = rx_relationship
-        for canonical, aliases in rel_aliases.items():
-            if rx_relationship in aliases:
-                rx_rel_normalised = canonical
-                break
-
-        matched_rel = any(
-            rx_rel_normalised in r or r in rx_rel_normalised
-            for r in policy_coverage_for_lower
-        )
-        if not matched_rel:
-            evaluate_rule(
-                "relationshipEligible",
-                False,
-                f"Patient relationship '{prescription.get('relationship')}' is not a covered relationship under this policy.",
-                blocker=True,
-            )
-        else:
-            evaluate_rule(
-                "relationshipEligible",
-                True,
-                f"Patient relationship '{prescription.get('relationship')}' is covered under this policy.",
-            )
-
-    # 19. Policy Holder Coverage Check
-    # Ensure prescription patient exists in the policy member list
-    if p_name and (members or policyholder):
-        any_member_match = False
-        for m in members:
-            m_name = (
-                m.get("name")
-                or m.get("fullName")
-                or m.get("memberName")
-                or ""
-            ).strip().lower()
-            if m_name and (
-                m_name in p_name
-                or p_name in m_name
-                or _fuzzy_name_match(p_name, m_name)
-            ):
-                any_member_match = True
-                break
-        if not any_member_match and policyholder and (
-            policyholder in p_name
-            or p_name in policyholder
-            or _fuzzy_name_match(p_name, policyholder)
-        ):
-            any_member_match = True
-
-        # Only block if the policy has a populated member list and NO match found
-        if not any_member_match:
-            evaluate_rule(
-                "patientInPolicyMemberList",
-                False,
-                f"Prescription patient '{prescription.get('patientName')}' is not listed as an insured member on this policy.",
-                blocker=True,
-            )
-        # (Pass silently — already covered by rule 7 patientNameMatch)
-
-    # 20. Minimum / Maximum Eligible Age Range Check
+    # 5. Age Range Eligible Check
     try:
         import re as _re
         min_age = policy.get("minEligibleAge") or policy.get("minimumAge") or policy.get("minAge")
@@ -519,7 +327,11 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
     except Exception as e:
         evaluate_rule("ageRangeEligible", True, f"Age range check skipped: {e}")
 
-    # 10. Consultation Date Check
+    # ===========================================================
+    # STAGE 2 — POLICY PERIOD, PRESCRIPTION DATES & WAITING PERIOD (HARD GATE #2)
+    # ===========================================================
+
+    # 6. Consultation Date Check
     c_date_raw = prescription.get("consultationDate") or prescription.get("visitDate")
     if c_date_raw:
         try:
@@ -559,7 +371,144 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
         except Exception as e:
             evaluate_rule("consultationDateValid", True, f"Date check note: {e}")
 
+    # 7. Policy Expiry Check
+    try:
+        policy_end = _parse_date(policy.get("policyEndDate"))
+        visit_date = _parse_date(prescription.get("visitDate") or prescription.get("consultationDate"))
+        if not visit_date and is_self_entered:
+            visit_date = datetime.now()
+
+        if policy_end and visit_date:
+            passed = visit_date <= policy_end
+            evaluate_rule(
+                "policyActive",
+                passed,
+                "Policy active during visit/evaluation date" if passed else "Policy expired before visit/evaluation date",
+                blocker=True,
+            )
+        elif visit_date:
+            evaluate_rule(
+                "policyActive",
+                True,
+                "Policy end date not specified; visit date accepted",
+                blocker=False,
+            )
+        else:
+            evaluate_rule(
+                "policyActive",
+                True,
+                "Missing visit date; assuming active current coverage query",
+                blocker=False,
+            )
+    except Exception as e:
+        evaluate_rule("policyActive", True, f"Date parse note: {e}", blocker=False)
+
+    # 8. Waiting Period & Pre-Existing Disease (PED) Check
+    try:
+        policy_start = _parse_date(policy.get("policyStartDate"))
+        visit_date = _parse_date(prescription.get("visitDate") or prescription.get("consultationDate"))
+        diag_date = _parse_date(prescription.get("diagnosisDate") or prescription.get("diseaseOnsetDate") or prescription.get("symptomOnsetDate"))
+        if not visit_date and is_self_entered:
+            visit_date = datetime.now()
+        waiting_days = policy.get("waitingPeriodDays")
+        ped_waiting_days = policy.get("pedWaitingPeriodDays") or waiting_days
+
+        is_ped = prescription.get("isPreExisting") is True or (diag_date and policy_start and diag_date < policy_start)
+
+        if policy_start and visit_date:
+            days_active = (visit_date - policy_start).days
+            if is_ped:
+                applicable_wait = int(ped_waiting_days) if ped_waiting_days is not None else 150
+                passed = days_active >= applicable_wait
+                evaluate_rule(
+                    "waitingPeriodCompleted",
+                    passed,
+                    f"Pre-existing disease. Policy active for {days_active} days (Required PED waiting period: {applicable_wait} days)" if passed else f"Pre-existing disease waiting period not satisfied. Policy active for {days_active} days (Required: {applicable_wait} days)",
+                    blocker=True,
+                )
+            elif waiting_days is not None:
+                passed = days_active >= int(waiting_days)
+                evaluate_rule(
+                    "waitingPeriodCompleted",
+                    passed,
+                    f"Active for {days_active} days (Required: {waiting_days})" if passed else f"Waiting period not met. Active for {days_active} days (Required: {waiting_days})",
+                    blocker=True,
+                )
+            else:
+                evaluate_rule(
+                    "waitingPeriodCompleted",
+                    True,
+                    f"Policy active for {days_active} days.",
+                    blocker=False,
+                )
+        else:
+            evaluate_rule(
+                "waitingPeriodCompleted",
+                False,
+                "Could not verify waiting period due to missing dates or waiting period value",
+                blocker=False,
+            )
+    except Exception as e:
+        evaluate_rule("waitingPeriodCompleted", False, f"Waiting period check error: {e}")
+
+    # ===========================================================
+    # STAGE 3 — DIAGNOSIS & EXCLUSIONS
+    # ===========================================================
+
+    # 9. Diagnosis Excluded Check
+    diagnosis = (prescription.get("diagnosis") or "").lower()
+    excluded_diseases = [d.lower() for d in (policy.get("excludedDiseases") or []) if d]
+    if diagnosis and excluded_diseases:
+        failed = any(d in diagnosis or diagnosis in d for d in excluded_diseases)
+        if failed:
+             evaluate_rule("diagnosisExcluded", False, f"Diagnosis '{prescription.get('diagnosis')}' is explicitly excluded", blocker=True)
+        else:
+             evaluate_rule("diagnosisExcluded", True, "Diagnosis is not in the excluded list")
+    else:
+         evaluate_rule("diagnosisExcluded", True, "No excluded diseases list to check against")
+
+    # 10. Diagnosis Covered Check
+    covered_diseases = [d.lower() for d in (policy.get("coveredDiseases") or []) if d]
+    if diagnosis and covered_diseases:
+        passed = any(d in diagnosis or diagnosis in d for d in covered_diseases)
+        if passed:
+             evaluate_rule("diagnosisCovered", True, f"Diagnosis '{prescription.get('diagnosis')}' found in covered list")
+        else:
+             evaluate_rule("diagnosisCovered", False, f"Diagnosis '{prescription.get('diagnosis')}' not explicitly found in covered list", blocker=False)
+    else:
+        evaluate_rule("diagnosisCovered", False, "Missing diagnosis or covered diseases list", blocker=False)
+
+    # 11. Hospitalization Check
+    hosp_req = prescription.get("hospitalizationRequired")
+    hosp_cov_raw = policy.get("hospitalization")
+    hosp_cov = (hosp_cov_raw or "").lower()
+
+    if hosp_req is True:
+        if hosp_cov_raw is None:
+             evaluate_rule("hospitalizationCovered", False, "Policy does not cover hospitalization (Outpatient Policy)", blocker=True)
+        elif "covered" in hosp_cov or "yes" in hosp_cov:
+            evaluate_rule("hospitalizationCovered", True, "Hospitalization is covered")
+        elif "not covered" in hosp_cov or "no" in hosp_cov:
+             evaluate_rule("hospitalizationCovered", False, "Policy explicitly does not cover hospitalization", blocker=True)
+        else:
+             evaluate_rule("hospitalizationCovered", False, "Unclear if hospitalization is covered", blocker=False)
+    else:
+        evaluate_rule("hospitalizationCovered", True, "Hospitalization not required")
+
     return results
+
+
+def _strip_titles(name: str) -> str:
+    """
+    Strip common honorific titles from a name before fuzzy comparison.
+    Handles both 'Mr. Vimal' (space) and 'Mr.Vimal' (no space).
+    e.g. 'Mr.Vimal M' -> 'vimal m', 'Dr. Anu' -> 'anu'
+    """
+    import re
+    # \s* instead of \s+ to handle no-space case like 'Mr.Vimal'
+    titles = r"^(mr\.?|mrs\.?|ms\.?|dr\.?|prof\.?|sir|shri|smt\.?|kumari|master|miss|rev\.?|capt\.?|col\.?|maj\.?)\s*"
+    return re.sub(titles, "", name.strip().lower(), flags=re.IGNORECASE).strip()
+
 
 def _fuzzy_name_match(name_a: str, name_b: str) -> bool:
     """

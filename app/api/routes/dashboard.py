@@ -23,13 +23,13 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
     import asyncio
     
     async def get_total_policies():
-        return await Policy.find(Policy.user_id == user_id, Policy.is_deleted == False).count()
+        return await Policy.find(Policy.user_id == user_id).count()
         
     async def get_total_prescriptions():
-        return await Prescription.find(Prescription.user_id == user_id, Prescription.is_deleted == False).count()
+        return await Prescription.find(Prescription.user_id == user_id).count()
         
     async def get_total_reports():
-        return await AnalysisReport.find(AnalysisReport.user_id == user_id, AnalysisReport.is_deleted == False).count()
+        return await AnalysisReport.find(AnalysisReport.user_id == user_id).count()
         
     async def get_recent_activities():
         # Using native Motor for projection & sorting

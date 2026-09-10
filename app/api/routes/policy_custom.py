@@ -29,24 +29,19 @@ async def get_policies_summary(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
     
     # We only return policies that have successfully completed extraction
-    # and are not deleted.
     policies = await Policy.find(
         Policy.user_id == user_id,
-        Policy.is_deleted == False,
         Policy.processing_status == "completed"
     ).sort("-_id").to_list()
     
     # Format according to spec, returning holder name, start and end dates (DD-MM-YYYY)
     formatted_policies = []
     for p in policies:
-        meta = p.metadata or {}
         p_json = p.extracted_policy_json or {}
         
         # Policy Holder Name
         holder_name = (
             getattr(p, "policy_holder_name", None)
-            or meta.get("policy_holder_name")
-            or meta.get("insured_person_name")
             or p_json.get("policyHolderName")
             or p_json.get("policyHolder")
             or p_json.get("insuredName")
@@ -61,7 +56,6 @@ async def get_policies_summary(current_user: dict = Depends(get_current_user)):
         # Start Date
         raw_start = (
             p.policy_start_date
-            or meta.get("policy_start_date")
             or p_json.get("policyStartDate")
             or p_json.get("startDate")
             or p_json.get("validFrom")
@@ -71,7 +65,6 @@ async def get_policies_summary(current_user: dict = Depends(get_current_user)):
         # End / Expiry Date
         raw_end = (
             p.policy_end_date
-            or meta.get("policy_expiry_date")
             or p_json.get("policyEndDate")
             or p_json.get("expiryDate")
             or p_json.get("validTo")
@@ -80,15 +73,15 @@ async def get_policies_summary(current_user: dict = Depends(get_current_user)):
 
         formatted_policies.append({
             "id": str(p.id),
-            "providerName": p.insurance_company or meta.get("provider_name") or p_json.get("insuranceCompany") or "---",
-            "policyNumber": p.policy_number or meta.get("policy_number") or p_json.get("policyNumber") or "---",
-            "policyType": p.policy_type or meta.get("policy_type") or p_json.get("policyType") or "---",
-            "planName": p.policy_name or meta.get("plan_name") or p_json.get("policyName") or "---",
+            "providerName": p.insurance_company or p_json.get("insuranceCompany") or "---",
+            "policyNumber": p.policy_number or p_json.get("policyNumber") or "---",
+            "policyType": p.policy_type or p_json.get("policyType") or "---",
+            "planName": p.policy_name or p_json.get("policyName") or "---",
             "policyHolderName": holder_name or "---",
             "startDate": start_date or "---",
             "endDate": end_date or "---",
             "expiryDate": end_date or "---",
-            "coverageAmount": p.coverage_amount or meta.get("sum_insured") or p_json.get("sumInsured"),
+            "coverageAmount": p.coverage_amount or p_json.get("coverageAmount") or p_json.get("sumInsured") or 0.0,
             "originalFileName": p.original_file_name or "---",
             "displayId": f"PCY{p.sequence_number:04d}" if getattr(p, "sequence_number", None) is not None else str(p.id)[:8].upper()
         })

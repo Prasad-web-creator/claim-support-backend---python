@@ -13,3 +13,4 @@ class UploadResponse(BaseModel):
     originalName: Optional[str] = None
     contentType: Optional[str] = None
     size: Optional[int] = None
+    isImageBased: bool = False

@@ -39,7 +39,8 @@ async def extract_prescription_details(prescription_text: str) -> dict:
                 system_prompt=PRESCRIPTION_EXTRACTION_PROMPT,
                 user_content=chunk,
                 max_tokens=1500,
-                response_schema=PrescriptionSchema
+                response_schema=PrescriptionSchema,
+                operation_name="Prescription JSON Extraction" if len(chunks) == 1 else f"Prescription JSON Extraction (Chunk {i+1}/{len(chunks)})",
             )
             if result.get("extractedJson"):
                 extracted_jsons.append(result["extractedJson"])

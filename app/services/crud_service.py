@@ -61,11 +61,13 @@ class CrudService:
     async def get_by_id(self, user_id: str, doc_id: str) -> T | None:
         """Get a document by ID."""
         try:
-            return await self.model.find_one(
+            conditions = [
                 self.model.id == ObjectId(doc_id),
                 getattr(self.model, "user_id") == user_id,
-                getattr(self.model, "is_deleted") == False
-            )
+            ]
+            if hasattr(self.model, "is_deleted"):
+                conditions.append(getattr(self.model, "is_deleted") == False)
+            return await self.model.find_one(*conditions)
         except Exception:
             return None
 
@@ -76,11 +78,19 @@ class CrudService:
         except Exception:
             return None
             
-        if not doc:
-            return None
-            
-        update_data = {k: v for k, v in data.items() if hasattr(doc, k)}
-        update_data["updated_by"] = user_id
+        update_data = {}
+        fields_dict = getattr(doc, "model_fields", getattr(doc, "__fields__", {}))
+        for k, v in data.items():
+            if hasattr(doc, k):
+                update_data[k] = v
+            else:
+                for field_name, field_info in fields_dict.items():
+                    alias = getattr(field_info, "alias", None)
+                    if alias == k:
+                        update_data[field_name] = v
+                        break
+        if hasattr(doc, "updated_by"):
+            update_data["updated_by"] = user_id
         
         await doc.update({"$set": update_data})
         
@@ -136,28 +146,15 @@ class CrudService:
         return True
 
     async def delete_batch(self, user_id: str, doc_ids: list[str]) -> dict:
-        """Batch delete multiple documents belonging to the user."""
-        if not doc_ids:
-            return {"deletedCount": 0, "skippedCount": 0, "totalRequested": 0}
-
+        """Hard delete multiple documents at once."""
         deleted_count = 0
-        skipped_count = 0
-
         for doc_id in doc_ids:
-            try:
-                success = await self.delete(user_id, str(doc_id))
-                if success:
-                    deleted_count += 1
-                else:
-                    skipped_count += 1
-            except Exception as e:
-                logger.error(f"Error batch deleting {self.entity_name} ID {doc_id}: {e}")
-                skipped_count += 1
-
+            if await self.delete(user_id, doc_id):
+                deleted_count += 1
+                
         return {
-            "deletedCount": deleted_count,
-            "skippedCount": skipped_count,
-            "totalRequested": len(doc_ids)
+            "requested": len(doc_ids),
+            "deleted": deleted_count
         }
 
     async def list_paginated(
@@ -171,7 +168,9 @@ class CrudService:
         **filters
     ) -> dict:
         """List documents with pagination and search."""
-        query_conditions = [getattr(self.model, "user_id") == user_id, getattr(self.model, "is_deleted") == False]
+        query_conditions = [getattr(self.model, "user_id") == user_id]
+        if hasattr(self.model, "is_deleted"):
+            query_conditions.append(getattr(self.model, "is_deleted") == False)
         
         # Exact filters
         for k, v in filters.items():

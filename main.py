@@ -10,9 +10,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi.errors import RateLimitExceeded
 from slowapi import _rate_limit_exceeded_handler
 
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
 from app.core.config import get_settings
 from app.core.database import connect_to_mongodb, close_mongodb_connection
-from app.core.exceptions import AppError, app_error_handler, generic_exception_handler
+from app.core.exceptions import (
+    AppError,
+    app_error_handler,
+    http_exception_handler,
+    validation_exception_handler,
+    generic_exception_handler,
+)
 from app.core.logging import logger
 from app.middleware.request_id import RequestIdMiddleware
 from app.middleware.rate_limiter import limiter
@@ -105,6 +114,8 @@ def create_app() -> FastAPI:
     # ─── Exception Handlers ──────────────────────────────────────────────────
     
     app.add_exception_handler(AppError, app_error_handler)
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.add_exception_handler(Exception, generic_exception_handler)
     
     # ─── API Routes ──────────────────────────────────────────────────────────
