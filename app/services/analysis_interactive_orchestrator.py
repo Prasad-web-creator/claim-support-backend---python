@@ -5,7 +5,7 @@ import time
 import asyncio
 from beanie import PydanticObjectId as ObjectId
 import json
-from app.core.logging import logger
+from app.core.logging import logger, log_section
 from app.models.analysis_report import AnalysisReport
 from app.models.analysis_session import AnalysisSession, ClarificationQuestion, ClarificationAnswer
 from app.models.policy import Policy
@@ -65,7 +65,8 @@ async def start_analysis_session(
     background_tasks: Optional[BackgroundTasks] = None
 ) -> dict:
     start_time = time.time()
-    logger.info(f"[Interactive Orchestrator] Starting session for User: {user_id}")
+    log_section("Claim Analysis Started")
+    logger.info(f"[Claim Analysis] Started session for User: {user_id}")
 
     session = AnalysisSession(
         user_id=user_id,
@@ -80,7 +81,7 @@ async def start_analysis_session(
 
     try:
         async def process_document(doc_id, doc_label="Document"):
-            logger.info(f"[Interactive Orchestrator] [DEBUG] Fetching file bytes from GridFS for {doc_label} (ID: {doc_id})...")
+            logger.debug(f"[Claim Analysis] Fetching file bytes from storage for {doc_label} (ID: {doc_id})...")
             bytes_data, mime = await _fetch_file_bytes_by_gridfs_id(doc_id, user_id)
             raw_text = await extract_text_from_document(bytes_data, mime, doc_label=doc_label)
             return clean_text(raw_text)
@@ -107,7 +108,7 @@ async def start_analysis_session(
 
         async def load_rx_text():
             if is_manual_rx and manual_rx_text:
-                logger.info("[Interactive Orchestrator] [DEBUG] Prescription is self-entered manual text by user.")
+                logger.debug("[Claim Analysis] Prescription is self-entered manual text by user.")
                 return clean_text(manual_rx_text)
             try:
                 return await process_document(target_rx_file_id, doc_label="Prescription Document")
@@ -120,25 +121,26 @@ async def start_analysis_session(
         policy_text = ""
         existing_policy_json = None
         
+        log_section("Document Processing")
         if policy_doc_id:
             policy_doc = await Policy.get(ObjectId(policy_doc_id))
             if not policy_doc or policy_doc.user_id != user_id:
                 raise ValueError("Invalid Policy ID or unauthorized")
             if policy_doc.extracted_policy_text:
                 logger.info(
-                    f"[Interactive Orchestrator] [DEBUG] [Policy Document] Reusing CACHED text ({len(policy_doc.extracted_policy_text)} chars) on Policy {policy_doc.id}"
+                    f"[Document] Using cached text for Policy {policy_doc.id} ({len(policy_doc.extracted_policy_text)} chars)"
                 )
                 policy_text = policy_doc.extracted_policy_text
                 existing_policy_json = policy_doc.extracted_policy_json or {}
                 rx_text = await load_rx_text()
             else:
-                logger.info("[Interactive Orchestrator] [DEBUG] Concurrently extracting Policy and Prescription documents...")
+                logger.info("[Document] Extracting text from policy and prescription documents...")
                 policy_text, rx_text = await asyncio.gather(
                     process_document(policy_doc.grid_fs_file_id, doc_label="Policy Document"),
                     load_rx_text()
                 )
         else:
-            logger.info("[Interactive Orchestrator] [DEBUG] Concurrently extracting Policy and Prescription documents...")
+            logger.info("[Document] Extracting text from policy and prescription documents...")
             policy_text, rx_text = await asyncio.gather(
                 process_document(policy_file_id, doc_label="Policy Document"),
                 load_rx_text()
@@ -148,9 +150,11 @@ async def start_analysis_session(
         session.prescription_text = rx_text
         
         if existing_policy_json:
+            log_section("Prescription Extraction")
             policy_data = {"extractedJson": existing_policy_json}
             rx_data = await extract_prescription_details(rx_text)
         else:
+            log_section("Policy & Prescription Extraction")
             policy_data, rx_data = await asyncio.gather(
                 extract_policy_details(policy_text),
                 extract_prescription_details(rx_text)
@@ -195,7 +199,7 @@ async def start_analysis_session(
                 rx_doc.visit_date = prescription_json.get("visitDate") or prescription_json.get("consultationDate")
             rx_doc.processing_status = "completed"
             await rx_doc.save()
-            logger.info(f"[Interactive Orchestrator] Saved extracted prescription text & JSON to Prescription {rx_doc.id}")
+            logger.info(f"[Claim Analysis] Saved extracted prescription text & JSON to prescription {rx_doc.id}")
         elif target_rx_file_id:
             try:
                 new_rx_doc = Prescription(
@@ -216,9 +220,9 @@ async def start_analysis_session(
                 await new_rx_doc.insert()
                 session.prescription_id = str(new_rx_doc.id)
                 rx_doc = new_rx_doc
-                logger.info(f"[Interactive Orchestrator] Created and persisted new Prescription {new_rx_doc.id}")
+                logger.info(f"[Claim Analysis] Saved prescription {new_rx_doc.id}")
             except Exception as rx_err:
-                logger.warning(f"[Interactive Orchestrator] Could not create new Prescription record: {rx_err}")
+                logger.warning(f"[Claim Analysis] Could not save prescription record: {rx_err}")
 
         if policy_doc and (not policy_doc.extracted_policy_text or not policy_doc.extracted_policy_json):
             policy_doc.extracted_policy_text = policy_text
@@ -226,7 +230,7 @@ async def start_analysis_session(
             if policy_json.get("policyHolder") and not policy_doc.policy_holder_name:
                 policy_doc.policy_holder_name = policy_json.get("policyHolder")
             await policy_doc.save()
-            logger.info(f"[Interactive Orchestrator] Cached extracted policy text & JSON on Policy {policy_doc.id}")
+            logger.info(f"[Claim Analysis] Cached extracted text for policy {policy_doc.id}")
 
         session.policy_json = policy_json
         session.prescription_json = prescription_json
@@ -236,7 +240,7 @@ async def start_analysis_session(
         is_rx_valid = validation.get("isPrescriptionValid", True)
         
         if not is_policy_valid or not is_rx_valid:
-            logger.warning(f"[Interactive Orchestrator] Document validation failed: policyValid={is_policy_valid}, prescriptionValid={is_rx_valid}")
+            logger.warning(f"[Claim Analysis] Document validation failed: policyValid={is_policy_valid}, prescriptionValid={is_rx_valid}")
             p_reason = ""
             rx_reason = ""
             if not is_policy_valid:
@@ -300,7 +304,7 @@ async def start_analysis_session(
         doc_dt, doc_disp = _parse_and_format_date(policy_json.get("policyStartDate"))
 
         if user_dt and doc_dt and user_dt.date() != doc_dt.date():
-            logger.info(f"[Interactive Orchestrator] Policy start date conflict: user entered {user_disp}, doc extracted {doc_disp}")
+            logger.info(f"[Claim Analysis] Policy start date conflict: user entered {user_disp}, doc extracted {doc_disp}")
             
             question_data = {
                 "id": "policy_start_date_conflict",
@@ -340,8 +344,14 @@ async def start_analysis_session(
         elif user_dt and doc_dt and user_dt.date() == doc_dt.date():
             policy_json["policyStartDate"] = user_dt.strftime("%Y-%m-%d")
 
+        log_section("Rule Engine & Eligibility")
+        logger.info("[Rule Engine] Evaluating policy rules, waiting periods, and exclusions...")
         br_results = enforce_business_rules(policy_json, prescription_json)
         session.business_rules = br_results
+        det_res = br_results.get("deterministicResult") or {}
+        det_status = det_res.get("status") or ("ELIGIBLE" if br_results.get("overallEligible") else "NOT_ELIGIBLE")
+        det_reason = det_res.get("reasonCode") or ""
+        logger.info(f"[Rule Engine] Decision: {det_status} ({det_reason})")
 
         # Track extraction & business rule processing time
         extraction_time_ms = int((time.time() - start_time) * 1000)
@@ -353,7 +363,7 @@ async def start_analysis_session(
         return await _run_llm_analysis(session, policy_json, prescription_json, br_results, background_tasks)
 
     except Exception as e:
-        logger.error(f"[Interactive Orchestrator] Session {session.id} failed: {e}")
+        logger.error(f"[Claim Analysis] Session {session.id} failed: {e}")
         session.status = "failed"
         await session.save()
         raise e
@@ -366,7 +376,7 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
     await session.save()
 
     if session.round_count > 3:
-        logger.warning(f"[Interactive Orchestrator] Session {session.id} exceeded max rounds. Forcing manual review.")
+        logger.warning(f"[Claim Analysis] Session {session.id} exceeded max rounds. Forcing manual review.")
         session.status = "manual_review_required"
         await session.save()
         return {"status": "manual_review_required", "reason": "Maximum clarification rounds exceeded."}
@@ -387,14 +397,20 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
                 "User_Answer": answer_obj.answer
             })
     
-    logger.info(f"[Interactive Orchestrator] Round {session.round_count}: clarification_history={clarification_history}")
+    log_section("AI Analysis")
+    if clarification_history:
+        logger.info(f"[AI Analysis] Evaluating with {len(clarification_history)} clarification answers (Round {session.round_count})...")
+    else:
+        logger.info(f"[AI Analysis] Evaluating coverage and generating explanation with Gemini (Round {session.round_count})...")
 
     coverage_analysis = await analyze_coverage(
         policy_text=session.policy_text or "",
         prescription_text=session.prescription_text or "",
         business_rule_results=br_results,
         prescription_json=prescription_json,
-        clarification_history=clarification_history
+        clarification_history=clarification_history,
+        policy_json=session.policy_json or {},
+        policy_id=session.policy_id or "",
     )
 
     llm_round_duration_ms = int((time.time() - llm_start_time) * 1000)
@@ -430,7 +446,7 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
             # Deduplication
             if not any(q.id == q_id for q in session.questions):
                 if len(session.questions) + len(filtered_questions) >= 10:
-                    logger.warning(f"[Interactive Orchestrator] Session {session.id} reached max 10 questions.")
+                    logger.warning(f"[Claim Analysis] Session {session.id} reached max 10 questions.")
                     break
                 
                 session.questions.append(ClarificationQuestion(
@@ -449,7 +465,7 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
         await audit_log.insert()
 
         if not filtered_questions:
-            logger.warning("[Interactive Orchestrator] LLM returned only duplicate/invalid questions. Forcing manual review.")
+            logger.warning("[Claim Analysis] LLM returned duplicate or invalid questions. Forcing manual review.")
             session.status = "manual_review_required"
             await session.save()
             return {"status": "manual_review_required", "reason": "AI generated duplicate or invalid questions."}
@@ -484,7 +500,7 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
     )
 
     if str(final_report.get("overallStatus", "")).startswith("Invalid"):
-        logger.info("[Interactive Orchestrator] Invalid report status; skipping DB insertion as requested.")
+        logger.info("[Claim Analysis] Invalid report status; skipping DB insertion as requested.")
         return final_report
 
     report = AnalysisReport(
@@ -493,6 +509,12 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
         prescription_id=session.prescription_id,
         status="completed" if next_action == "generate_report" else "manual_review_required",
         analysis_version="2.1.0",
+        model="gemini-2.5-flash",
+        model_version="2.5-flash",
+        prompt_version="1.2.0",
+        rule_engine_version="2.0.0-deterministic",
+        knowledge_base_version="1.0.0",
+        dataset_version="1.0.0",
         policy_text=session.policy_text,
         prescription_text=session.prescription_text,
         policy_json=policy_json,
@@ -506,6 +528,7 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
         summary=final_report.get("summary"),
         comparison=final_report.get("comparison"),
         processing_time_ms=total_processing_time,
+        reference_comparison=final_report.get("referenceComparison") or {},
         
         decision_type="Automatic" if next_action == "generate_report" else "Manual Review",
         confidence_score=confidence,
@@ -516,15 +539,12 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
         error_message=coverage_analysis.get("reason") if next_action == "manual_review" else None
     )
     await report.insert()
-    logger.info(
-        f"\n{'='*70}\n"
-        f"📊 [ANALYSIS COMPLETED] Report #{report.report_number} | ID: {report.id}\n"
-        f"   • Decision:         {report.overall_status} ({report.decision_type})\n"
-        f"   • Dominance Score:  {report.dominance_score}%\n"
-        f"   • Processing Time:  {total_processing_time}ms ({total_processing_time/1000.0:.2f}s)\n"
-        f"   • Session ID:       {session.id}\n"
-        f"{'='*70}"
-    )
+    log_section("Claim Decision Summary")
+    logger.info(f"  - Report Number:   #{report.report_number} | ID: {report.id}")
+    logger.info(f"  - Decision:        {report.overall_status} ({report.decision_type})")
+    logger.info(f"  - Dominance Score: {report.dominance_score}%")
+    logger.info(f"  - Processing Time: {total_processing_time}ms ({total_processing_time/1000.0:.2f}s)")
+    logger.info(f"  - Session ID:      {session.id}")
 
     tracker = get_current_cost_tracker()
     if tracker:
@@ -544,6 +564,14 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
             policy_file_id=None, 
             prescription_id=session.prescription_id
         )
+    else:
+        await _background_post_processing(
+            user_id=session.user_id,
+            report_id=str(report.id),
+            policy_doc_id=session.policy_id if len(session.policy_id or "") > 20 else None,
+            policy_file_id=None,
+            prescription_id=session.prescription_id
+        )
 
     fresh = await AnalysisReport.get(report.id)
     result = fresh.dict(by_alias=True)
@@ -556,13 +584,14 @@ async def resume_analysis_session(
     answers: dict,
     background_tasks: Optional[BackgroundTasks] = None
 ) -> dict:
-    logger.info(f"[Interactive Orchestrator] resume_analysis_session called. session_id={session_id}, answers={answers}")
+    log_section("Clarification Session")
+    logger.info(f"[Clarification] Resuming session {session_id} with {len(answers)} user answers")
     session = await AnalysisSession.get(ObjectId(session_id))
     if not session or session.user_id != user_id:
         raise ValueError("Session not found or unauthorized")
 
     if session.status not in ("waiting_for_user", "needs_clarification"):
-        logger.warning(f"[Interactive Orchestrator] Session {session_id} has unexpected status '{session.status}'")
+        logger.warning(f"[Clarification] Session {session_id} has unexpected status '{session.status}'")
         raise ValueError(f"Session is not waiting for user input (current status: {session.status})")
 
     tracker = AnalysisCostTracker(session_id=str(session.id))
@@ -570,7 +599,7 @@ async def resume_analysis_session(
         tracker.load_steps(session.cost_steps)
     set_current_cost_tracker(tracker)
 
-    logger.info(f"[Interactive Orchestrator] Storing {len(answers)} answers for session {session_id}")
+    logger.debug(f"[Clarification] Storing {len(answers)} answers for session {session_id}")
     for q_id, answer_val in answers.items():
         session.answers.append(ClarificationAnswer(
             questionId=q_id,
@@ -589,7 +618,7 @@ async def resume_analysis_session(
                 if not session.policy_json:
                     session.policy_json = {}
                 session.policy_json["policyStartDate"] = chosen_iso_date
-                logger.info(f"[Interactive Orchestrator] Resolved policy start date from user answer: {chosen_iso_date}")
+                logger.info(f"[Clarification] Resolved policy start date from user answer: {chosen_iso_date}")
                 
                 # Persist chosen start date in Policy MongoDB record
                 if session.policy_id:
@@ -601,9 +630,9 @@ async def resume_analysis_session(
                                 if pol_record.extracted_policy_json:
                                     pol_record.extracted_policy_json["policyStartDate"] = chosen_iso_date
                                 await pol_record.save()
-                                logger.info(f"[Interactive Orchestrator] Saved resolved policy start date {chosen_parsed} to Policy {pol_record.id}")
+                                logger.debug(f"[Clarification] Saved resolved policy start date {chosen_parsed} to Policy {pol_record.id}")
                     except Exception as pe:
-                        logger.error(f"[Interactive Orchestrator] Error updating policy start date in DB: {pe}")
+                        logger.error(f"[Clarification] Error updating policy start date in DB: {pe}")
 
     # Check if treatment date was answered
     treatment_date_ans = answers.get("prescription_treatment_date")
@@ -685,5 +714,5 @@ async def resume_analysis_session(
     session.status = "reanalyzing"
     await session.save()
 
-    logger.info(f"[Interactive Orchestrator] Re-running LLM analysis for session {session_id}")
+    logger.info(f"[Claim Analysis] Re-running AI analysis for session {session_id}")
     return await _run_llm_analysis(session, policy_json, prescription_json, br_results, background_tasks)

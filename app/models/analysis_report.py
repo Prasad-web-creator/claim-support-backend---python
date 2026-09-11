@@ -36,6 +36,12 @@ class AnalysisReport(Document):
     # ─── Pipeline Status ──────────────────────────────────────────────────────
     status: str = Field(default="pending")  # pending | extracting | analyzing | completed | failed | manual_review_required
     analysis_version: str = Field(default="2.1.0", alias="analysisVersion")
+    model: Optional[str] = Field(default="gemini-2.5-flash", alias="model")
+    model_version: Optional[str] = Field(default="2.5-flash", alias="modelVersion")
+    prompt_version: Optional[str] = Field(default="1.2.0", alias="promptVersion")
+    rule_engine_version: Optional[str] = Field(default="2.0.0-deterministic", alias="ruleEngineVersion")
+    knowledge_base_version: Optional[str] = Field(default="1.0.0", alias="knowledgeBaseVersion")
+    dataset_version: Optional[str] = Field(default="1.0.0", alias="datasetVersion")
     decision_type: Optional[str] = Field(default="Automatic", alias="decisionType") # Automatic | Manual Review
     confidence_score: Optional[int] = Field(default=0, alias="confidenceScore")
     processing_time_ms: Optional[int] = Field(default=0, alias="processingTimeMs")
@@ -51,6 +57,7 @@ class AnalysisReport(Document):
     coverage_analysis: Optional[dict] = Field(default_factory=dict, alias="coverageAnalysis")
     business_rules: Optional[dict] = Field(default_factory=dict, alias="businessRules")
     document_validity: Optional[dict] = Field(default_factory=dict, alias="documentValidity")
+    reference_comparison: Optional[dict] = Field(default_factory=dict, alias="referenceComparison")
 
     # ─── Snapshot Caches ──────────────────────────────────────────────────────
     policy_json: Optional[dict] = Field(default_factory=dict, alias="policyJson")
@@ -62,6 +69,8 @@ class AnalysisReport(Document):
     policy_clauses_used: Optional[List[Any]] = Field(default_factory=list, alias="policyClausesUsed")
     prescription_evidence: Optional[List[Any]] = Field(default_factory=list, alias="prescriptionEvidence")
     clarification_answers_used: Optional[List[Any]] = Field(default_factory=list, alias="clarificationAnswersUsed")
+    retrieved_evidence: Optional[List[dict]] = Field(default_factory=list, alias="retrievedEvidence")
+    rag_metadata: Optional[dict] = Field(default_factory=dict, alias="ragMetadata")
 
     # ─── Error Info ───────────────────────────────────────────────────────────
     error_message: Optional[str] = Field(default="", alias="errorMessage")
@@ -113,6 +122,7 @@ class AnalysisReport(Document):
         "document_validity",
         "policy_json",
         "prescription_json",
+        "reference_comparison",
         mode="before",
     )
     @classmethod
@@ -166,7 +176,8 @@ class AnalysisReport(Document):
 
         dict_fields = [
             "coverage_breakdown", "coverage_analysis", "business_rules",
-            "document_validity", "policy_json", "prescription_json"
+            "document_validity", "policy_json", "prescription_json",
+            "reference_comparison"
         ]
         for field in dict_fields:
             val = getattr(self, field, None)

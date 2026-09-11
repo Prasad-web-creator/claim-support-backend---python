@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional
 from beanie import PydanticObjectId as ObjectId
 
-from app.core.logging import logger
+from app.core.logging import logger, log_section
 from app.models.analysis_report import AnalysisReport
 from app.models.policy import Policy
 from app.models.prescription import Prescription
@@ -89,7 +89,8 @@ async def _background_post_processing(
             return
 
         # ─── Stage 10: Extract & Persist Metadata in Policies & Prescriptions Collections ───
-        logger.info("[Orchestrator] Stage 10: Extracting & Storing Metadata in Policies and Prescriptions Collections")
+        log_section("Background Processing")
+        logger.info("[Background] Saving extracted metadata for policy and prescription...")
         policy_meta = {}
         rx_meta = {}
         try:
@@ -99,10 +100,10 @@ async def _background_post_processing(
                 return_exceptions=True
             )
             if isinstance(policy_meta, Exception):
-                logger.error(f"[Orchestrator] Policy metadata extraction error: {policy_meta}")
+                logger.error(f"[Background] Policy metadata error: {policy_meta}")
                 policy_meta = {}
             if isinstance(rx_meta, Exception):
-                logger.error(f"[Orchestrator] Prescription metadata extraction error: {rx_meta}")
+                logger.error(f"[Background] Prescription metadata error: {rx_meta}")
                 rx_meta = {}
 
             # 1. Update / Insert in `policies` collection
@@ -255,12 +256,27 @@ async def _background_post_processing(
 
             await report.save()
         except Exception as meta_err:
-            logger.error(f"[Orchestrator Background] Error during metadata extraction/persistence: {meta_err}", exc_info=True)
+            logger.error(f"[Background] Error during metadata extraction: {meta_err}", exc_info=True)
 
-        logger.info("[Orchestrator Background] Post-processing complete.")
+        # Register ClaimCase in expert review knowledge base
+        try:
+            log_section("Case Review System")
+            from app.services.expert_learning.expert_case_service import ExpertCaseService
+            case = await ExpertCaseService.create_case_from_report(
+                report_id=report_id,
+                user_id=user_id,
+                policy_id=report.policy_id or policy_doc_id,
+                prescription_id=report.prescription_id or prescription_id
+            )
+            case_id = getattr(case, "case_id", "New Case") if case else "New Case"
+            logger.info(f"[Case Review] Registered claim case {case_id} in PENDING_EXPERT_REVIEW")
+        except Exception as expert_err:
+            logger.error(f"[Case Review] Error registering case for review: {expert_err}", exc_info=True)
+
+        logger.info("[Background] Post-processing complete.")
 
     except Exception as e:
-        logger.error(f"[Orchestrator Background] Fatal error: {e}", exc_info=True)
+        logger.error(f"[Background] Fatal error: {e}", exc_info=True)
 
 
 async def run_analysis_pipeline(
@@ -274,26 +290,30 @@ async def run_analysis_pipeline(
     Executes the 11-stage analysis pipeline.
     """
     start_time = time.time()
-    logger.info(f"[Orchestrator] Starting pipeline for User: {user_id}")
+    log_section("Claim Analysis Started")
+    logger.info(f"[Claim Analysis] Started session for User: {user_id}")
     
     report = AnalysisReport(
         user_id=user_id,
         policy_id=policy_doc_id or policy_file_id,
         prescription_id=prescription_id,
         status="extracting",
-        analysis_version="2.0.0"
+        analysis_version="2.1.0",
+        model="gemini-2.5-flash",
+        model_version="2.5-flash",
+        prompt_version="1.2.0",
+        rule_engine_version="2.0.0-deterministic",
+        knowledge_base_version="1.0.0",
+        dataset_version="1.0.0",
     )
     await report.insert()
     
     try:
-        # Stage 1: Load Metadata
-        logger.info("[Orchestrator] Stage 1: Validating file IDs")
-        
-        # Stage 2 & 3: Extract & Clean Text
-        logger.info("[Orchestrator] Stage 2 & 3: Extracting and Cleaning Text")
+        # Load Metadata & Extract Text
+        logger.debug("[Claim Analysis] Loading file data and extracting text...")
         
         async def process_document(doc_id, doc_label="Document"):
-            logger.info(f"[Orchestrator] [DEBUG] Fetching file bytes from GridFS for {doc_label} (ID: {doc_id})...")
+            logger.debug(f"[Claim Analysis] Loading {doc_label} (ID: {doc_id})...")
             bytes_data, mime = await _fetch_file_bytes_by_gridfs_id(doc_id, user_id)
             raw_text = await extract_text_from_document(bytes_data, mime, doc_label=doc_label)
             return clean_text(raw_text)
@@ -320,7 +340,7 @@ async def run_analysis_pipeline(
 
         async def load_rx_text():
             if is_manual_rx and manual_rx_text:
-                logger.info("[Orchestrator] [DEBUG] Prescription is self-entered manual text by user.")
+                logger.debug("[Claim Analysis] Prescription is self-entered manual text by user.")
                 return clean_text(manual_rx_text)
             try:
                 return await process_document(target_rx_file_id, doc_label="Prescription Document")
@@ -333,6 +353,7 @@ async def run_analysis_pipeline(
         policy_text = ""
         existing_policy_json = None
         
+        log_section("Document Processing")
         if policy_doc_id:
             policy_doc = await Policy.get(ObjectId(policy_doc_id))
             if not policy_doc or policy_doc.user_id != user_id:
@@ -340,19 +361,19 @@ async def run_analysis_pipeline(
                 
             if policy_doc.extracted_policy_text:
                 logger.info(
-                    f"[Orchestrator] [DEBUG] [Policy Document] Reusing CACHED text ({len(policy_doc.extracted_policy_text)} chars) on Policy {policy_doc.id}"
+                    f"[Document] Using cached text for Policy {policy_doc.id} ({len(policy_doc.extracted_policy_text)} chars)"
                 )
                 policy_text = policy_doc.extracted_policy_text
                 existing_policy_json = policy_doc.extracted_policy_json or {}
                 rx_text = await load_rx_text()
             else:
-                logger.info("[Orchestrator] [DEBUG] Concurrently extracting Policy and Prescription documents...")
+                logger.info("[Document] Extracting text from policy and prescription documents...")
                 policy_text, rx_text = await asyncio.gather(
                     process_document(policy_doc.grid_fs_file_id, doc_label="Policy Document"),
                     load_rx_text()
                 )
         else:
-            logger.info("[Orchestrator] [DEBUG] Concurrently extracting Policy and Prescription documents...")
+            logger.info("[Document] Extracting text from policy and prescription documents...")
             policy_text, rx_text = await asyncio.gather(
                 process_document(policy_file_id, doc_label="Policy Document"),
                 load_rx_text()
@@ -362,20 +383,17 @@ async def run_analysis_pipeline(
         report.prescription_text = rx_text
         await report.save()
         
-        # Stage 4 & 5: JSON Extraction
-        logger.info("[Orchestrator] Stage 4 & 5: JSON Extraction")
-        
         if existing_policy_json:
+            log_section("Prescription Extraction")
             policy_data = {"extractedJson": existing_policy_json}
             rx_data = await extract_prescription_details(rx_text)
         else:
+            log_section("Policy & Prescription Extraction")
             policy_data, rx_data = await asyncio.gather(
                 extract_policy_details(policy_text),
                 extract_prescription_details(rx_text)
             )
         
-        # Stage 6: JSON Validation
-        logger.info("[Orchestrator] Stage 6: JSON Validation")
         validation = validate_extracted_json(
             policy_data.get("extractedJson"),
             rx_data.get("extractedJson")
@@ -407,7 +425,7 @@ async def run_analysis_pipeline(
         is_rx_valid = validation.get("isPrescriptionValid", True)
         
         if not is_policy_valid or not is_rx_valid:
-            logger.warning(f"[Orchestrator] Document validation failed: policyValid={is_policy_valid}, prescriptionValid={is_rx_valid}")
+            logger.warning(f"[Claim Analysis] Document validation failed: policyValid={is_policy_valid}, prescriptionValid={is_rx_valid}")
             p_reason = ""
             rx_reason = ""
             if not is_policy_valid:
@@ -448,9 +466,9 @@ async def run_analysis_pipeline(
             # Do NOT store invalid coverage summary report in DB as per user requirement
             try:
                 await report.delete()
-                logger.info(f"[Orchestrator] Removed invalid report {report.id} from DB.")
+                logger.info(f"[Claim Analysis] Removed invalid report {report.id} from DB.")
             except Exception as del_err:
-                logger.warning(f"[Orchestrator] Could not delete invalid report: {del_err}")
+                logger.warning(f"[Claim Analysis] Could not delete invalid report: {del_err}")
 
             return final_report
 
@@ -458,26 +476,33 @@ async def run_analysis_pipeline(
         await report.save()
         
         # Stage 7: Business Rules
-        import json
-        logger.info("[Orchestrator] Stage 7: Business Rules")
+        log_section("Rule Engine & Eligibility")
+        logger.info("[Rule Engine] Evaluating policy rules, waiting periods, and exclusions...")
         br_results = enforce_business_rules(
             report.policy_json,
             report.prescription_json
         )
         report.business_rules = br_results
+        det_res = br_results.get("deterministicResult") or {}
+        det_status = det_res.get("status") or ("ELIGIBLE" if br_results.get("overallEligible") else "NOT_ELIGIBLE")
+        det_reason = det_res.get("reasonCode") or ""
+        logger.info(f"[Rule Engine] Decision: {det_status} ({det_reason})")
         
-        # Stage 8: Deep AI Coverage Analysis
-        logger.info("[Orchestrator] Stage 8: AI Coverage Analysis")
+        # AI Coverage Analysis
+        log_section("AI Analysis")
+        logger.info("[AI Analysis] Evaluating policy coverage and generating explanation with Gemini...")
         coverage_analysis = await analyze_coverage(
             policy_text=report.policy_text or "",
             prescription_text=report.prescription_text or "",
             business_rule_results=br_results,
-            prescription_json=report.prescription_json or {}
+            prescription_json=report.prescription_json or {},
+            policy_json=report.policy_json or {},
+            policy_id=report.policy_id or policy_doc_id or "",
         )
         report.coverage_analysis = coverage_analysis
+        report.retrieved_evidence = coverage_analysis.get("retrieved_evidence", [])
         
-        # Stage 9: Generate Coverage Report
-        logger.info("[Orchestrator] Stage 9: Generating Coverage Report")
+        # Generate Coverage Report
         processing_time = int((time.time() - start_time) * 1000)
         
         final_report = generate_report(
@@ -508,12 +533,11 @@ async def run_analysis_pipeline(
                 prescription_id=prescription_id
             )
             
-        # Stage 11: Finalize and Save AnalysisReport
-        logger.info("[Orchestrator] Stage 11: Finalizing and Saving Report")
+        # Finalize and Save AnalysisReport
         if str(final_report.get("overallStatus", "")).startswith("Invalid"):
             try:
                 await report.delete()
-                logger.info(f"[Orchestrator] Removed invalid analysis report {report.id} from DB.")
+                logger.info(f"[Claim Analysis] Removed invalid report {report.id} from DB.")
             except Exception:
                 pass
             return final_report
@@ -524,17 +548,22 @@ async def run_analysis_pipeline(
         report.coverage_breakdown = final_report.get("coverageBreakdown")
         report.summary = final_report.get("summary")
         report.comparison = final_report.get("comparison")
+        report.reference_comparison = final_report.get("referenceComparison") or {}
         report.processing_time_ms = processing_time
         
         await report.save()
-        logger.info(f"[Orchestrator] Pipeline completed successfully in {processing_time}ms.")
+        log_section("Claim Decision Summary")
+        logger.info(f"  - Report Number:   #{report.report_number} | ID: {report.id}")
+        logger.info(f"  - Decision:        {report.overall_status} ({report.decision_type})")
+        logger.info(f"  - Dominance Score: {report.dominance_score}%")
+        logger.info(f"  - Processing Time: {processing_time}ms ({processing_time/1000.0:.2f}s)")
         
         # Fetch fresh complete document to return as dict
         fresh = await AnalysisReport.get(report.id)
         return fresh.dict(by_alias=True)
         
     except Exception as e:
-        logger.error(f"[Orchestrator] Pipeline failed: {e}")
+        logger.error(f"[Claim Analysis] Analysis failed: {e}")
         report.status = "failed"
         report.error_message = str(e)
         report.processing_time_ms = int((time.time() - start_time) * 1000)

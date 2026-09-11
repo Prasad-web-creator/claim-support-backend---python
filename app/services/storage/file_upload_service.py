@@ -10,7 +10,7 @@ from typing import Any
 
 from beanie import PydanticObjectId as ObjectId
 from app.core.database import get_gridfs_bucket
-from app.core.logging import logger
+from app.core.logging import logger, log_section
 from app.models.stored_file import StoredFile
 from app.services.storage.gridfs_provider import GridFSProvider
 
@@ -35,14 +35,16 @@ class FileUploadService:
         document_type: str,
         user_id: str,
         document_id: str | None = None
-    ) -> dict[str, str]:
-        """Upload a file and persist metadata to MongoDB."""
-        
-        # 1. Compute SHA256
+    ) -> dict[str, Any]:
+        """
+        Coordinates hashing, deduplication, storage upload, and DB metadata persistence.
+        """
+        log_section("File Upload")
+        # 1. Generate SHA256
         sha256_hash = hashlib.sha256(buffer).hexdigest()
         file_size = len(buffer)
         
-        # 2. Duplicate Check
+        # 2. Check for duplicate within the same user's scope
         existing_file = await StoredFile.find_one(
             StoredFile.user_id == user_id,
             StoredFile.sha256_hash == sha256_hash,
@@ -57,17 +59,17 @@ class FileUploadService:
                 cursor = bucket.find({"filename": existing_file.storage_key}).limit(1)
                 files = await cursor.to_list(length=1)
                 if files:
-                    logger.info(f"[FileUpload] Duplicate file detected for user {user_id}. Returning existing.")
+                    logger.info(f"[File Upload] Duplicate document detected for user {user_id}. Returning existing file.")
                     return {
                         "storedFileId": str(existing_file.id),
                         "storageKey": existing_file.storage_key,
                         "storedFilename": existing_file.stored_filename
                     }
                 else:
-                    logger.warning(f"[FileUpload] Corrupted StoredFile {existing_file.id} found (missing in GridFS). Deleting metadata.")
+                    logger.warning(f"[File Upload] Corrupted file entry {existing_file.id} found (missing in GridFS). Deleting metadata.")
                     await existing_file.delete()
             except Exception as e:
-                logger.warning(f"[FileUpload] Error checking GridFS for duplicate: {e}")
+                logger.warning(f"[File Upload] Error checking storage for duplicate: {e}")
             
         # 3. Generate UUID filename and storage key
         ext = Path(original_filename).suffix.lower() or ".pdf"
@@ -103,7 +105,7 @@ class FileUploadService:
         )
         
         await stored_file.insert()
-        logger.info(f"[FileUpload] Successfully saved metadata for {stored_filename}")
+        logger.info(f"[File Upload] Saved {stored_filename} ({file_size / 1024.0:.1f} KB, {mime_type})")
         
         return {
             "storedFileId": str(stored_file.id),

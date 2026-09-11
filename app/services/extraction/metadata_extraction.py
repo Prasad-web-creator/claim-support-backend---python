@@ -138,7 +138,7 @@ async def extract_policy_metadata(policy_text: str) -> dict:
     """
     Extracts Section A Policy metadata from policy text.
     """
-    logger.info("[MetadataExtraction] Starting policy metadata extraction...")
+    logger.info("[Background] Extracting policy metadata...")
     if not policy_text or len(policy_text.strip()) < 30:
         return dict(POLICY_METADATA_TEMPLATE)
 
@@ -159,7 +159,7 @@ async def extract_policy_metadata(policy_text: str) -> dict:
             merged = merge_extracted_json(extracted_jsons) if len(extracted_jsons) > 1 else extracted_jsons[0]
             return _sanitize_policy_metadata(merged)
     except Exception as e:
-        logger.error(f"[MetadataExtraction] Policy metadata extraction failed: {e}")
+        logger.error(f"[Background] Policy metadata extraction failed: {e}")
 
     return dict(POLICY_METADATA_TEMPLATE)
 
@@ -168,7 +168,7 @@ async def extract_prescription_metadata(rx_text: str) -> dict:
     """
     Extracts Section B Prescription / Medical metadata from prescription text.
     """
-    logger.info("[MetadataExtraction] Starting prescription metadata extraction...")
+    logger.info("[Background] Extracting prescription metadata...")
     if not rx_text or len(rx_text.strip()) < 30:
         return dict(PRESCRIPTION_METADATA_TEMPLATE)
 
@@ -189,6 +189,6 @@ async def extract_prescription_metadata(rx_text: str) -> dict:
             merged = merge_extracted_json(extracted_jsons) if len(extracted_jsons) > 1 else extracted_jsons[0]
             return _sanitize_prescription_metadata(merged)
     except Exception as e:
-        logger.error(f"[MetadataExtraction] Prescription metadata extraction failed: {e}")
+        logger.error(f"[Background] Prescription metadata extraction failed: {e}")
 
     return dict(PRESCRIPTION_METADATA_TEMPLATE)

@@ -16,7 +16,7 @@ async def extract_prescription_details(prescription_text: str) -> dict:
     Extracts structured JSON data from raw prescription text.
     Uses chunking if text exceeds the context window.
     """
-    logger.info("[PrescriptionExtraction] Starting prescription extraction...")
+    logger.info("[Prescription] Extracting structured medical details...")
     
     if not prescription_text or not prescription_text.strip():
         return {
@@ -28,12 +28,13 @@ async def extract_prescription_details(prescription_text: str) -> dict:
         }
         
     chunks = split_text_intelligently(prescription_text, 15000)
-    logger.info(f"[PrescriptionExtraction] Split prescription text into {len(chunks)} chunk(s).")
+    logger.debug(f"[Prescription] Split prescription text into {len(chunks)} chunk(s).")
     
     extracted_jsons = []
     
     for i, chunk in enumerate(chunks):
-        logger.info(f"[PrescriptionExtraction] Processing chunk {i+1}/{len(chunks)}...")
+        if len(chunks) > 1:
+            logger.info(f"[Prescription] Processing chunk {i+1}/{len(chunks)}...")
         try:
             result = await extract_json_with_retry(
                 system_prompt=PRESCRIPTION_EXTRACTION_PROMPT,
@@ -45,7 +46,7 @@ async def extract_prescription_details(prescription_text: str) -> dict:
             if result.get("extractedJson"):
                 extracted_jsons.append(result["extractedJson"])
         except Exception as e:
-            logger.error(f"[PrescriptionExtraction] Error extracting chunk {i+1}: {e}")
+            logger.error(f"[Prescription] Error extracting chunk {i+1}: {e}")
             
     if not extracted_jsons:
         return {
@@ -65,7 +66,7 @@ async def extract_prescription_details(prescription_text: str) -> dict:
         all_expected_fields=PRESCRIPTION_FIELDS
     )
     
-    logger.info(f"[PrescriptionExtraction] Extraction complete. Valid: {validation_result['isValid']}, Confidence: {validation_result['confidence']}")
+    logger.info(f"[Prescription] Extraction completed (Valid: {validation_result['isValid']}, Confidence: {validation_result['confidence']}%)")
     
     return {
         "isValid": validation_result["isValid"],

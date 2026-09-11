@@ -15,7 +15,7 @@ async def extract_policy_details(policy_text: str) -> dict:
     Extracts structured JSON data from raw policy text.
     Uses chunking if text exceeds the context window.
     """
-    logger.info("[PolicyExtraction] Starting policy extraction...")
+    logger.info("[Policy] Extracting structured policy terms...")
     
     if not policy_text or len(policy_text.strip()) < 50:
         return {
@@ -31,7 +31,7 @@ async def extract_policy_details(policy_text: str) -> dict:
     
     # Restored to use the intelligent default of 24,000 characters
     chunks = split_text_intelligently(policy_text)
-    logger.info(f"[PolicyExtraction] Split policy text into {len(chunks)} chunk(s).")
+    logger.debug(f"[Policy] Split policy text into {len(chunks)} chunk(s).")
     
     extracted_jsons = []
     
@@ -42,7 +42,8 @@ async def extract_policy_details(policy_text: str) -> dict:
     import asyncio
     
     async def extract_chunk(i, chunk):
-        logger.info(f"[PolicyExtraction] Processing chunk {i+1}/{len(chunks)}...")
+        if len(chunks) > 1:
+            logger.info(f"[Policy] Processing chunk {i+1}/{len(chunks)}...")
         try:
             result = await extract_json_with_retry(
                 system_prompt=POLICY_EXTRACTION_PROMPT,
@@ -52,7 +53,7 @@ async def extract_policy_details(policy_text: str) -> dict:
             )
             return i, result
         except Exception as e:
-            logger.error(f"[PolicyExtraction] Error extracting chunk {i+1}: {e}")
+            logger.error(f"[Policy] Error extracting chunk {i+1}: {e}")
             return i, None
 
     tasks = [extract_chunk(i, chunk) for i, chunk in enumerate(chunks)]
@@ -83,14 +84,7 @@ async def extract_policy_details(policy_text: str) -> dict:
     final_json = merge_extracted_json(extracted_jsons)
     
     total_processing = time.time() - start_time
-    logger.info("\n=== PERFORMANCE TIMINGS ===")
-    logger.info("PDF Extraction: (Completed Upstream)")
-    logger.info(f"Prompt Preparation: {total_prompt_prep:.2f} seconds")
-    logger.info(f"LLM Processing: {total_llm_processing:.2f} seconds")
-    logger.info(f"JSON Parsing: {total_json_parsing:.2f} seconds")
-    logger.info(f"Total Processing: {total_processing:.2f} seconds")
-    logger.info("===========================\n")
-    
+    logger.debug(f"[Policy] Extraction timings: prompt={total_prompt_prep:.2f}s, llm={total_llm_processing:.2f}s, parse={total_json_parsing:.2f}s, total={total_processing:.2f}s")
     
     validation_result = validate_extraction(
         extracted_json=final_json,
@@ -98,7 +92,7 @@ async def extract_policy_details(policy_text: str) -> dict:
         all_expected_fields=POLICY_FIELDS
     )
     
-    logger.info(f"[PolicyExtraction] Extraction complete. Valid: {validation_result['isValid']}, Confidence: {validation_result['confidence']}")
+    logger.info(f"[Policy] Extraction completed (Valid: {validation_result['isValid']}, Confidence: {validation_result['confidence']}%)")
     
     return {
         "isValid": validation_result["isValid"],

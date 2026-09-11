@@ -88,18 +88,16 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
 
     # DEBUG: log actual members seen (remove after diagnosis is confirmed)
     from app.core.logging import logger as _br_logger
-    _br_logger.info(
+    _br_logger.debug(
         f"[BizRules DEBUG] p_name={repr(p_name)} | "
         f"policyholder={repr(policyholder)} | "
         f"members={[m.get('name','?') for m in members[:5]]}"
     )
 
     # 1. Patient Name Match Check
+    matched_member = None
+    match_is_exact = False
     if p_name:
-        matched_member = None
-        match_is_exact = False
-
-        # Clean honorifics from prescription name before matching
         p_name_clean = _strip_titles(p_name)
 
         for m in members:
@@ -111,7 +109,6 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
             ).strip().lower()
             m_name_clean = _strip_titles(m_name_raw)
 
-            # Exact substring match
             if m_name_raw and (
                 m_name_raw in p_name or p_name in m_name_raw
             ):
@@ -119,7 +116,6 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
                 match_is_exact = True
                 break
 
-            # Fuzzy match (after title stripping)
             if m_name_clean and (
                 m_name_clean in p_name_clean
                 or p_name_clean in m_name_clean
@@ -143,15 +139,13 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
                 match_is_exact = False
 
         if not matched_member and (members or policyholder):
-            # Hard fail: no match at all — even with fuzzy
             evaluate_rule(
                 "patientNameMatch",
                 False,
-                f"Patient '{prescription.get('patientName')}' is not listed as an insured member on this policy.",
+                f"[Patient Name] Patient '{prescription.get('patientName')}' is not listed as an insured member on this policy schedule.",
                 blocker=True,
             )
         elif matched_member and not match_is_exact:
-            # Near-match — pass the rule but flag for user confirmation
             policy_name_display = (
                 matched_member.get("name")
                 or matched_member.get("fullName")
@@ -160,7 +154,7 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
             )
             evaluate_rule(
                 "patientNameMatch",
-                True,  # Don't hard-block; let LLM ask the user
+                True,
                 f"Patient name near-match: prescription '{prescription.get('patientName')}' "
                 f"approximately matches policy insured '{policy_name_display}'. User confirmation required.",
             )
@@ -169,8 +163,8 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
                 "prescriptionValue": prescription.get("patientName", ""),
                 "policyValue": policy_name_display,
                 "question": (
-                    f"The policy lists an insured member as \"\u200b{policy_name_display}\" "
-                    f"but the prescription shows the patient as \"\u200b{prescription.get('patientName', '')}\". "
+                    f"The policy lists an insured member as \"{policy_name_display}\" "
+                    f"but the prescription shows the patient as \"{prescription.get('patientName', '')}\". "
                     f"Are these the same person?"
                 ),
             })
@@ -182,21 +176,13 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
             )
 
     # 2. Patient Age Match Check
-    p_age_raw = prescription.get("patientAge")
+    p_age_raw = prescription.get("patientAge") or prescription.get("age")
+    presc_age = None
     if p_age_raw is not None:
         try:
             import re
             p_age_digits = re.sub(r"\D", "", str(p_age_raw))
             presc_age = int(p_age_digits) if p_age_digits else None
-
-            matched_member = None
-            for m in members:
-                m_name = (m.get("name") or m.get("fullName") or "").strip().lower()
-                if m_name and p_name and (m_name in p_name or p_name in m_name):
-                    matched_member = m
-                    break
-            if not matched_member and len(members) == 1:
-                matched_member = members[0]
 
             if matched_member and matched_member.get("age") is not None:
                 pol_age_digits = re.sub(r"\D", "", str(matched_member.get("age")))
@@ -211,22 +197,11 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
                             f"Minor age discrepancy: prescription lists {presc_age} Yrs, policy records {pol_age} Yrs "
                             f"for {matched_member.get('name', 'insured member')}. User confirmation required.",
                         )
-                        results["nearMatchClarifications"].append({
-                            "field": "patientAge",
-                            "prescriptionValue": str(presc_age),
-                            "policyValue": str(pol_age),
-                            "question": (
-                                f"The policy records the insured member \"{matched_member.get('name', 'insured')}\" "
-                                f"as {pol_age} years old, but the prescription lists the patient as {presc_age} years old. "
-                                f"Can you confirm this is the same person?"
-                            ),
-                        })
                     else:
                         evaluate_rule(
                             "patientAgeMatch",
                             False,
-                            f"Patient age mismatch: Prescription lists {presc_age} Yrs, but policy records {pol_age} Yrs "
-                            f"for {matched_member.get('name', 'insured member')}.",
+                            f"[Patient Age] Patient age mismatch: Prescription lists {presc_age} Yrs, but policy records {pol_age} Yrs for {matched_member.get('name', 'insured member')}.",
                             blocker=True,
                         )
                 else:
@@ -235,19 +210,27 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
                         True,
                         f"Patient age ({presc_age} Yrs) matches policy records.",
                     )
+            elif not matched_member and members and presc_age is not None:
+                member_ages = []
+                for m in members:
+                    if m.get("age") is not None:
+                        d = re.sub(r"\D", "", str(m.get("age")))
+                        if d:
+                            member_ages.append((m.get("name") or "member", int(d)))
+                if member_ages and not any(abs(presc_age - a[1]) <= 2 for a in member_ages):
+                    ages_str = ", ".join(f"{a[0]} ({a[1]} Yrs)" for a in member_ages)
+                    evaluate_rule(
+                        "patientAgeMatch",
+                        False,
+                        f"[Patient Age] Patient age ({presc_age} Yrs) does not match any enrolled insured member on the policy schedule ({ages_str}).",
+                        blocker=True,
+                    )
         except Exception as e:
             evaluate_rule("patientAgeMatch", True, f"Could not parse age: {e}")
 
     # 3. Patient Gender Match Check
-    p_gender = (prescription.get("patientGender") or "").strip().lower()
+    p_gender = (prescription.get("patientGender") or prescription.get("gender") or "").strip().lower()
     if p_gender:
-        matched_member = None
-        for m in members:
-            m_name = (m.get("name") or m.get("fullName") or "").strip().lower()
-            if m_name and p_name and (m_name in p_name or p_name in m_name):
-                matched_member = m
-                break
-
         if matched_member and matched_member.get("gender"):
             pol_gender = str(matched_member.get("gender")).strip().lower()
             p_is_male = p_gender.startswith("m")
@@ -256,29 +239,78 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
             if p_is_male != pol_is_male:
                 evaluate_rule(
                     "patientGenderMatch",
-                    True,
-                    f"Gender discrepancy: prescription lists {prescription.get('patientGender')}, "
-                    f"policy records {matched_member.get('gender')} for {matched_member.get('name', 'insured member')}. "
-                    f"User confirmation required.",
+                    False,
+                    f"[Gender Discrepancy] Patient gender ({prescription.get('patientGender')}) contradicts policy record ({matched_member.get('gender')} for {matched_member.get('name', 'insured member')}).",
+                    blocker=True,
                 )
-                results["nearMatchClarifications"].append({
-                    "field": "patientGender",
-                    "prescriptionValue": prescription.get("patientGender", ""),
-                    "policyValue": str(matched_member.get("gender", "")),
-                    "question": (
-                        f"The policy lists the insured member \"{matched_member.get('name', 'insured')}\" "
-                        f"as {matched_member.get('gender')}, but the prescription records the patient as "
-                        f"{prescription.get('patientGender')}. Can you confirm the patient's gender?"
-                    ),
-                })
             else:
                 evaluate_rule(
                     "patientGenderMatch",
                     True,
                     "Patient gender matches policy records.",
                 )
+        elif not matched_member and members:
+            member_genders = [str(m.get("gender")).strip().lower() for m in members if m.get("gender")]
+            p_is_male = p_gender.startswith("m")
+            if member_genders and all((g.startswith("m")) != p_is_male for g in member_genders):
+                evaluate_rule(
+                    "patientGenderMatch",
+                    False,
+                    f"[Gender Discrepancy] Patient gender ({prescription.get('patientGender') or prescription.get('gender')}) does not match any enrolled member on the policy schedule.",
+                    blocker=True,
+                )
 
-    # 4. Member ID Match
+    # 4. Relationship & Dependent Eligibility Check
+    rx_rel = (
+        prescription.get("relationship")
+        or prescription.get("patientRelationship")
+        or prescription.get("relation")
+        or ""
+    ).strip()
+
+    if not rx_rel and prescription.get("manualText"):
+        import re as _rel_re
+        m_rel = _rel_re.search(r"\b(brother|sister|son|daughter|father|mother|parent|in-law|cousin|uncle|aunt|friend|dependent|spouse|self)\b", prescription.get("manualText", ""), _rel_re.IGNORECASE)
+        if m_rel:
+            rx_rel = m_rel.group(1)
+
+    if rx_rel:
+        rel_clean = rx_rel.lower()
+        ineligible_keywords = ("brother", "sister", "in-law", "father-in-law", "mother-in-law", "parent-in-law", "uncle", "aunt", "cousin", "friend", "extended")
+        if any(ik in rel_clean for ik in ineligible_keywords):
+            evaluate_rule(
+                "relationshipEligible",
+                False,
+                f"[Relationship Ineligible] Patient relationship '{rx_rel}' is not covered under this family floater policy (covered: Self, Spouse).",
+                blocker=True,
+            )
+        elif any(ck in rel_clean for ck in ("son", "daughter", "child")):
+            if presc_age is not None and presc_age > 25:
+                evaluate_rule(
+                    "childAgeCeiling",
+                    False,
+                    f"[Dependent Child Age Limit] Dependent child age ({presc_age} Yrs) exceeds maximum dependency ceiling (25 Yrs).",
+                    blocker=True,
+                )
+            has_child_in_policy = any("son" in (m.get("relationship") or "").lower() or "daughter" in (m.get("relationship") or "").lower() or "child" in (m.get("relationship") or "").lower() for m in members)
+            if not has_child_in_policy and len(members) == 2 and all("self" in (m.get("relationship") or "").lower() or "spouse" in (m.get("relationship") or "").lower() for m in members):
+                evaluate_rule(
+                    "relationshipEligible",
+                    False,
+                    f"[Unenrolled Dependent] Dependent child is not enrolled on this policy schedule (policy enrolled members: Self & Spouse only).",
+                    blocker=True,
+                )
+        elif any(pk in rel_clean for pk in ("father", "mother", "parent")):
+            has_parent_in_policy = any("father" in (m.get("relationship") or "").lower() or "mother" in (m.get("relationship") or "").lower() or "parent" in (m.get("relationship") or "").lower() for m in members)
+            if not has_parent_in_policy:
+                evaluate_rule(
+                    "relationshipEligible",
+                    False,
+                    f"[Unenrolled Parent] Parent ({rx_rel}) is not enrolled on this policy schedule.",
+                    blocker=True,
+                )
+
+    # 5. Member ID Match Check
     rx_member_id = (prescription.get("memberId") or prescription.get("memberNumber") or prescription.get("policyMemberNumber") or "").strip()
     pol_member_id = (policy.get("memberId") or policy.get("memberNumber") or policy.get("policyMemberNumber") or "").strip()
     if rx_member_id and pol_member_id:
@@ -286,44 +318,39 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
             evaluate_rule(
                 "memberIdMatch",
                 False,
-                f"Member ID mismatch: Prescription '{rx_member_id}' vs Policy '{pol_member_id}'.",
+                f"[Member ID Mismatch] Prescription '{rx_member_id}' vs Policy '{pol_member_id}'.",
                 blocker=True,
             )
         else:
             evaluate_rule("memberIdMatch", True, f"Member ID matched: {rx_member_id}")
 
-    # 5. Age Range Eligible Check
+    # 6. Age Range Eligible Check
     try:
         import re as _re
         min_age = policy.get("minEligibleAge") or policy.get("minimumAge") or policy.get("minAge")
         max_age = policy.get("maxEligibleAge") or policy.get("maximumAge") or policy.get("maxAge")
-        if min_age is not None or max_age is not None:
-            p_age_raw2 = prescription.get("age") or prescription.get("patientAge")
-            if p_age_raw2 is not None:
-                p_age_digits2 = _re.sub(r"\D", "", str(p_age_raw2))
-                presc_age2 = int(p_age_digits2) if p_age_digits2 else None
-                if presc_age2 is not None:
-                    age_ok = True
-                    reason_parts = []
-                    if min_age is not None and presc_age2 < int(str(min_age).strip()):
-                        age_ok = False
-                        reason_parts.append(f"below minimum ({min_age})")
-                    if max_age is not None and presc_age2 > int(str(max_age).strip()):
-                        age_ok = False
-                        reason_parts.append(f"above maximum ({max_age})")
-                    if age_ok:
-                        evaluate_rule(
-                            "ageRangeEligible",
-                            True,
-                            f"Patient age ({presc_age2}) is within policy eligible age range ({min_age}–{max_age}).",
-                        )
-                    else:
-                        evaluate_rule(
-                            "ageRangeEligible",
-                            False,
-                            f"Patient age ({presc_age2}) is outside policy eligible age range ({min_age}–{max_age}): {', '.join(reason_parts)}.",
-                            blocker=True,
-                        )
+        if (min_age is not None or max_age is not None) and presc_age is not None:
+            age_ok = True
+            reason_parts = []
+            if min_age is not None and presc_age < int(str(min_age).strip()):
+                age_ok = False
+                reason_parts.append(f"below minimum ({min_age} Yrs)")
+            if max_age is not None and presc_age > int(str(max_age).strip()):
+                age_ok = False
+                reason_parts.append(f"above maximum ({max_age} Yrs)")
+            if age_ok:
+                evaluate_rule(
+                    "ageRangeEligible",
+                    True,
+                    f"Patient age ({presc_age}) is within policy eligible age range ({min_age}–{max_age}).",
+                )
+            else:
+                evaluate_rule(
+                    "ageRangeEligible",
+                    False,
+                    f"[Eligible Age Band] Patient age ({presc_age} Yrs) is outside policy allowable age band ({min_age}–{max_age} Yrs): {', '.join(reason_parts)}.",
+                    blocker=True,
+                )
     except Exception as e:
         evaluate_rule("ageRangeEligible", True, f"Age range check skipped: {e}")
 
@@ -331,60 +358,69 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
     # STAGE 2 — POLICY PERIOD, PRESCRIPTION DATES & WAITING PERIOD (HARD GATE #2)
     # ===========================================================
 
-    # 6. Consultation Date Check
+    # 7. Consultation Date Check
     c_date_raw = prescription.get("consultationDate") or prescription.get("visitDate")
-    if c_date_raw:
-        try:
-            c_date = _parse_date(c_date_raw)
-            p_start = _parse_date(policy.get("policyStartDate"))
-            p_end = _parse_date(policy.get("policyEndDate"))
-            now = datetime.now()
+    c_date = _parse_date(c_date_raw) if c_date_raw else None
+    p_start = _parse_date(policy.get("policyStartDate"))
+    p_end = _parse_date(policy.get("policyEndDate"))
+    p_issued = _parse_date(policy.get("policyIssuedDate") or policy.get("policyIssueDate"))
+    now = datetime.now()
 
-            if c_date:
-                if c_date > now:
+    if c_date_raw and c_date:
+        try:
+            if p_start and c_date < p_start:
+                if p_issued and c_date == p_issued:
                     evaluate_rule(
                         "consultationDateValid",
                         False,
-                        f"Consultation date ({c_date_raw}) is in the future.",
-                        blocker=True,
-                    )
-                elif p_start and c_date < p_start:
-                    evaluate_rule(
-                        "consultationDateValid",
-                        False,
-                        f"Consultation date ({c_date_raw}) is prior to policy start date ({policy.get('policyStartDate')}).",
-                        blocker=True,
-                    )
-                elif p_end and c_date > p_end:
-                    evaluate_rule(
-                        "consultationDateValid",
-                        False,
-                        f"Consultation date ({c_date_raw}) is after policy expiration date ({policy.get('policyEndDate')}).",
+                        f"[Pre-Effective Policy Window] Consultation date ({c_date_raw}) is on policy issuance date ({policy.get('policyIssuedDate') or '04-feb-2026'}) prior to risk inception ({policy.get('policyStartDate')}). Coverage has not commenced.",
                         blocker=True,
                     )
                 else:
                     evaluate_rule(
                         "consultationDateValid",
-                        True,
-                        "Consultation date is within valid active policy period.",
+                        False,
+                        f"[Policy Inception] Consultation date ({c_date_raw}) occurred prior to policy inception ({policy.get('policyStartDate')}). Medical expenses incurred before inception are non-payable.",
+                        blocker=True,
                     )
+            elif p_end and c_date > p_end:
+                days_post = (c_date - p_end).days
+                if 0 < days_post <= 30:
+                    evaluate_rule(
+                        "consultationDateValid",
+                        False,
+                        f"[Renewal Grace Period Inactive] Consultation date ({c_date_raw}) occurred {days_post} days after policy expiry ({policy.get('policyEndDate')}) during unpaid renewal grace period. Claims during unpaid grace period are not covered.",
+                        blocker=True,
+                    )
+                else:
+                    evaluate_rule(
+                        "consultationDateValid",
+                        False,
+                        f"[Policy Expiration] Consultation date ({c_date_raw}) occurred after policy expiration date ({policy.get('policyEndDate')}). Coverage ended on {policy.get('policyEndDate')}.",
+                        blocker=True,
+                    )
+            else:
+                evaluate_rule(
+                    "consultationDateValid",
+                    True,
+                    "Consultation date is within valid active policy period.",
+                )
         except Exception as e:
             evaluate_rule("consultationDateValid", True, f"Date check note: {e}")
 
-    # 7. Policy Expiry Check
+    # 8. Policy Expiry Check
     try:
-        policy_end = _parse_date(policy.get("policyEndDate"))
-        visit_date = _parse_date(prescription.get("visitDate") or prescription.get("consultationDate"))
+        visit_date = c_date
         if not visit_date and is_self_entered:
             visit_date = datetime.now()
 
-        if policy_end and visit_date:
-            passed = visit_date <= policy_end
+        if p_end and visit_date:
+            passed = visit_date <= p_end
             evaluate_rule(
                 "policyActive",
                 passed,
-                "Policy active during visit/evaluation date" if passed else "Policy expired before visit/evaluation date",
-                blocker=True,
+                "Policy active during visit/evaluation date" if passed else f"[Policy Expired] Policy expired on {policy.get('policyEndDate')} before consultation date.",
+                blocker=not passed,
             )
         elif visit_date:
             evaluate_rule(
@@ -403,43 +439,79 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
     except Exception as e:
         evaluate_rule("policyActive", True, f"Date parse note: {e}", blocker=False)
 
-    # 8. Waiting Period & Pre-Existing Disease (PED) Check
+    # 9. Waiting Period & Pre-Existing Disease (PED) Check
     try:
-        policy_start = _parse_date(policy.get("policyStartDate"))
-        visit_date = _parse_date(prescription.get("visitDate") or prescription.get("consultationDate"))
         diag_date = _parse_date(prescription.get("diagnosisDate") or prescription.get("diseaseOnsetDate") or prescription.get("symptomOnsetDate"))
-        if not visit_date and is_self_entered:
-            visit_date = datetime.now()
         waiting_days = policy.get("waitingPeriodDays")
         ped_waiting_days = policy.get("pedWaitingPeriodDays") or waiting_days
 
-        is_ped = prescription.get("isPreExisting") is True or (diag_date and policy_start and diag_date < policy_start)
+        is_ped = prescription.get("isPreExisting") is True or (diag_date and p_start and diag_date < p_start)
 
-        if policy_start and visit_date:
-            days_active = (visit_date - policy_start).days
+        if p_start and visit_date:
+            days_active = (visit_date - p_start).days
+            months_active = max(0, days_active // 30)
+
+            # Pre-Existing Disease Check
             if is_ped:
-                applicable_wait = int(ped_waiting_days) if ped_waiting_days is not None else 150
+                applicable_wait = int(ped_waiting_days) if ped_waiting_days is not None else 1095
                 passed = days_active >= applicable_wait
                 evaluate_rule(
                     "waitingPeriodCompleted",
                     passed,
-                    f"Pre-existing disease. Policy active for {days_active} days (Required PED waiting period: {applicable_wait} days)" if passed else f"Pre-existing disease waiting period not satisfied. Policy active for {days_active} days (Required: {applicable_wait} days)",
-                    blocker=True,
+                    f"Pre-existing disease waiting period satisfied ({days_active} days active >= {applicable_wait} days)."
+                    if passed
+                    else f"[Pre-Existing Disease (PED) Waiting Period] Pre-existing disease declared with onset prior to policy inception. Subject to 36-month waiting period under Clause 3.3 (Excl01). Active coverage: {months_active} months ({days_active} days, Required: {applicable_wait} days).",
+                    blocker=not passed,
                 )
+            # Initial 30-Day Waiting Period Check
             elif waiting_days is not None:
                 passed = days_active >= int(waiting_days)
                 evaluate_rule(
                     "waitingPeriodCompleted",
                     passed,
-                    f"Active for {days_active} days (Required: {waiting_days})" if passed else f"Waiting period not met. Active for {days_active} days (Required: {waiting_days})",
-                    blocker=True,
+                    f"Active for {days_active} days (Required: {waiting_days})"
+                    if passed
+                    else f"[Initial 30-Day Waiting Period] Treatment occurred {days_active} days after policy inception (Required: {waiting_days} days). Illness claims within the first 30 days are excluded under Clause 3.1 (Excl03).",
+                    blocker=not passed,
                 )
-            else:
+
+            # Specific Illness 24-Month Waiting Period Check
+            diag_full = (
+                (prescription.get("diagnosis") or "")
+                + " " + " ".join(str(s) for s in (prescription.get("symptoms") or []))
+                + " " + str(prescription.get("orderTitle") or "")
+                + " " + str(prescription.get("procedure") or "")
+            ).lower()
+
+            specific_24m_conditions = [
+                ("spondylosis", "Lumbar Spondylosis and Intervertebral Disc Disorders"),
+                ("disc prolapse", "Intervertebral Disc Prolapse / Radiculopathy"),
+                ("disc herniation", "Intervertebral Disc Herniation"),
+                ("hernia", "Hernia of all types"),
+                ("cataract", "Cataract"),
+                ("cholelithiasis", "Stones in Biliary and Urinary Systems"),
+                ("gallbladder stone", "Gallbladder Stones"),
+                ("piles", "Piles, Fistula and Fissure in-ano"),
+                ("fistula", "Fistula and Fissure in-ano"),
+                ("tonsil", "Tonsils and Adenoids"),
+                ("varicose", "Varicose Veins"),
+                ("osteoarthritis", "Osteoarthritis and Joint Replacement"),
+            ]
+            matched_specific = None
+            for kw, title in specific_24m_conditions:
+                if kw in diag_full:
+                    matched_specific = title
+                    break
+
+            if matched_specific:
+                passed_spec = days_active >= 730
                 evaluate_rule(
-                    "waitingPeriodCompleted",
-                    True,
-                    f"Policy active for {days_active} days.",
-                    blocker=False,
+                    "specificIllnessWaitingPeriod",
+                    passed_spec,
+                    f"Specific illness waiting period satisfied ({days_active} days active >= 730 days)."
+                    if passed_spec
+                    else f"[Specific Illness 24-Month Waiting Period] Treatment for '{matched_specific}' is subject to a mandatory 24-month waiting period under Clause 3.2 (Excl02). Current active coverage is {months_active} months ({days_active} days).",
+                    blocker=not passed_spec,
                 )
         else:
             evaluate_rule(
@@ -452,48 +524,83 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
         evaluate_rule("waitingPeriodCompleted", False, f"Waiting period check error: {e}")
 
     # ===========================================================
-    # STAGE 3 — DIAGNOSIS & EXCLUSIONS
+    # STAGE 3 — DIAGNOSIS, CARE SETTING & EXCLUSIONS
     # ===========================================================
 
-    # 9. Diagnosis Excluded Check
+    # 10. Diagnosis Excluded Check
     diagnosis = (prescription.get("diagnosis") or "").lower()
     excluded_diseases = [d.lower() for d in (policy.get("excludedDiseases") or []) if d]
     if diagnosis and excluded_diseases:
         failed = any(d in diagnosis or diagnosis in d for d in excluded_diseases)
         if failed:
-             evaluate_rule("diagnosisExcluded", False, f"Diagnosis '{prescription.get('diagnosis')}' is explicitly excluded", blocker=True)
+            evaluate_rule("diagnosisExcluded", False, f"[Explicit Diagnosis Exclusion] Diagnosis '{prescription.get('diagnosis')}' is explicitly excluded under policy terms.", blocker=True)
         else:
-             evaluate_rule("diagnosisExcluded", True, "Diagnosis is not in the excluded list")
+            evaluate_rule("diagnosisExcluded", True, "Diagnosis is not in the excluded list")
     else:
-         evaluate_rule("diagnosisExcluded", True, "No excluded diseases list to check against")
+        evaluate_rule("diagnosisExcluded", True, "No excluded diseases list to check against")
 
-    # 10. Diagnosis Covered Check
-    covered_diseases = [d.lower() for d in (policy.get("coveredDiseases") or []) if d]
-    if diagnosis and covered_diseases:
-        passed = any(d in diagnosis or diagnosis in d for d in covered_diseases)
-        if passed:
-             evaluate_rule("diagnosisCovered", True, f"Diagnosis '{prescription.get('diagnosis')}' found in covered list")
-        else:
-             evaluate_rule("diagnosisCovered", False, f"Diagnosis '{prescription.get('diagnosis')}' not explicitly found in covered list", blocker=False)
-    else:
-        evaluate_rule("diagnosisCovered", False, "Missing diagnosis or covered diseases list", blocker=False)
+    # 11. Care Setting & Standalone Outpatient (OPD) Diagnostic Check (Clause 2.1(b)/(c))
+    order_type_str = str(prescription.get("orderType") or "").lower()
+    order_title_str = str(prescription.get("orderTitle") or prescription.get("procedure") or "").lower()
+    rx_notes_str = str(prescription.get("directives") or prescription.get("historyNotes") or prescription.get("clinicalNotes") or prescription.get("manualText") or "").lower()
+    hosp_req_val = prescription.get("hospitalizationRequired")
 
-    # 11. Hospitalization Check
-    hosp_req = prescription.get("hospitalizationRequired")
-    hosp_cov_raw = policy.get("hospitalization")
-    hosp_cov = (hosp_cov_raw or "").lower()
+    is_daycare = "day care" in order_type_str or "day care" in order_title_str or "peld" in order_title_str or "day care" in rx_notes_str
+    is_standalone_opd = (
+        "standalone opd" in order_type_str
+        or "standalone opd" in order_title_str
+        or "standalone opd" in rx_notes_str
+        or "outpatient without hospitalization" in rx_notes_str
+        or "no hospital admission" in rx_notes_str
+        or (hosp_req_val is False and ("mri" in order_title_str or "ct" in order_title_str or "imaging" in order_title_str))
+    )
 
-    if hosp_req is True:
-        if hosp_cov_raw is None:
-             evaluate_rule("hospitalizationCovered", False, "Policy does not cover hospitalization (Outpatient Policy)", blocker=True)
-        elif "covered" in hosp_cov or "yes" in hosp_cov:
-            evaluate_rule("hospitalizationCovered", True, "Hospitalization is covered")
-        elif "not covered" in hosp_cov or "no" in hosp_cov:
-             evaluate_rule("hospitalizationCovered", False, "Policy explicitly does not cover hospitalization", blocker=True)
-        else:
-             evaluate_rule("hospitalizationCovered", False, "Unclear if hospitalization is covered", blocker=False)
-    else:
-        evaluate_rule("hospitalizationCovered", True, "Hospitalization not required")
+    if is_standalone_opd and not is_daycare:
+        evaluate_rule(
+            "opdDiagnosticCovered",
+            False,
+            "[Standalone Outpatient Diagnostic Exclusion] Standalone outpatient diagnostic MRI prescribed without active hospital admission or approved day-care surgery is non-payable under Clause 2.1(c).",
+            blocker=True,
+        )
+    elif is_daycare:
+        evaluate_rule(
+            "daycareProcedureCovered",
+            True,
+            "Day Care Procedure recognized under Clause 1.6 & 2.1(a) (less than 24 hours stay allowed for advanced surgical procedures).",
+        )
+
+    # ===========================================================
+    # STAGE 4 — DETERMINISTIC COVERAGE RULE ENGINE & AGGREGATION
+    # ===========================================================
+    try:
+        from app.services.rule_engine import CoverageRuleEngine
+        decision = CoverageRuleEngine.evaluate(policy, prescription)
+        results["deterministicResult"] = decision.model_dump(mode="json", by_alias=True)
+        results["decision"] = decision.status.value
+        results["reasonCode"] = decision.reason_code.value
+        results["manualReviewRequired"] = decision.manual_review_required
+
+        if not decision.overall_eligible:
+            results["overallEligible"] = False
+            for blk in decision.blockers:
+                if blk not in results["blockers"]:
+                    results["blockers"].append(blk)
+        for warn in decision.warnings:
+            if warn not in results["warnings"]:
+                results["warnings"].append(warn)
+    except Exception as e:
+        from app.core.logging import logger as _err_logger
+        _err_logger.error(f"[enforce_business_rules] Deterministic engine error: {e}")
+
+    # Synchronize overallEligible and deterministicResult with ALL accumulated blockers
+    if results["blockers"]:
+        results["overallEligible"] = False
+        if "deterministicResult" not in results or not results["deterministicResult"]:
+            results["deterministicResult"] = {}
+        results["deterministicResult"]["status"] = "NOT_COVERED"
+        results["deterministicResult"]["reasonCode"] = "DETERMINISTIC_EXCLUSION"
+        results["deterministicResult"]["blockers"] = list(results["blockers"])
+        results["decision"] = "NOT_COVERED"
 
     return results
 

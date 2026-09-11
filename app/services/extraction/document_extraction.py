@@ -68,52 +68,45 @@ async def extract_text_from_document(
     t_start = time.time()
     size_kb = len(buffer) / 1024.0
     logger.info(
-        f"[DocExtractor] [DEBUG] ▶ [START] Extracting [{doc_label}] | Type: {mime_type} | Size: {size_kb:.1f} KB ({len(buffer)} bytes)"
+        f"[Document] Extracting text from {doc_label} ({size_kb:.1f} KB, {mime_type})..."
     )
     text = ""
     
     try:
         # Route 1: Image -> OCR
         if mime_type.startswith("image/"):
-            logger.info(f"[DocExtractor] [DEBUG] [{doc_label}] Route: Single Image -> Gemini Flash Vision (Primary)")
+            logger.debug(f"[Document] {doc_label} route: Image -> Gemini Flash Vision OCR")
             text = await extract_text_from_image_bytes(buffer, mime_type, doc_label=doc_label)
             
         # Route 2: DOCX -> Python-docx
         elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-            logger.info(f"[DocExtractor] [DEBUG] [{doc_label}] Route: DOCX Document -> python-docx parser")
+            logger.debug(f"[Document] {doc_label} route: DOCX -> python-docx parser")
             doc = docx.Document(io.BytesIO(buffer))
             text = "\n".join([p.text for p in doc.paragraphs])
             
         # Route 3: PDF -> PyMuPDF (text-based) or Gemini Flash Vision OCR (scanned)
         elif mime_type == "application/pdf":
             page_count = get_pdf_page_count(buffer)
-            logger.info(f"[DocExtractor] [DEBUG] [{doc_label}] Route: PDF Document ({page_count} pages)")
+            logger.debug(f"[Document] {doc_label} route: PDF ({page_count} pages)")
             
             if is_scanned_pdf(buffer):
-                logger.info(
-                    f"[DocExtractor] [DEBUG] [{doc_label}] PDF is Scanned (Image-based) -> Routing to Gemini Flash Vision Cloud OCR"
-                )
+                logger.debug(f"[Document] {doc_label} is scanned image PDF -> Routing to Gemini Flash Vision OCR")
                 text = await extract_text_from_scanned_pdf(buffer, doc_label=doc_label)
             else:
-                logger.info(
-                    f"[DocExtractor] [DEBUG] [{doc_label}] PDF is Native (Text-based) -> Attempting fast PyMuPDF extraction"
-                )
+                logger.debug(f"[Document] {doc_label} is native text PDF -> Fast PyMuPDF extraction")
                 text = extract_text_from_pdf_buffer(buffer)
                 if not text or len(text.strip()) < 50:
-                    logger.warning(
-                        f"[DocExtractor] [DEBUG] [{doc_label}] PyMuPDF extracted minimal text ({len(text.strip()) if text else 0} chars). "
-                        "Fallback trigger: Routing to Gemini Flash Vision OCR..."
-                    )
+                    logger.debug(f"[Document] PyMuPDF extracted minimal text; falling back to Gemini Vision OCR")
                     text = await extract_text_from_scanned_pdf(buffer, doc_label=doc_label)
                     
         # Route 4: Fallback for plain text or unknown
         else:
-            logger.info(f"[DocExtractor] [DEBUG] [{doc_label}] Route: Plaintext fallback")
+            logger.debug(f"[Document] {doc_label} route: Plaintext fallback")
             text = buffer.decode("utf-8", errors="ignore")
             
     except Exception as e:
         logger.error(
-            f"[DocExtractor] [DEBUG] [ERROR] [{doc_label}] Extraction failed with exception: {type(e).__name__}: {e}",
+            f"[Document] Extraction failed for {doc_label}: {e}",
             exc_info=True
         )
         
@@ -122,13 +115,11 @@ async def extract_text_from_document(
     
     if is_valid:
         logger.info(
-            f"[DocExtractor] [DEBUG] ✔ [DONE] [{doc_label}] Extraction Succeeded in {elapsed:.2f}s | "
-            f"Result: {len(text)} chars, {len(text.split())} words"
+            f"[Document] Extracted {len(text)} characters ({len(text.split())} words) from {doc_label} in {elapsed:.2f}s"
         )
     else:
         logger.warning(
-            f"[DocExtractor] [DEBUG] ✖ [WARN] [{doc_label}] Extraction Completed with quality warnings in {elapsed:.2f}s | "
-            f"Extracted only {len(text)} chars."
+            f"[Document] Completed with quality warnings for {doc_label} in {elapsed:.2f}s ({len(text)} chars extracted)"
         )
         
     return text

@@ -55,6 +55,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"Data retention enabled: {settings.DATA_CLEANUP_DAYS} days ({settings.ttl_seconds} seconds)")
     await connect_to_mongodb()
     
+    # Initialize / Seed Knowledge Base if needed
+    try:
+        from app.services.knowledge_base.policy_knowledge_service import PolicyKnowledgeService
+        await PolicyKnowledgeService.seed_knowledge_base()
+    except Exception as e:
+        logger.warning(f"Knowledge Base initialization notice: {e}")
+    
     # Ensure TTL Indexes on all non-permanent models
     models = [
         Policy, Prescription, AnalysisReport, AnalysisSession, 

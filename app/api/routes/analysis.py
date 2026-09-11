@@ -178,6 +178,25 @@ async def get_analysis(
             pass
     if not d.get("updatedAt") and d.get("createdAt"):
         d["updatedAt"] = d["createdAt"]
+
+    # Ensure referenceComparison is populated even for legacy/pre-existing reports
+    if not d.get("referenceComparison") or (isinstance(d.get("referenceComparison"), dict) and len(d["referenceComparison"]) == 0):
+        try:
+            from app.services.coverage.reference_benchmark_service import generate_reference_comparison
+            ref_comp = generate_reference_comparison(
+                policy_json=d.get("policyJson"),
+                prescription_json=d.get("prescriptionJson"),
+                coverage_analysis=d.get("coverageAnalysis")
+            )
+            d["referenceComparison"] = ref_comp
+            # Persist to database so subsequent queries have it
+            try:
+                report.reference_comparison = ref_comp
+                await report.save()
+            except Exception:
+                pass
+        except Exception:
+            pass
         
     return d
 
@@ -197,11 +216,13 @@ async def batch_delete_analysis_reports(
 
     service = CrudService(AnalysisReport, "AnalysisReport", [])
     result = await service.delete_batch(current_user["id"], body.ids)
+    deleted_count = result.get("deletedCount", result.get("deleted", 0))
+    skipped_count = result.get("skippedCount", len(body.ids) - deleted_count)
     return {
         "success": True,
-        "deletedCount": result["deletedCount"],
-        "skippedCount": result["skippedCount"],
-        "message": f"Successfully deleted {result['deletedCount']} report(s)"
+        "deletedCount": deleted_count,
+        "skippedCount": skipped_count,
+        "message": f"Successfully deleted {deleted_count} report(s)"
     }
 
 

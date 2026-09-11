@@ -152,9 +152,12 @@ class CrudService:
             if await self.delete(user_id, doc_id):
                 deleted_count += 1
                 
+        skipped_count = len(doc_ids) - deleted_count
         return {
             "requested": len(doc_ids),
-            "deleted": deleted_count
+            "deleted": deleted_count,
+            "deletedCount": deleted_count,
+            "skippedCount": skipped_count
         }
 
     async def list_paginated(

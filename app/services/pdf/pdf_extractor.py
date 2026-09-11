@@ -25,7 +25,7 @@ def extract_text_from_pdf_buffer(buffer: bytes) -> str:
         text_parts: list[str] = []
         total_pages = doc.page_count
 
-        logger.info(f"[PDF Extractor] [DEBUG] Direct PyMuPDF text parsing on {total_pages} page(s)...")
+        logger.debug(f"[PDF] Parsing text on {total_pages} page(s) with PyMuPDF...")
 
         for page_num in range(total_pages):
             try:
@@ -34,15 +34,15 @@ def extract_text_from_pdf_buffer(buffer: bytes) -> str:
                 if page_text and page_text.strip():
                     text_parts.append(page_text)
             except Exception as e:
-                logger.warning(
-                    f"[PDF Extractor] [DEBUG] Failed to parse text on page {page_num + 1}/{total_pages}: {e}"
+                logger.debug(
+                    f"[PDF] Failed to parse text on page {page_num + 1}/{total_pages}: {e}"
                 )
                 # Skip corrupted pages, continue processing
 
         full_text = "\n".join(text_parts)
 
-        logger.info(
-            f"[PDF Extractor] [DEBUG] PyMuPDF extracted {len(full_text)} chars ({len(full_text.split())} words) from {len(text_parts)}/{total_pages} pages"
+        logger.debug(
+            f"[PDF] Extracted {len(full_text)} chars ({len(full_text.split())} words) from {len(text_parts)}/{total_pages} pages"
         )
 
         from app.services.llm.ai_client import get_current_cost_tracker
@@ -118,16 +118,9 @@ def render_all_pages_as_bytes(
     """
     Render ALL pages of a PDF to PNG bytes in a SINGLE document open.
 
-    Why DPI=90?
-    PaddleOCR's text detector internally resizes images so the longest side
-    is ≤ det_limit_side_len (default 960px). A standard A4 page at 90 DPI
-    is ~752×1063px — already within that limit — so PaddleOCR uses the
-    image as-is with NO extra resize step.  Rendering at higher DPI (e.g.
-    300) wastes RAM and forces PaddleOCR to do an internal downscale anyway.
-
     Args:
         buffer:    Raw PDF bytes.
-        dpi:       Rendering resolution (default 90 — optimal for PaddleOCR).
+        dpi:       Rendering resolution (default 90).
         max_pages: Maximum pages to render (None = all).
 
     Returns:
@@ -192,8 +185,8 @@ def is_scanned_pdf(buffer: bytes, sample_pages: int = 3) -> bool:
                 scanned_pages += 1
 
         is_scanned = scanned_pages > (pages_to_check / 2)
-        logger.info(
-            f"[PDF Extractor] [DEBUG] Format Analysis: {doc.page_count} total pages | "
+        logger.debug(
+            f"[PDF] Format Analysis: {doc.page_count} total pages | "
             f"Sampled {pages_to_check} pages: [{', '.join(word_counts)}] | "
             f"Result: {'SCANNED (Image-based)' if is_scanned else 'NATIVE (Text-based)'}"
         )

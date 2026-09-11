@@ -52,6 +52,27 @@ async def connect_to_mongodb() -> None:
     from app.models.stored_file import StoredFile
     from app.models.analysis_session import AnalysisSession
     from app.models.analysis_audit_log import AnalysisAuditLog
+    from app.models.knowledge_base import (
+        InsuranceCompany,
+        InsuranceProduct,
+        ProductVariant,
+        PolicyVersion,
+        PolicyClause,
+        CoverageRule,
+        PolicyEvidence,
+    )
+    from app.models.rag_chunk import PolicyChunk
+    from app.models.expert_review import (
+        ClaimCase,
+        ClaimAnalysisVersion,
+        ExpertReview,
+        ExpertCorrection,
+        ApprovedExpertCase,
+    )
+    from app.models.dataset_tuning import (
+        DatasetManifest,
+        EvaluationRun,
+    )
 
     await init_beanie(
         database=db,
@@ -65,6 +86,21 @@ async def connect_to_mongodb() -> None:
             StoredFile,
             AnalysisSession,
             AnalysisAuditLog,
+            InsuranceCompany,
+            InsuranceProduct,
+            ProductVariant,
+            PolicyVersion,
+            PolicyClause,
+            CoverageRule,
+            PolicyEvidence,
+            PolicyChunk,
+            ClaimCase,
+            ClaimAnalysisVersion,
+            ExpertReview,
+            ExpertCorrection,
+            ApprovedExpertCase,
+            DatasetManifest,
+            EvaluationRun,
         ],
     )
 

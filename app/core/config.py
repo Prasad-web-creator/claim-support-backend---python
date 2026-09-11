@@ -33,6 +33,13 @@ class Settings(BaseSettings):
         description="Vision/multimodal AI model",
     )
 
+    # ─── Policy RAG / File Search ─────────────────────────────────────────────
+    RAG_PROVIDER: str = Field(default="local", description="RAG search provider: local | gemini")
+    RAG_TOP_K: int = Field(default=5, ge=1, le=20, description="Top K relevant clauses to retrieve")
+    RAG_SIMILARITY_THRESHOLD: float = Field(default=0.15, ge=0.0, le=1.0, description="Minimum relevance score threshold")
+    RAG_CACHE_ENABLED: bool = Field(default=True, description="Enable retrieval caching")
+    RAG_CACHE_TTL_SECONDS: int = Field(default=3600, ge=60, description="Retrieval cache TTL in seconds")
+
     # ─── Logging ──────────────────────────────────────────────────────────────
     LOG_LEVEL: str = Field(default="DEBUG", description="Logging level")
 
@@ -87,3 +94,6 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Cached settings instance — loaded once at startup."""
     return Settings()
+
+
+settings = get_settings()

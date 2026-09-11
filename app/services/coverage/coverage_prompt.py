@@ -2598,31 +2598,52 @@ the Coverage Status itself — it belongs only in the "Recommendation" field.
 
 ══════════════════════════════════════════════════════════════════════════════
 
-# EXPLAINABILITY REQUIREMENT
+# EXPLAINABILITY & DIAGNOSIS CARD REQUIREMENT
 
-Every coverage decision MUST contain:
+For EACH and EVERY diagnosis, procedure, test, or clinical item in the "comparison" array:
 
-Diagnosis
+Every diagnosis/item card MUST contain these FOUR essential fields:
 
-↓
+1. "coverageStatus":
+   - MUST be strictly ONE of: "Covered", "Not Covered", or "Partially Covered" only.
+   - Do NOT use any other status (e.g. never use "Manual Review", "Rejected", "Unknown", or "Pending" in item coverageStatus).
 
-Medical Purpose
+2. "coverageStatusReason" (and "explanation" - must be identical):
+   - MUST be written in plain, clear, friendly English that is easily understood by ANY person — including a policyholder with mid-level English, medical personnel, and an insurance claims examiner.
+   - MUST explain the decision clearly, directly, and with detailed reasoning.
+   - MUST incorporate the precise policy-related terms (e.g., "Period of Insurance", "Active Policy Period", "Waiting Period", "Pre-Existing Disease (PED) Clause", "Specific Disease Sub-Limit", "Permanent Exclusions", "Co-payment", "Deductible", "Room Rent Capping", "Inpatient / Daycare Benefit").
+   - MUST provide a detailed explanation comparing dates and terms:
+     * Example for Not Covered (Expired):
+       "Your insurance policy expired on 10 January 2024. Your doctor visit was on 15 March 2024. Claims cannot be paid for treatments taken after the policy has ended. Under your policy terms, medical coverage is strictly limited to services received during the active Period of Insurance."
+     * Example for Not Covered (Waiting Period):
+       "Your treatment for [Diagnosis] is not covered due to the initial 30-day waiting period clause. Your policy started on 01 January 2024, and your doctor visit was on 15 January 2024 (15 days after start). Under policy terms, no illness claims are payable during the first 30 days of coverage."
+     * Example for Covered:
+       "Your treatment for [Diagnosis] is covered under the Inpatient Hospitalization Benefit of your policy. Your consultation on 15 March 2024 occurred within the active Period of Insurance, and all initial waiting periods have been fulfilled."
+     * Example for Partially Covered:
+       "Your treatment for [Diagnosis] is partially covered. Under your policy's Specific Disease Sub-Limit clause, coverage for this procedure is capped at ₹25,000. Your estimated procedure cost is ₹40,000, so the remaining ₹15,000 is the patient's responsibility."
 
-↓
+3. "policyEvidence":
+   - MUST cite the clear, verifiable policy evidence directly from the policy document or specify the exact reason taken to decide if prescription is covered/not/partially.
+   - Quote relevant clauses, sections, dates, and terms verbatim or near-verbatim.
+   - Example for Expiration:
+     "Period of Insurance : 15-01-2022 to 10-01-2024. Policy Clause 3.1 (Policy Period & Validity): Medical expenses must be incurred during the active Period of Insurance. Treatments after expiry are strictly excluded."
+   - Example for Waiting Period:
+     "Policy Clause 4.1 (Initial Waiting Period): 30-day waiting period from policy inception date 01-01-2024. Expenses related to any illness diagnosed during the first 30 days are excluded."
+   - Example for Covered Benefit:
+     "Policy Clause 2.1 (Inpatient Care & Hospitalization Expenses): Coverage provided up to the Sum Insured of ₹5,00,000 for medically necessary inpatient hospitalizations."
+   - Example for Sub-Limit:
+     "Policy Clause 5.2 (Specific Ailment Capping): Cataract / procedure sub-limit capped at ₹25,000 per eye."
+   - NEVER output generic placeholder text like "No matching policy clause found" if policy text is available. Always cite the relevant section, clause, or policy period.
 
-Policy Clause
-
-↓
-
-Coverage Status (exactly one of: Covered / Partially Covered / Not Covered)
-
-↓
-
-Reason
-
-↓
-
-Recommendation
+4. "financialDecision":
+   - Any financial coverage reasoning from comparing the policy limits/terms and prescription costs.
+   - State whether 100% covered, patient out-of-pocket, co-pay, or deductible details.
+   - Example:
+     "Covered 100% up to Policy Sum Insured of ₹5,00,000. No co-payment or deductible applies. Insurer pays 100%, patient payable is ₹0."
+   - Example:
+     "0% covered. 100% patient financial responsibility because the claim occurred outside the active insurance policy period."
+   - Example:
+     "10% mandatory co-payment applicable under Clause 6. Insurer pays 90% (₹9,000), patient out-of-pocket liability is 10% (₹1,000)."
 
 Every conclusion must be traceable to documented evidence. Medicine / tablet
 items are never reported as their own coverage line item in the final

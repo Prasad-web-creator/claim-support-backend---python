@@ -1,4 +1,5 @@
 from datetime import datetime
+from app.services.coverage.reference_benchmark_service import generate_reference_comparison
 
 
 def _is_meaningful(val) -> bool:
@@ -81,7 +82,15 @@ def generate_report(
     if not diag_ok and not has_meds and not has_tests and not has_procs and not has_symptoms:
         rx_valid = False
 
-    comparison = coverage_analysis.get("comparison", [])
+    from app.services.coverage.coverage_analysis import _format_item_card, _generate_fallback_comparison
+
+    raw_comparison = coverage_analysis.get("comparison", [])
+    if not raw_comparison and p_valid and rx_valid:
+        raw_comparison = _generate_fallback_comparison(prescription_json, policy_json)
+
+    comparison = []
+    for item in raw_comparison:
+        comparison.append(_format_item_card(item, policy_json, prescription_json))
     
     # Calculate Coverage Breakdown
     total_items = len(comparison)
@@ -129,6 +138,58 @@ def generate_report(
     dominance_score = round(dominance_score, 2)
     
     is_doc_invalid = (not p_valid) or (not rx_valid) or str(overall_status).startswith("Invalid")
+
+    all_blockers = []
+    if business_rule_results.get("blockers"):
+        for b in business_rule_results.get("blockers"):
+            if b not in all_blockers:
+                all_blockers.append(b)
+    det_res = business_rule_results.get("deterministicResult") or {}
+    if det_res.get("blockers"):
+        for b in det_res.get("blockers"):
+            if b not in all_blockers:
+                all_blockers.append(b)
+
+    is_blocked = (
+        (business_rule_results.get("overallEligible") is False)
+        or (det_res.get("status") in ("NOT_COVERED", "NOT_CURRENTLY_COVERED"))
+        or (len(all_blockers) > 0)
+    )
+
+    if is_blocked and not is_doc_invalid:
+        overall_status = "Not Covered"
+        comparison = [
+            _format_item_card(
+                c,
+                policy_json,
+                prescription_json,
+                override_status="Not Covered",
+                reason_code=det_res.get("reasonCode") or "POLICY_EXCLUSION",
+                blockers=all_blockers,
+            )
+            for c in comparison
+        ]
+        covered_count = 0
+        partially_covered_count = 0
+        not_covered_count = len(comparison)
+        dominance_score = 100.0
+    elif det_res and not is_doc_invalid:
+        det_status = det_res.get("status")
+        if det_status == "PARTIALLY_COVERED":
+            overall_status = "Partially Covered"
+            comparison = [
+                _format_item_card(
+                    c,
+                    policy_json,
+                    prescription_json,
+                    override_status="Partially Covered" if c.get("coverageStatus") == "Covered" else None,
+                    reason_code=det_res.get("reasonCode") or "LIMIT_EXCEEDED",
+                    blockers=det_res.get("blockers"),
+                )
+                for c in comparison
+            ]
+        elif det_status == "MANUAL_REVIEW":
+            overall_status = "Manual Review Required"
 
     if is_doc_invalid:
         comparison = []
@@ -252,19 +313,35 @@ def generate_report(
         "manualText": prescription_json.get("manualText")
     }
 
-    matched_items = coverage_analysis.get("coveredTreatments", [c["item"] for c in comparison if c.get("isCovered")]) if not is_doc_invalid else []
-    excluded_items = coverage_analysis.get("excludedTreatments", [c["item"] for c in comparison if not c.get("isCovered")]) if not is_doc_invalid else []
+    if is_blocked and not is_doc_invalid:
+        matched_items = []
+        excluded_items = [c["item"] for c in comparison] if comparison else (coverage_analysis.get("excludedTreatments", []) + coverage_analysis.get("coveredTreatments", []))
+        if all_blockers:
+            blockers_formatted = "\n".join(f"• {b}" for b in all_blockers)
+            summary_text = (
+                f"Claim Assessment: Not Covered (0% Coverage).\n\n"
+                f"The claim cannot be approved under policy terms due to the following non-coverage criteria and restrictions:\n"
+                f"{blockers_formatted}"
+            )
+        else:
+            summary_text = (
+                f"Claim Assessment: Not Covered (0% Coverage). "
+                f"The claim is not covered under the terms and conditions of this policy."
+            )
+    else:
+        matched_items = coverage_analysis.get("coveredTreatments", [c["item"] for c in comparison if c.get("isCovered")]) if not is_doc_invalid else []
+        excluded_items = coverage_analysis.get("excludedTreatments", [c["item"] for c in comparison if not c.get("isCovered")]) if not is_doc_invalid else []
 
-    if not is_doc_invalid:
-        patient_clause = f"Patient {p_name}" if p_name else "Member"
-        diag_clause = f"diagnosed with {extracted_diag}" if extracted_diag else "requesting medical coverage"
+        if not is_doc_invalid:
+            patient_clause = f"Patient {p_name}" if p_name else "Member"
+            diag_clause = f"diagnosed with {extracted_diag}" if extracted_diag else "requesting medical coverage"
 
-        summary_text = (
-            f"Analysis complete with status: {overall_status}. "
-            f"{patient_clause} {diag_clause}. "
-            f"{len(matched_items)} items are covered, while {len(excluded_items)} items are not covered or excluded. "
-            f"Dominance Score: {dominance_score}."
-        )
+            summary_text = (
+                f"Analysis complete with status: {overall_status}. "
+                f"{patient_clause} {diag_clause}. "
+                f"{len(matched_items)} items are covered, while {len(excluded_items)} items are not covered or excluded. "
+                f"Dominance Score: {dominance_score}."
+            )
 
     recommendations = coverage_analysis.get("recommendation", "")
     if coverage_analysis.get("nextSteps") and isinstance(coverage_analysis["nextSteps"], list):
@@ -303,20 +380,33 @@ def generate_report(
         "detectedDocumentTypeIfInvalid": doc_validity.get("detectedDocumentTypeIfInvalid", "")
     }
 
+    reference_comparison = generate_reference_comparison(
+        policy_json=policy_json,
+        prescription_json=prescription_json,
+        coverage_analysis=coverage_analysis,
+    )
+
+    combined_blocked = list(coverage_analysis.get("blockedPolicyClauses", []))
+    for b in all_blockers:
+        if b not in combined_blocked:
+            combined_blocked.append(b)
+
     return {
         "documentValidity": final_doc_validity,
         "overallStatus": overall_status,
         "dominanceScore": dominance_score,
         "coverageBreakdown": coverage_breakdown,
-        "summary": summary_text if is_doc_invalid else coverage_analysis.get("summary", summary_text),
+        "summary": summary_text if (is_doc_invalid or is_blocked) else coverage_analysis.get("summary", summary_text),
         "coverageStatus": overall_status,
         "policySummary": policy_summary,
         "prescriptionSummary": prescription_summary,
         "matchedItems": matched_items,
         "excludedItems": excluded_items,
         "applicableClauses": coverage_analysis.get("matchedPolicyClauses", []),
-        "blockedClauses": coverage_analysis.get("blockedPolicyClauses", []),
+        "blockedClauses": combined_blocked,
         "businessRuleResults": business_rule_results,
+        "deterministicResult": det_res,
+        "decisionType": "Manual Review" if (det_res.get("manualReviewRequired") or det_res.get("status") == "MANUAL_REVIEW") else "Automatic",
         "recommendations": recommendations.strip(),
         "reasoning": coverage_analysis.get("reasoning", ""),
         "processingTimeMs": processing_time_ms,
@@ -326,5 +416,6 @@ def generate_report(
         "isManualPrescription": is_manual_rx,
         "prescriptionSource": prescription_source,
         "prescriptionJson": prescription_json,
-        "policyJson": policy_json
+        "policyJson": policy_json,
+        "referenceComparison": reference_comparison,
     }

@@ -109,35 +109,8 @@ class AnalysisCostTracker:
                 )
 
     def print_summary_table(self, doc_summary: str = "Complete Analysis Pipeline"):
-        total_in = sum(s.input_tokens for s in self.steps)
-        total_out = sum(s.output_tokens for s in self.steps)
-        total_usd = sum(s.cost_usd for s in self.steps)
-        total_inr = sum(s.cost_inr for s in self.steps)
-
-        header_title = f"💰 [ANALYSIS COST BREAKDOWN] Report #{self.report_number} | Session: {self.session_id}" if self.report_number else f"💰 [ANALYSIS COST BREAKDOWN] Session: {self.session_id}"
-
-        lines = [
-            "\n" + "=" * 98,
-            header_title,
-            "=" * 98,
-            f"  {'Step':<5} | {'Operation':<38} | {'In Tok':>8} | {'Out Tok':>8} | {'Cost (USD)':>12} | {'Cost (INR)':>14}",
-            "-" * 98,
-        ]
-
-        for idx, step in enumerate(self.steps, 1):
-            cost_inr_str = f"₹{step.cost_inr:.3f}" if step.cost_inr > 0 else "₹0.000 (Free)"
-            cost_usd_str = f"${step.cost_usd:.5f}"
-            lines.append(
-                f"  {idx:<5} | {step.operation:<38} | {step.input_tokens:>8,d} | {step.output_tokens:>8,d} | {cost_usd_str:>12} | {cost_inr_str:>14}"
-            )
-
-        lines.append("-" * 98)
-        lines.append(
-            f"  {'TOTAL':<5} | {doc_summary:<38} | {total_in:>8,d} | {total_out:>8,d} | {f'${total_usd:.5f}':>12} | {f'₹{total_inr:.3f} INR':>14}"
-        )
-        lines.append("=" * 98)
-
-        logger.info("\n".join(lines))
+        # Retain internal step recording; silence verbose cost table at standard INFO level
+        logger.debug(f"[CostTracker] Summary recorded for {doc_summary} ({len(self.steps)} operations)")
 
 
 def calculate_gemini_cost(prompt_tokens: int, completion_tokens: int, model_name: str = "") -> dict:
@@ -294,20 +267,10 @@ async def extract_json_with_retry(
             content = response.text
             usage = response.usage_metadata
 
-            logger.info(
-                f"\n----------------------------- Google's server response -----------------------------------\n"
-                f"{response}\n"
-                f"---------------------------------------------------------------------------------------------"
-            )
-
             prompt_toks = getattr(usage, "prompt_token_count", 0) if usage else 0
             comp_toks = getattr(usage, "candidates_token_count", 0) if usage else 0
             total_toks = getattr(usage, "total_token_count", 0) if usage else 0
             cost_info = calculate_gemini_cost(prompt_toks, comp_toks, model_name=model_name)
-
-            logger.info(
-                f"[AI Cost] 💵 Model: {model_name} | In: {prompt_toks} tok | Out: {comp_toks} tok | Cost: {cost_info['formattedCost']}"
-            )
 
             tracker = get_current_cost_tracker()
             if tracker:
@@ -325,6 +288,9 @@ async def extract_json_with_retry(
             json_parse_end = time.time()
             
             processing_time_ms = int((time.time() - start_time) * 1000)
+            logger.info(
+                f"[AI] {operation_name} completed in {processing_time_ms}ms ({total_toks} tokens)"
+            )
 
             return {
                 "extractedJson": extracted_json,
@@ -443,20 +409,10 @@ async def extract_json_multimodal(
             content = response.text
             usage = response.usage_metadata
 
-            logger.info(
-                f"\n----------------------------- Google's server response -----------------------------------\n"
-                f"{response}\n"
-                f"---------------------------------------------------------------------------------------------"
-            )
-
             prompt_toks = getattr(usage, "prompt_token_count", 0) if usage else 0
             comp_toks = getattr(usage, "candidates_token_count", 0) if usage else 0
             total_toks = getattr(usage, "total_token_count", 0) if usage else 0
             cost_info = calculate_gemini_cost(prompt_toks, comp_toks, model_name=model_name)
-
-            logger.info(
-                f"[AI Cost] 💵 [Multimodal] Model: {model_name} | In: {prompt_toks} tok | Out: {comp_toks} tok | Cost: {cost_info['formattedCost']}"
-            )
 
             tracker = get_current_cost_tracker()
             if tracker:
@@ -471,6 +427,9 @@ async def extract_json_multimodal(
 
             extracted_json = parse_ai_json_response(content)
             processing_time_ms = int((time.time() - start_time) * 1000)
+            logger.info(
+                f"[AI] {operation_name} completed in {processing_time_ms}ms ({total_toks} tokens)"
+            )
 
             return {
                 "extractedJson": extracted_json,
@@ -558,19 +517,9 @@ async def extract_text_multimodal(
 
             usage = response.usage_metadata
 
-            logger.info(
-                f"\n----------------------------- Google's server response -----------------------------------\n"
-                f"{response}\n"
-                f"---------------------------------------------------------------------------------------------"
-            )
-
             prompt_toks = getattr(usage, "prompt_token_count", 0) if usage else 0
             comp_toks = getattr(usage, "candidates_token_count", 0) if usage else 0
             cost_info = calculate_gemini_cost(prompt_toks, comp_toks, model_name=model_name)
-
-            logger.info(
-                f"[AI Cost] 💵 [Vision OCR] Model: {model_name} | In: {prompt_toks} tok | Out: {comp_toks} tok | Cost: {cost_info['formattedCost']}"
-            )
 
             tracker = get_current_cost_tracker()
             if tracker:
@@ -583,6 +532,9 @@ async def extract_text_multimodal(
                     engine=model_name or "Gemini",
                 )
 
+            logger.info(
+                f"[AI OCR] {operation_name} completed ({prompt_toks + comp_toks} tokens)"
+            )
             text = response.text or ""
             return text.strip()
 

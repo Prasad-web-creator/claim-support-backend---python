@@ -96,11 +96,13 @@ def create_crud_router(
     ):
         """Batch delete entities."""
         result = await service.delete_batch(current_user["id"], body.ids)
+        deleted_count = result.get("deletedCount", result.get("deleted", 0))
+        skipped_count = result.get("skippedCount", len(body.ids) - deleted_count)
         return {
             "success": True,
-            "deletedCount": result["deletedCount"],
-            "skippedCount": result["skippedCount"],
-            "message": f"Successfully deleted {result['deletedCount']} {entity_name.lower()}(s)"
+            "deletedCount": deleted_count,
+            "skippedCount": skipped_count,
+            "message": f"Successfully deleted {deleted_count} {entity_name.lower()}(s)"
         }
 
     @router.delete("/{entity_id}")
