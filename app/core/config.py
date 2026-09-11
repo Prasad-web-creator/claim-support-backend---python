@@ -4,7 +4,7 @@ All environment variables are validated at startup.
 """
 
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, AliasChoices
 from typing import Optional
 from functools import lru_cache
 
@@ -23,7 +23,11 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = Field(default="", description="Comma-separated CORS origins")
 
     # ─── Database ─────────────────────────────────────────────────────────────
-    MONGODB_URI: str = Field(..., description="MongoDB connection URI")
+    MONGODB_URI: str = Field(
+        ...,
+        validation_alias=AliasChoices("MONGODB_URI", "MONGO_URL"),
+        description="MongoDB connection URI (supports Railway MONGO_URL)",
+    )
 
     # ─── AI / LLM ─────────────────────────────────────────────────────────────
     GEMINI_API_KEY: str = Field(..., description="Google Gemini API key")

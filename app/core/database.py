@@ -38,8 +38,9 @@ async def connect_to_mongodb() -> None:
     _client = AsyncIOMotorClient(settings.MONGODB_URI, **client_kwargs)
 
     # Get the database from the URI (defaults to 'claimsupport')
-    db = _client.get_default_database()
-    if db is None:
+    try:
+        db = _client.get_default_database(default="claimsupport")
+    except Exception:
         db = _client["claimsupport"]
 
     # Import all document models for Beanie initialization
