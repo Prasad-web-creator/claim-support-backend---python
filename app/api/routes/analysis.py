@@ -16,6 +16,7 @@ from app.services.multi_policy_orchestrator import (
     retry_policy_analysis,
     get_multi_policy_session,
 )
+from app.services.report_grouping import list_report_groups, delete_report_group
 from app.core.config import get_settings
 from app.models.analysis_report import AnalysisReport
 from app.services.crud_service import CrudService
@@ -170,6 +171,59 @@ async def answer_multi_clarification(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class BatchDeleteGroupsRequest(BaseModel):
+    ids: list[str]
+
+
+@router.get("/grouped")
+async def list_grouped_analyses(
+    page: int = 1,
+    limit: int = 10,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Coverage Analysis Reports, grouped by analysis.
+
+    Policies analysed together against one prescription are returned as a single
+    group; classic single-policy reports are returned as groups of one.
+    """
+    return await list_report_groups(current_user["id"], page=page, limit=limit)
+
+
+@router.post("/grouped/batch-delete")
+async def batch_delete_grouped_analyses(
+    body: BatchDeleteGroupsRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete whole analysis groups (all reports belonging to each group)."""
+    deleted_groups = 0
+    deleted_reports = 0
+    for group_id in body.ids:
+        result = await delete_report_group(current_user["id"], group_id)
+        deleted_groups += result["deletedGroups"]
+        deleted_reports += result["deletedReports"]
+
+    return {
+        "success": True,
+        "deletedCount": deleted_groups,
+        "deletedReports": deleted_reports,
+        "skippedCount": len(body.ids) - deleted_groups,
+        "message": f"Successfully deleted {deleted_groups} analysis group(s)"
+    }
+
+
+@router.delete("/grouped/{group_id}")
+async def delete_grouped_analysis(
+    group_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete one analysis group and every report inside it."""
+    result = await delete_report_group(current_user["id"], group_id)
+    if result["deletedGroups"] == 0:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    return {"success": True, **result}
 
 
 @router.post("/multi/{session_id}/{policy_id}/retry")
