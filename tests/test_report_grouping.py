@@ -474,7 +474,7 @@ async def test_multi_policy_run_produces_one_grouped_entry(db, monkeypatch):
 
     # Policy C fails; A and B persist a real report exactly as the pipeline does.
     async def fake_run_single(session, *, user_id, validation, policy_ctx, policy_text,
-                              is_manual_rx, start_time, background_tasks=None):
+                              is_manual_rx, start_time, background_tasks=None, on_stage=None):
         if policy_ctx.policy_doc.policy_name.endswith("C"):
             raise RuntimeError("coverage analysis failed")
         report = AnalysisReport(

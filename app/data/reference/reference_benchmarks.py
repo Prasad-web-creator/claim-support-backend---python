@@ -5,6 +5,47 @@ Reference benchmark dataset extracted from:
 3. 2 YEAR & Permanent Exclusion-2.pdf: 14 Specific 2-Year Waiting Periods & 32 Permanent Exclusions
 """
 
+# ── Keyword matching for the catalogues below ────────────────────────────────
+# Matching is on whole words. Plain substring matching made short entries fire
+# on unrelated text — "thr" (total hip replacement) matched *arthroscopy*, so
+# every ACL report raised a hip-replacement waiting-period advisory, and "iol"
+# matched *biological*. An advisory the user cannot trust is worse than none.
+
+import re
+from functools import lru_cache
+from typing import List
+
+
+@lru_cache(maxsize=4096)
+def _keyword_pattern(keyword: str) -> "re.Pattern":
+    """
+    Whole-word pattern for one catalogue keyword.
+
+    Accepts the plural ("cyst" matches "cysts") and any separator between the
+    words of a multi-word keyword, so "knee replacement" also matches
+    "knee-replacement". The lookarounds stand in for \b so a keyword can never
+    match inside a longer medical word.
+    """
+    words = [re.escape(word) for word in keyword.strip().lower().split()]
+    core = r"[\s\-/]+".join(words)
+    return re.compile(rf"(?<![a-z0-9]){core}(?:e?s)?(?![a-z0-9])")
+
+
+def keyword_matches(keyword: str, corpus: str) -> bool:
+    """True when `keyword` appears in `corpus` as a whole word."""
+    if not keyword or not corpus:
+        return False
+    return bool(_keyword_pattern(keyword).search(corpus.lower()))
+
+
+def find_matching_keywords(keywords, corpus: str) -> List[str]:
+    """Every keyword that appears in `corpus` as a whole word, in catalogue order."""
+    if not corpus:
+        return []
+    lowered = corpus.lower()
+    return [kw for kw in (keywords or []) if kw and _keyword_pattern(kw).search(lowered)]
+
+
 # ==============================================================================
 # 1. INSURER MARKET & SOLVENCY DATA (Marsh India / GIC Council Apr-Jul 2026)
 # ==============================================================================

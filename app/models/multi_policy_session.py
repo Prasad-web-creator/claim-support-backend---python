@@ -50,6 +50,14 @@ class PolicyAnalysisEntry(BaseModel):
     error_message: Optional[str] = Field(default="", alias="errorMessage")
     failed_at_stage: Optional[str] = Field(default="", alias="failedAtStage")
 
+    # ── Real progress, written by the orchestrator as each step actually finishes ──
+    # `stage` is the step currently in flight (or the last one reached); the two
+    # counters are the honest "work done / work planned" for this policy, never
+    # a timer-based estimate.
+    stage: str = Field(default="queued")
+    completed_steps: int = Field(default=0, alias="completedSteps")
+    total_steps: int = Field(default=5, alias="totalSteps")
+
     started_at: Optional[datetime] = Field(default=None, alias="startedAt")
     completed_at: Optional[datetime] = Field(default=None, alias="completedAt")
 
@@ -71,6 +79,10 @@ class MultiPolicyAnalysisSession(Document):
     prescription_json: Optional[dict] = Field(default_factory=dict, alias="prescriptionJson")
     is_manual_prescription: bool = Field(default=False, alias="isManualPrescription")
 
+    # queued | extracting | ready — the shared prescription step is one unit of
+    # real work that every policy waits on, so it counts towards progress once.
+    prescription_stage: str = Field(default="queued", alias="prescriptionStage")
+
     policy_analyses: List[PolicyAnalysisEntry] = Field(default_factory=list, alias="policyAnalyses")
     comparison_summary: Optional[dict] = Field(default_factory=dict, alias="comparisonSummary")
 
@@ -80,7 +92,7 @@ class MultiPolicyAnalysisSession(Document):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), alias="createdAt")
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), alias="updatedAt")
 
-    @field_validator("prescription_id", "status", "prescription_text", "error_message", mode="before")
+    @field_validator("prescription_id", "status", "prescription_text", "error_message", "prescription_stage", mode="before")
     @classmethod
     def sanitize_string_fields(cls, v):
         if v is None:
@@ -125,7 +137,7 @@ class MultiPolicyAnalysisSession(Document):
     @before_event([Insert, Replace, SaveChanges, Update])
     def sanitize_null_fields(self):
         """Ensure no string or dictionary fields are stored as null in MongoDB."""
-        string_fields = ["prescription_id", "status", "prescription_text", "error_message"]
+        string_fields = ["prescription_id", "status", "prescription_text", "error_message", "prescription_stage"]
         for field_name in string_fields:
             if getattr(self, field_name, None) is None:
                 setattr(self, field_name, "")

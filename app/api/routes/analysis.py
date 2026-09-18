@@ -11,7 +11,9 @@ from app.middleware.auth import get_current_user
 from app.middleware.rate_limiter import limiter
 from app.services.analysis_interactive_orchestrator import start_analysis_session, resume_analysis_session
 from app.services.multi_policy_orchestrator import (
-    start_multi_policy_analysis,
+    create_multi_policy_session,
+    schedule_multi_policy_analysis,
+    serialize_multi_session,
     resume_policy_analysis,
     retry_policy_analysis,
     get_multi_policy_session,
@@ -111,15 +113,19 @@ async def start_multi_analysis(
     """
     Start a multi-policy analysis: one prescription against N policies.
     Each policy is analysed independently and keeps its own result.
+
+    Returns as soon as the session exists, so the client has a session id to
+    poll `GET /analysis/multi/{session_id}` with while the work runs. That poll
+    reports progress recorded from steps the pipeline has actually completed.
     """
     try:
-        result = await start_multi_policy_analysis(
+        session = await create_multi_policy_session(
             user_id=current_user["id"],
             prescription_id=body.prescriptionPath,
             policy_ids=body.policyIds,
-            background_tasks=background_tasks
         )
-        return {"success": True, **result}
+        schedule_multi_policy_analysis(session, current_user["id"])
+        return {"success": True, **serialize_multi_session(session)}
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:

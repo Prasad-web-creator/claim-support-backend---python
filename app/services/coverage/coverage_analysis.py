@@ -13,8 +13,20 @@ async def analyze_coverage(
     clarification_history: list = None,
     policy_json: dict = None,
     policy_id: str = None,
+    on_stage=None,
 ) -> dict:
+    """`on_stage`, when given, is awaited as each real phase of this analysis
+    begins, so callers can report progress that matches the work done."""
     logger.info("[AI Analysis] Evaluating coverage and generating explanation with Gemini...")
+
+    async def _stage(name: str) -> None:
+        # Progress reporting must never be able to break an analysis.
+        if on_stage is None:
+            return
+        try:
+            await on_stage(name)
+        except Exception as stage_err:
+            logger.warning(f"[AI Analysis] Progress callback failed at '{name}': {stage_err}")
 
     from datetime import datetime
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -39,6 +51,7 @@ async def analyze_coverage(
     from app.services.rag.policy_retrieval_service import PolicyRetrievalService
 
     retrieved_chunks = []
+    await _stage("evidence_retrieval")
     try:
         # If policy_id is provided and text exists, ensure indexed
         if policy_id and policy_text:
@@ -189,6 +202,7 @@ PREVIOUS CLARIFICATION HISTORY
 {json.dumps(clarification_history or [], indent=2, default=str)}
 """
 
+    await _stage("coverage_analysis")
     try:
         # Increase token limit as analysis outputs can be quite large (up to 8000 tokens)
         result = await extract_json_with_retry(

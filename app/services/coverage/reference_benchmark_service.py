@@ -10,6 +10,7 @@ extracted from the 5 ClaimSupport PDFs:
 from typing import Dict, Any, List, Optional
 import re
 from app.data.reference.reference_benchmarks import (
+    find_matching_keywords,
     INSURER_MARKET_BENCHMARK,
     INDUSTRY_OVERVIEW,
     BENCHMARK_POLICY_SPEC,
@@ -47,6 +48,68 @@ def _match_insurer(company_name: str) -> Optional[Dict[str, Any]]:
             return data
 
     return None
+
+
+# What the benchmark is called when shown to a user. The catalogue entry names
+# the real product it was derived from; that is internal provenance, and naming
+# another insurer's product inside someone's claim report would be misleading,
+# so the user only ever sees the standard it represents.
+DISPLAY_BENCHMARK_LABEL = "Industry gold-standard cover"
+
+# Benchmark wording with product and rider brand names removed, used for the
+# feature-by-feature card. The catalogue values stay untouched for internal use.
+NEUTRAL_BENCHMARK_STANDARDS = {
+    "roomRentCategory": "Any room / no room-rent capping",
+    "consumablesCoverage": "100% coverage of IRDAI Lists I-IV non-payable items",
+}
+
+
+def _benchmark_standard(key: str) -> str:
+    """Benchmark wording for display: neutral text where a brand name exists."""
+    return NEUTRAL_BENCHMARK_STANDARDS.get(key) or str(BENCHMARK_POLICY_SPEC.get(key) or "")
+
+
+# Policy types the comparison can be framed as. Anything unrecognised falls back
+# to the generic wording rather than guessing.
+_POLICY_TYPE_LABELS = {
+    "health": "Health",
+    "medical": "Health",
+    "mediclaim": "Health",
+    "personal accident": "Personal Accident",
+    "accident": "Personal Accident",
+    "critical illness": "Critical Illness",
+    "travel": "Travel",
+    "life": "Life",
+    "group health": "Group Health",
+    "family floater": "Family Floater Health",
+    "individual health": "Individual Health",
+    "senior citizen": "Senior Citizen Health",
+    "top up": "Top-Up Health",
+    "top-up": "Top-Up Health",
+}
+
+
+def _display_policy_type(policy_json: Dict[str, Any]) -> str:
+    """
+    The analysed policy's type, for framing the comparison ("a standard Health
+    policy"). Only the type is shown — never the policy or insurer name.
+    """
+    raw = _clean_str(
+        policy_json.get("policyType")
+        or policy_json.get("planType")
+        or policy_json.get("productType")
+    )
+    if not raw:
+        return "Health"
+    for key, label in _POLICY_TYPE_LABELS.items():
+        if key in raw:
+            return label
+    # An unmapped but meaningful value is still the user's own policy type.
+    return str(
+        policy_json.get("policyType")
+        or policy_json.get("planType")
+        or policy_json.get("productType")
+    ).strip().title()[:40]
 
 
 def generate_reference_comparison(
@@ -139,7 +202,7 @@ def generate_reference_comparison(
     feature_comparisons.append({
         "feature": "Room Rent Category",
         "userPolicy": str(user_room).strip(),
-        "benchmarkStandard": BENCHMARK_POLICY_SPEC["roomRentCategory"],
+        "benchmarkStandard": _benchmark_standard("roomRentCategory"),
         "comparisonStatus": "Parity" if is_room_unlimited else "Potential Gap",
         "insight": "Room rent capping often causes proportionate deductions across the entire hospital bill. Benchmark covers Any Room without deduction."
     })
@@ -154,9 +217,9 @@ def generate_reference_comparison(
     feature_comparisons.append({
         "feature": "Consumables & Non-Payables",
         "userPolicy": "Covered via Rider" if has_consumables else "Excluded by Default (Standard IRDAI Lists I-IV)",
-        "benchmarkStandard": BENCHMARK_POLICY_SPEC["consumablesCoverage"],
+        "benchmarkStandard": _benchmark_standard("consumablesCoverage"),
         "comparisonStatus": "Parity" if has_consumables else "Coverage Gap",
-        "insight": "Consumable items (gloves, PPE, syringes, administrative fees) constitute 10-15% of modern hospital bills. Benchmark provides 100% reimbursement."
+        "insight": "Consumable items (gloves, PPE, syringes, administrative fees) make up 10-15% of a modern hospital bill. The benchmark reimburses them in full."
     })
 
     # D. Modern Treatments
@@ -209,7 +272,7 @@ def generate_reference_comparison(
     # Check against 14 Specific 2-Year Waiting Period conditions
     detected_waiting_conditions: List[Dict[str, Any]] = []
     for cond in SPECIFIC_2_YEAR_WAITING_CONDITIONS:
-        matched_kw = [kw for kw in cond["keywords"] if kw in full_medical_corpus]
+        matched_kw = find_matching_keywords(cond["keywords"], full_medical_corpus)
         if matched_kw:
             detected_waiting_conditions.append({
                 "condition": cond["category"],
@@ -228,7 +291,7 @@ def generate_reference_comparison(
     # Check against 32 Permanent Exclusions Master Catalog
     detected_permanent_exclusions: List[Dict[str, Any]] = []
     for excl in PERMANENT_EXCLUSIONS_CATALOG:
-        matched_excl_kw = [kw for kw in excl["keywords"] if kw in full_medical_corpus]
+        matched_excl_kw = find_matching_keywords(excl["keywords"], full_medical_corpus)
         if matched_excl_kw:
             detected_permanent_exclusions.append({
                 "exclusionNumber": excl["num"],
@@ -266,7 +329,9 @@ def generate_reference_comparison(
     )
 
     return {
-        "benchmarkName": BENCHMARK_POLICY_SPEC["benchmarkName"],
+        # Shown to the user; never the product it was derived from.
+        "benchmarkName": DISPLAY_BENCHMARK_LABEL,
+        "policyType": _display_policy_type(policy_json),
         "industryOverview": INDUSTRY_OVERVIEW,
         "insurerBenchmark": insurer_benchmark,
         "featureComparisons": feature_comparisons,

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 import re
 
+from app.data.reference.reference_benchmarks import find_matching_keywords, keyword_matches
 from app.core.logging import logger
 from app.models.knowledge_base import (
     InsuranceCompany,
@@ -408,8 +409,8 @@ class PolicyKnowledgeService:
 
         detected_waiting_conditions = []
         for r in wp_rules:
-            matched_kw = [kw for kw in (r.keywords or []) if kw in medical_corpus]
-            if matched_kw or (r.condition.lower() in medical_corpus):
+            matched_kw = find_matching_keywords(r.keywords, medical_corpus)
+            if matched_kw or keyword_matches(r.condition, medical_corpus):
                 detected_waiting_conditions.append({
                     "ruleId": r.rule_id,
                     "condition": r.condition,
@@ -437,8 +438,8 @@ class PolicyKnowledgeService:
 
         detected_permanent_exclusions = []
         for r in excl_rules:
-            matched_kw = [kw for kw in (r.keywords or []) if kw in medical_corpus]
-            if matched_kw or (r.condition.lower() in medical_corpus):
+            matched_kw = find_matching_keywords(r.keywords, medical_corpus)
+            if matched_kw or keyword_matches(r.condition, medical_corpus):
                 detected_permanent_exclusions.append({
                     "ruleId": r.rule_id,
                     "exclusionNumber": r.rule_value.get("exclusionNumber"),

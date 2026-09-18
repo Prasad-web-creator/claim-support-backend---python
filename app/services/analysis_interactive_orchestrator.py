@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 from datetime import datetime
 from fastapi import BackgroundTasks
 import time
@@ -20,6 +20,69 @@ from app.services.coverage.coverage_analysis import analyze_coverage
 from app.services.coverage.report_generator import generate_report
 from app.services.llm.ai_client import AnalysisCostTracker, set_current_cost_tracker, get_current_cost_tracker
 from app.services.analysis_orchestrator import _fetch_file_bytes_by_gridfs_id, _background_post_processing
+
+
+# Names a policy record carries before its document has been read.
+PLACEHOLDER_POLICY_NAMES = {"", "uploaded policy", "unknown", "n/a", "policy"}
+
+
+def is_placeholder_policy_name(name) -> bool:
+    """True when a stored policy name says nothing about the actual policy."""
+    return str(name or "").strip().lower() in PLACEHOLDER_POLICY_NAMES
+
+
+def _meaningful(value) -> str:
+    """Extracted text worth showing, or an empty string."""
+    text = str(value or "").strip()
+    if not text or text.lower() in ("n/a", "na", "unknown", "not specified", "null", "none"):
+        return ""
+    return text
+
+
+def apply_extracted_policy_identity(policy_doc, policy_json: dict) -> bool:
+    """
+    Fill a policy record's name/insurer/number from its extracted document.
+
+    Only fills what is still a placeholder, so a name the user gave the policy
+    themselves is never overwritten by an extraction. Returns whether anything
+    changed.
+    """
+    if not policy_doc or not isinstance(policy_json, dict):
+        return False
+
+    changed = False
+
+    extracted_name = _meaningful(policy_json.get("policyName"))
+    if extracted_name and is_placeholder_policy_name(policy_doc.policy_name):
+        policy_doc.policy_name = extracted_name[:255]
+        changed = True
+
+    insurer = _meaningful(policy_json.get("insuranceCompany"))
+    if insurer and not _meaningful(policy_doc.insurance_company):
+        policy_doc.insurance_company = insurer[:255]
+        changed = True
+
+    number = _meaningful(policy_json.get("policyNumber"))
+    if number and not _meaningful(policy_doc.policy_number):
+        policy_doc.policy_number = number[:255]
+        changed = True
+
+    return changed
+
+
+async def _report_stage(on_stage: Optional[Callable[[str], Awaitable[None]]], stage: str) -> None:
+    """
+    Tell the caller a real pipeline step has begun.
+
+    Progress reporting must never be able to break an analysis, so a failing
+    callback is logged and swallowed.
+    """
+    if on_stage is None:
+        return
+    try:
+        await on_stage(stage)
+    except Exception as e:
+        logger.warning(f"[Claim Analysis] Progress callback failed at stage '{stage}': {e}")
 
 
 def _parse_and_format_date(date_val):
@@ -296,9 +359,14 @@ async def run_single_policy_analysis(
     is_manual_rx: bool,
     start_time: float,
     background_tasks: Optional[BackgroundTasks] = None,
+    on_stage: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> dict:
     """
     Reusable core: validated policy + prescription JSON → decision for ONE policy.
+
+    `on_stage`, when supplied, is awaited as each real step begins
+    ("rule_engine", "coverage_analysis", "report"), letting a caller record
+    progress that matches the work actually done.
 
     Runs document-validity gating, the policy start date conflict check, the
     deterministic rule engine and the LLM coverage analysis for exactly one
@@ -315,6 +383,10 @@ async def run_single_policy_analysis(
         policy_doc.extracted_policy_json = policy_json
         if policy_json.get("policyHolder") and not policy_doc.policy_holder_name:
             policy_doc.policy_holder_name = policy_json.get("policyHolder")
+        # A freshly uploaded policy is stored under a placeholder name because
+        # nothing is known about it yet. Now that the document has been read,
+        # give it its real identity so every later screen can name it.
+        apply_extracted_policy_identity(policy_doc, policy_json)
         await policy_doc.save()
         logger.info(f"[Claim Analysis] Cached extracted text for policy {policy_doc.id}")
 
@@ -409,6 +481,7 @@ async def run_single_policy_analysis(
 
     log_section("Rule Engine & Eligibility")
     logger.info("[Rule Engine] Evaluating policy rules, waiting periods, and exclusions...")
+    await _report_stage(on_stage, "rule_engine")
     br_results = enforce_business_rules(policy_json, prescription_json)
     session.business_rules = br_results
     det_res = br_results.get("deterministicResult") or {}
@@ -423,7 +496,9 @@ async def run_single_policy_analysis(
     session.status = "analyzing"
     await session.save()
 
-    return await _run_llm_analysis(session, policy_json, prescription_json, br_results, background_tasks)
+    return await _run_llm_analysis(
+        session, policy_json, prescription_json, br_results, background_tasks, on_stage=on_stage
+    )
 
 
 async def start_analysis_session(
@@ -524,7 +599,14 @@ async def start_analysis_session(
         await session.save()
         raise e
 
-async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescription_json: dict, br_results: dict, background_tasks: Optional[BackgroundTasks]) -> dict:
+async def _run_llm_analysis(
+    session: AnalysisSession,
+    policy_json: dict,
+    prescription_json: dict,
+    br_results: dict,
+    background_tasks: Optional[BackgroundTasks],
+    on_stage: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> dict:
     from app.models.analysis_audit_log import AnalysisAuditLog
     llm_start_time = time.time()
     
@@ -567,6 +649,9 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
         clarification_history=clarification_history,
         policy_json=session.policy_json or {},
         policy_id=session.policy_id or "",
+        # Reports "evidence_retrieval" then "coverage_analysis" from inside, so
+        # the longest part of the pipeline is not one silent block.
+        on_stage=lambda stage: _report_stage(on_stage, stage),
     )
 
     llm_round_duration_ms = int((time.time() - llm_start_time) * 1000)
@@ -639,6 +724,7 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
         }
 
     # Otherwise complete (generate_report or manual_review)
+    await _report_stage(on_stage, "report")
     session.accumulated_processing_time_ms = total_processing_time
     session.status = "completed" if next_action == "generate_report" else "manual_review_required"
     await session.save()
@@ -743,7 +829,8 @@ async def resume_analysis_session(
     session_id: str,
     user_id: str,
     answers: dict,
-    background_tasks: Optional[BackgroundTasks] = None
+    background_tasks: Optional[BackgroundTasks] = None,
+    on_stage: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> dict:
     log_section("Clarification Session")
     logger.info(f"[Clarification] Resuming session {session_id} with {len(answers)} user answers")
@@ -870,10 +957,13 @@ async def resume_analysis_session(
 
     policy_json = session.policy_json if hasattr(session, "policy_json") and session.policy_json else {}
     prescription_json = session.prescription_json or {}
+    await _report_stage(on_stage, "rule_engine")
     br_results = enforce_business_rules(policy_json, prescription_json)
     session.business_rules = br_results
     session.status = "reanalyzing"
     await session.save()
 
     logger.info(f"[Claim Analysis] Re-running AI analysis for session {session_id}")
-    return await _run_llm_analysis(session, policy_json, prescription_json, br_results, background_tasks)
+    return await _run_llm_analysis(
+        session, policy_json, prescription_json, br_results, background_tasks, on_stage=on_stage
+    )

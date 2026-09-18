@@ -5,6 +5,8 @@ from app.data.reference.reference_benchmarks import (
     BENCHMARK_POLICY_SPEC,
     SPECIFIC_2_YEAR_WAITING_CONDITIONS,
     PERMANENT_EXCLUSIONS_CATALOG,
+    find_matching_keywords,
+    keyword_matches,
 )
 
 __all__ = [
@@ -13,4 +15,6 @@ __all__ = [
     "BENCHMARK_POLICY_SPEC",
     "SPECIFIC_2_YEAR_WAITING_CONDITIONS",
     "PERMANENT_EXCLUSIONS_CATALOG",
+    "find_matching_keywords",
+    "keyword_matches",
 ]

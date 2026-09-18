@@ -55,11 +55,12 @@ class Harness:
 async def harness(monkeypatch, db):
     h = Harness()
 
-    async def add_policy(label, cached=False, user=USER):
+    async def add_policy(label, cached=False, user=USER, policy_name=None,
+                         insurance_company="TestInsurer"):
         policy = Policy(
             user_id=user,
-            policy_name=f"Policy {label}",
-            insurance_company="TestInsurer",
+            policy_name=policy_name if policy_name is not None else f"Policy {label}",
+            insurance_company=insurance_company,
             grid_fs_file_id=f"file-{label}",
             extracted_policy_text="CACHED POLICY TEXT" if cached else "",
             extracted_policy_json=dict(VALID_POLICY_JSON) if cached else {},
@@ -111,8 +112,12 @@ async def harness(monkeypatch, db):
 
     # ─── stub the shared single-policy core ──────────────────────────────────
     async def fake_run_single(session, *, user_id, validation, policy_ctx, policy_text,
-                              is_manual_rx, start_time, background_tasks=None):
+                              is_manual_rx, start_time, background_tasks=None, on_stage=None):
         await asyncio.sleep(0)  # force interleaving under gather
+        # Mirror the real pipeline's progress reporting so step counting is exercised.
+        for stage in ("rule_engine", "coverage_analysis", "report"):
+            if on_stage:
+                await on_stage(stage)
         pid = str(session.policy_id)
         label = h.label(pid)
         h.analyses.append({
@@ -146,7 +151,7 @@ async def harness(monkeypatch, db):
 
     monkeypatch.setattr(mpo, "run_single_policy_analysis", fake_run_single)
 
-    async def fake_resume(session_id, user_id, answers, background_tasks=None):
+    async def fake_resume(session_id, user_id, answers, background_tasks=None, on_stage=None):
         label = next((a["label"] for a in h.analyses if a["sessionId"] == session_id), "?")
         h.analyses.append({
             "label": label, "policyId": h.ids.get(label, ""),
@@ -321,7 +326,8 @@ async def test_case5_one_policy_failure_is_isolated(harness):
     failed = harness.entry(result, "B")
     assert failed["status"] == "failed"
     assert "exploded" in failed["errorMessage"]
-    assert failed["failedAtStage"] == "policy_analysis"
+    # The failure is attributed to the real step the policy had reached.
+    assert failed["failedAtStage"] in mpo.POLICY_STAGES
 
     # Parent reflects the mix rather than collapsing to a single outcome
     assert result["status"] == "partial"
@@ -906,3 +912,138 @@ async def test_comparison_summary_included_in_response(harness):
     assert summary["totalPolicies"] == 2
     assert summary["counts"]["covered"] == 2
     assert len(summary["results"]) == 2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Case 12 — progress reflects work actually completed
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def test_progress_is_readable_while_the_analysis_is_still_running(harness, monkeypatch):
+    """A client polling mid-run sees the real, partial state — not 0% or 100%."""
+    await harness.add_policy("A")
+    await harness.add_policy("B")
+    await harness.add_prescription()
+
+    observed = []
+    release = asyncio.Event()
+    reached = asyncio.Event()
+
+    original = mpo.run_single_policy_analysis
+
+    async def pausing_run_single(session, **kwargs):
+        on_stage = kwargs.get("on_stage")
+        if on_stage:
+            await on_stage("rule_engine")
+        # Hold both policies here, mid-pipeline, and read the session as a
+        # polling client would.
+        reached.set()
+        await release.wait()
+        return await original(session, **kwargs)
+
+    monkeypatch.setattr(mpo, "run_single_policy_analysis", pausing_run_single)
+
+    parent = await mpo.create_multi_policy_session(
+        USER, harness.rx_id, [harness.id("A"), harness.id("B")]
+    )
+    session_id = str(parent.id)
+
+    # Before anything runs, nothing is claimed as done.
+    at_start = await mpo.get_multi_policy_session(session_id, USER)
+    assert at_start["progress"]["completedSteps"] == 0
+    assert at_start["progress"]["totalSteps"] == 1 + 2 * mpo.POLICY_TOTAL_STEPS
+
+    run = asyncio.create_task(mpo.run_multi_policy_analysis(parent, USER))
+    await asyncio.wait_for(reached.wait(), timeout=5)
+
+    mid = await mpo.get_multi_policy_session(session_id, USER)
+    observed.append(mid["progress"]["completedSteps"])
+    # The shared prescription step plus each policy's finished steps so far.
+    assert 0 < mid["progress"]["completedSteps"] < mid["progress"]["totalSteps"]
+    assert mid["progress"]["label"] == mpo.STAGE_LABELS["rule_engine"]
+    assert mid["prescriptionStage"] == "ready"
+
+    mid_entry = harness.entry(mid, "A")
+    assert mid_entry["stage"] == "rule_engine"
+    assert mid_entry["completedSteps"] == mpo.POLICY_STAGES.index("rule_engine")
+    assert mid_entry["stageLabel"] == mpo.STAGE_LABELS["rule_engine"]
+
+    release.set()
+    result = await asyncio.wait_for(run, timeout=5)
+
+    # Everything settled → every planned step is accounted for.
+    assert result["progress"]["completedSteps"] == result["progress"]["totalSteps"]
+    assert result["progress"]["percent"] == 100
+    assert all(e["stage"] == "done" for e in result["policyAnalyses"])
+
+
+async def test_progress_stops_at_the_real_point_for_a_clarifying_policy(harness):
+    """A paused policy must not be counted as further along than it is."""
+    await harness.add_policy("A")
+    await harness.add_prescription()
+    harness.behaviour["A"] = "clarify"
+
+    result = await mpo.start_multi_policy_analysis(USER, harness.rx_id, [harness.id("A")])
+
+    entry = harness.entry(result, "A")
+    assert entry["status"] == "waiting_for_user"
+    assert entry["stage"] == "waiting_for_user"
+    # Stopped where the work actually stopped, not at the end.
+    assert 0 < entry["completedSteps"] < entry["totalSteps"]
+    assert result["progress"]["completedSteps"] < result["progress"]["totalSteps"]
+    assert result["progress"]["label"] == mpo.STAGE_LABELS["waiting_for_user"]
+
+
+async def test_failed_policy_leaves_no_outstanding_steps(harness):
+    """A settled policy — even a failed one — has no work left to wait for."""
+    await harness.add_policy("A")
+    await harness.add_policy("B")
+    await harness.add_prescription()
+    harness.behaviour["B"] = "fail"
+
+    result = await mpo.start_multi_policy_analysis(
+        USER, harness.rx_id, [harness.id("A"), harness.id("B")]
+    )
+
+    assert harness.entry(result, "B")["status"] == "failed"
+    assert result["progress"]["completedSteps"] == result["progress"]["totalSteps"]
+    assert result["progress"]["policiesFinished"] == 2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Case 13 — a freshly uploaded policy is named from its own document
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def test_uploaded_policy_row_is_named_from_the_extracted_document(harness, monkeypatch):
+    """"Uploaded Policy" is a placeholder; the comparison must show the real name."""
+    await harness.add_policy("A", policy_name="Uploaded Policy", insurance_company="")
+    await harness.add_prescription()
+
+    async def named_extract(text):
+        return {"extractedJson": dict(
+            VALID_POLICY_JSON,
+            policyName="Apex Plus R New",
+            insuranceCompany="Apex Insurance",
+        )}
+
+    monkeypatch.setattr(mpo, "extract_policy_details", named_extract)
+
+    result = await mpo.start_multi_policy_analysis(USER, harness.rx_id, [harness.id("A")])
+
+    entry = harness.entry(result, "A")
+    assert entry["policyName"] == "Apex Plus R New"
+    assert entry["insuranceCompany"] == "Apex Insurance"
+
+
+async def test_a_policy_the_user_named_keeps_its_name(harness, monkeypatch):
+    """An extraction never overwrites a name that already means something."""
+    await harness.add_policy("A", policy_name="My Family Cover")
+    await harness.add_prescription()
+
+    async def named_extract(text):
+        return {"extractedJson": dict(VALID_POLICY_JSON, policyName="Apex Plus R New")}
+
+    monkeypatch.setattr(mpo, "extract_policy_details", named_extract)
+
+    result = await mpo.start_multi_policy_analysis(USER, harness.rx_id, [harness.id("A")])
+
+    assert harness.entry(result, "A")["policyName"] == "My Family Cover"
