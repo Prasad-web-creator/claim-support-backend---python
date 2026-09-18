@@ -7,6 +7,7 @@ from typing import Optional
 
 from beanie import Document
 from pydantic import Field
+from pymongo import ReturnDocument
 
 
 class Counter(Document):
@@ -25,16 +26,17 @@ class Counter(Document):
 
     @classmethod
     async def get_next_sequence(cls, user_id: str, entity_type: str) -> int:
-        """Atomically increment and return the next sequence number."""
-        counter = await cls.find_one(
-            cls.user_id == user_id,
-            cls.entity_type == entity_type,
+        """
+        Atomically increment and return the next sequence number.
+
+        Uses a single findAndModify with upsert so that concurrent analyses for
+        the same user (multi-policy sessions) can never be handed the same
+        sequence number.
+        """
+        doc = await cls.get_motor_collection().find_one_and_update(
+            {"userId": user_id, "entityType": entity_type},
+            {"$inc": {"seq": 1}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
         )
-        if counter is None:
-            counter = cls(user_id=user_id, entity_type=entity_type, seq=1)
-            await counter.insert()
-            return 1
-        else:
-            counter.seq += 1
-            await counter.save()
-            return counter.seq
+        return int(doc.get("seq", 1)) if doc else 1

@@ -10,6 +10,13 @@ from pydantic import BaseModel, model_validator
 from app.middleware.auth import get_current_user
 from app.middleware.rate_limiter import limiter
 from app.services.analysis_interactive_orchestrator import start_analysis_session, resume_analysis_session
+from app.services.multi_policy_orchestrator import (
+    start_multi_policy_analysis,
+    resume_policy_analysis,
+    retry_policy_analysis,
+    get_multi_policy_session,
+)
+from app.core.config import get_settings
 from app.models.analysis_report import AnalysisReport
 from app.services.crud_service import CrudService
 
@@ -61,6 +68,136 @@ async def start_analysis(
 
 class AnswerRequest(BaseModel):
     answers: dict
+
+
+class MultiAnalysisRequest(BaseModel):
+    """One prescription analysed against one or more policies."""
+    prescriptionPath: str
+    policyIds: List[str]
+
+    @model_validator(mode='after')
+    def validate_policy_ids(self):
+        settings = get_settings()
+        cleaned = [str(p).strip() for p in (self.policyIds or []) if str(p).strip()]
+        if not cleaned:
+            raise ValueError('At least one policy must be supplied.')
+
+        # Normalize duplicates — selecting the same policy twice is the same analysis.
+        seen = set()
+        deduped = []
+        for pid in cleaned:
+            if pid not in seen:
+                seen.add(pid)
+                deduped.append(pid)
+
+        if len(deduped) > settings.MAX_POLICIES_PER_ANALYSIS:
+            raise ValueError(
+                f'A maximum of {settings.MAX_POLICIES_PER_ANALYSIS} policies can be analysed at once.'
+            )
+
+        self.policyIds = deduped
+        return self
+
+
+@router.post("/start-multi")
+@limiter.limit("5/minute")
+async def start_multi_analysis(
+    request: Request,
+    body: MultiAnalysisRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Start a multi-policy analysis: one prescription against N policies.
+    Each policy is analysed independently and keeps its own result.
+    """
+    try:
+        result = await start_multi_policy_analysis(
+            user_id=current_user["id"],
+            prescription_id=body.prescriptionPath,
+            policy_ids=body.policyIds,
+            background_tasks=background_tasks
+        )
+        return {"success": True, **result}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/multi/{session_id}")
+async def get_multi_analysis(
+    session_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Current state of a multi-policy session, including per-policy results."""
+    try:
+        return {
+            "success": True,
+            **await get_multi_policy_session(session_id, current_user["id"])
+        }
+    except PermissionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/multi/{session_id}/{policy_id}/answer")
+@limiter.limit("5/minute")
+async def answer_multi_clarification(
+    request: Request,
+    session_id: str,
+    policy_id: str,
+    body: AnswerRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
+    """Answer clarification questions for ONE policy; only that policy resumes."""
+    try:
+        result = await resume_policy_analysis(
+            parent_session_id=session_id,
+            policy_id=policy_id,
+            user_id=current_user["id"],
+            answers=body.answers,
+            background_tasks=background_tasks
+        )
+        return {"success": True, **result}
+    except PermissionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/multi/{session_id}/{policy_id}/retry")
+@limiter.limit("5/minute")
+async def retry_multi_policy(
+    request: Request,
+    session_id: str,
+    policy_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
+    """Retry a single failed policy without re-running the others."""
+    try:
+        result = await retry_policy_analysis(
+            parent_session_id=session_id,
+            policy_id=policy_id,
+            user_id=current_user["id"],
+            background_tasks=background_tasks
+        )
+        return {"success": True, **result}
+    except PermissionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 @router.post("/{session_id}/answer")
 @limiter.limit("5/minute")

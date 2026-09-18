@@ -62,6 +62,7 @@ async def connect_to_mongodb() -> None:
         CoverageRule,
         PolicyEvidence,
     )
+    from app.models.multi_policy_session import MultiPolicyAnalysisSession
     from app.models.rag_chunk import PolicyChunk
     from app.models.expert_review import (
         ClaimCase,
@@ -86,6 +87,7 @@ async def connect_to_mongodb() -> None:
             Counter,
             StoredFile,
             AnalysisSession,
+            MultiPolicyAnalysisSession,
             AnalysisAuditLog,
             InsuranceCompany,
             InsuranceProduct,

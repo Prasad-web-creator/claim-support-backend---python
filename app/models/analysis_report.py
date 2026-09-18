@@ -31,6 +31,8 @@ class AnalysisReport(Document):
     policy_id: Optional[str] = Field(default="", alias="policyId")
     prescription_id: Optional[str] = Field(default="", alias="prescriptionId")
     session_id: Optional[str] = Field(default="", alias="sessionId")
+    # Set only for reports produced inside a multi-policy session; empty otherwise.
+    parent_session_id: Optional[str] = Field(default="", alias="parentSessionId")
     report_number: Optional[int] = Field(default=None, alias="reportNumber")
 
     # ─── Pipeline Status ──────────────────────────────────────────────────────
@@ -84,6 +86,7 @@ class AnalysisReport(Document):
         "policy_id",
         "prescription_id",
         "session_id",
+        "parent_session_id",
         "status",
         "analysis_version",
         "decision_type",
@@ -151,6 +154,10 @@ class AnalysisReport(Document):
     class Settings:
         name = "analysisreports"
         use_state_management = True
+        indexes = [
+            "session_id",
+            "parent_session_id",
+        ]
 
     class Config:
         populate_by_name = True
@@ -159,7 +166,7 @@ class AnalysisReport(Document):
     def sanitize_null_fields(self):
         """Ensure no string, dict, or list fields are stored as null in MongoDB."""
         string_fields = [
-            "policy_id", "prescription_id", "session_id", "status",
+            "policy_id", "prescription_id", "session_id", "parent_session_id", "status",
             "analysis_version", "decision_type", "overall_status",
             "summary", "policy_text", "prescription_text",
             "error_message", "failed_at_stage"

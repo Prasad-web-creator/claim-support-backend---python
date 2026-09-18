@@ -44,6 +44,9 @@ class AnalysisSession(Document):
     user_id: Indexed(str) = Field(alias="userId") # type: ignore[valid-type]
     policy_id: Optional[str] = Field(default="", alias="policyId")
     prescription_id: Optional[str] = Field(default="", alias="prescriptionId")
+    # Set only when this session is one policy of a multi-policy parent session.
+    # Empty string for every classic single-policy session (including historical ones).
+    parent_session_id: Optional[str] = Field(default="", alias="parentSessionId")
 
     status: str = Field(default="created") # created | extracting_documents | analyzing | waiting_for_user | reanalyzing | completed | failed | manual_review_required | cancelled | expired
     
@@ -69,7 +72,7 @@ class AnalysisSession(Document):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), alias="createdAt")
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), alias="updatedAt")
 
-    @field_validator("policy_id", "prescription_id", "status", "policy_text", "prescription_text", "report_id", mode="before")
+    @field_validator("policy_id", "prescription_id", "parent_session_id", "status", "policy_text", "prescription_text", "report_id", mode="before")
     @classmethod
     def sanitize_string_fields(cls, v):
         if v is None:
@@ -96,7 +99,7 @@ class AnalysisSession(Document):
     def sanitize_null_fields(self):
         """Ensure no string or dictionary fields are stored as null in MongoDB."""
         string_fields = [
-            "policy_id", "prescription_id", "status",
+            "policy_id", "prescription_id", "parent_session_id", "status",
             "policy_text", "prescription_text", "report_id"
         ]
         for field in string_fields:

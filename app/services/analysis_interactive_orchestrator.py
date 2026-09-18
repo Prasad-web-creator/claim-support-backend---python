@@ -57,6 +57,375 @@ def _parse_and_format_date(date_val):
         return parsed, parsed.strftime("%d-%m-%Y")
     return None, None
 
+class PrescriptionContext:
+    """
+    Resolved prescription inputs, shared by the single-policy and multi-policy flows.
+
+    Holds everything needed to turn a `prescription_id` (which may be a Prescription
+    id, a StoredFile id, or raw manual text) into cleaned text + normalized JSON.
+    """
+
+    def __init__(self, prescription_id: str, rx_doc=None, is_manual: bool = False,
+                 manual_text: Optional[str] = None, target_file_id: Optional[str] = None):
+        self.prescription_id = prescription_id
+        self.rx_doc = rx_doc
+        self.is_manual = is_manual
+        self.manual_text = manual_text
+        self.target_file_id = target_file_id
+        self.text: str = ""
+        self.json: dict = {}
+
+
+class PolicyContext:
+    """Resolved policy inputs for one policy (document record + any cached extraction)."""
+
+    def __init__(self, policy_doc=None, policy_file_id: Optional[str] = None,
+                 cached_text: str = "", cached_json: Optional[dict] = None):
+        self.policy_doc = policy_doc
+        self.policy_file_id = policy_file_id
+        self.cached_text = cached_text
+        self.cached_json = cached_json or None
+        self.text: str = ""
+
+    @property
+    def has_cached_text(self) -> bool:
+        return bool(self.cached_text)
+
+    @property
+    def identifier(self) -> str:
+        return str(self.policy_doc.id) if self.policy_doc else (self.policy_file_id or "")
+
+
+async def _process_document(doc_id, user_id: str, doc_label: str = "Document") -> str:
+    """Fetch a stored file and extract + clean its text."""
+    logger.debug(f"[Claim Analysis] Fetching file bytes from storage for {doc_label} (ID: {doc_id})...")
+    bytes_data, mime = await _fetch_file_bytes_by_gridfs_id(doc_id, user_id)
+    raw_text = await extract_text_from_document(bytes_data, mime, doc_label=doc_label)
+    return clean_text(raw_text)
+
+
+async def _resolve_prescription_context(user_id: str, prescription_id: str) -> PrescriptionContext:
+    """Resolve which prescription record / file / manual text a request refers to."""
+    rx_doc = None
+    if prescription_id:
+        try:
+            if len(str(prescription_id)) == 24:
+                rx_doc = await Prescription.get(ObjectId(prescription_id))
+        except Exception:
+            rx_doc = None
+
+    ctx = PrescriptionContext(prescription_id=prescription_id, target_file_id=prescription_id)
+    if rx_doc:
+        ctx.rx_doc = rx_doc
+        if rx_doc.is_manual:
+            ctx.is_manual = True
+            ctx.manual_text = rx_doc.extracted_prescription_text or ""
+        elif rx_doc.grid_fs_file_id:
+            ctx.target_file_id = rx_doc.grid_fs_file_id
+    return ctx
+
+
+async def _load_prescription_text(ctx: PrescriptionContext, user_id: str) -> str:
+    """Extract (or read back manual) prescription text. Unchanged single-policy behaviour."""
+    if ctx.is_manual and ctx.manual_text:
+        logger.debug("[Claim Analysis] Prescription is self-entered manual text by user.")
+        return clean_text(ctx.manual_text)
+    try:
+        return await _process_document(ctx.target_file_id, user_id, doc_label="Prescription Document")
+    except Exception as e:
+        # If target_file_id is raw manual text directly passed
+        if ctx.prescription_id and len(ctx.prescription_id) > 10 and not ctx.prescription_id.isalnum():
+            return clean_text(ctx.prescription_id)
+        raise e
+
+
+async def _resolve_policy_context(
+    user_id: str,
+    policy_doc_id: Optional[str] = None,
+    policy_file_id: Optional[str] = None,
+) -> PolicyContext:
+    """
+    Resolve a policy and its cached extraction. Enforces ownership for stored policies.
+    """
+    if policy_doc_id:
+        policy_doc = await Policy.get(ObjectId(policy_doc_id))
+        if not policy_doc or policy_doc.user_id != user_id:
+            raise ValueError("Invalid Policy ID or unauthorized")
+        if policy_doc.extracted_policy_text:
+            logger.info(
+                f"[Document] Using cached text for Policy {policy_doc.id} ({len(policy_doc.extracted_policy_text)} chars)"
+            )
+            return PolicyContext(
+                policy_doc=policy_doc,
+                cached_text=policy_doc.extracted_policy_text,
+                cached_json=policy_doc.extracted_policy_json or {},
+            )
+        return PolicyContext(policy_doc=policy_doc)
+    return PolicyContext(policy_file_id=policy_file_id)
+
+
+def _apply_manual_prescription_defaults(prescription_json: dict, rx_text: str) -> dict:
+    """Tag self-entered prescriptions and default the visit/consultation dates to today."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    prescription_json["isManual"] = True
+    prescription_json["prescriptionSource"] = "Self-entered Prescription"
+    prescription_json["manualText"] = rx_text
+    if not prescription_json.get("visitDate"):
+        prescription_json["visitDate"] = today_str
+    if not prescription_json.get("consultationDate"):
+        prescription_json["consultationDate"] = today_str
+    return prescription_json
+
+
+async def _persist_prescription_extraction(
+    ctx: PrescriptionContext,
+    user_id: str,
+    rx_text: str,
+    prescription_json: dict,
+    fallback_original_name: str = "",
+) -> Optional[str]:
+    """
+    Persist extracted prescription text & JSON for instant reuse.
+    Returns the prescription id when a new Prescription record was created.
+    """
+    rx_doc = ctx.rx_doc
+    if rx_doc:
+        rx_doc.extracted_prescription_text = rx_text or ""
+        rx_doc.extracted_prescription_json = prescription_json or {}
+        if ctx.is_manual:
+            rx_doc.is_manual = True
+        if prescription_json.get("patientName"):
+            rx_doc.patient_name = str(prescription_json.get("patientName"))
+        if prescription_json.get("doctorName"):
+            rx_doc.doctor_name = str(prescription_json.get("doctorName"))
+        if prescription_json.get("hospitalName"):
+            rx_doc.hospital_name = str(prescription_json.get("hospitalName"))
+        if prescription_json.get("diagnosis"):
+            rx_doc.diagnosis = str(prescription_json.get("diagnosis"))
+        if prescription_json.get("prescriptionNumber"):
+            rx_doc.prescription_number = str(prescription_json.get("prescriptionNumber"))
+        if prescription_json.get("visitDate") or prescription_json.get("consultationDate"):
+            rx_doc.visit_date = prescription_json.get("visitDate") or prescription_json.get("consultationDate")
+        rx_doc.processing_status = "completed"
+        await rx_doc.save()
+        logger.info(f"[Claim Analysis] Saved extracted prescription text & JSON to prescription {rx_doc.id}")
+        return None
+
+    if ctx.target_file_id:
+        try:
+            new_rx_doc = Prescription(
+                user_id=user_id,
+                hospital_name=str(prescription_json.get("hospitalName") or ""),
+                doctor_name=str(prescription_json.get("doctorName") or ""),
+                patient_name=str(prescription_json.get("patientName") or ""),
+                prescription_number=str(prescription_json.get("prescriptionNumber") or ""),
+                visit_date=prescription_json.get("visitDate") or prescription_json.get("consultationDate") or "",
+                diagnosis=str(prescription_json.get("diagnosis") or ""),
+                is_manual=ctx.is_manual,
+                grid_fs_file_id="" if ctx.is_manual else str(ctx.target_file_id),
+                original_file_name=fallback_original_name or "",
+                extracted_prescription_text=rx_text or "",
+                extracted_prescription_json=prescription_json or {},
+                processing_status="completed"
+            )
+            await new_rx_doc.insert()
+            ctx.rx_doc = new_rx_doc
+            logger.info(f"[Claim Analysis] Saved prescription {new_rx_doc.id}")
+            return str(new_rx_doc.id)
+        except Exception as rx_err:
+            logger.warning(f"[Claim Analysis] Could not save prescription record: {rx_err}")
+    return None
+
+
+def _build_invalid_document_report(
+    validation: dict,
+    policy_json: dict,
+    prescription_json: dict,
+    is_manual_rx: bool,
+    processing_time_ms: int,
+) -> dict:
+    """Build (but never persist) the report returned when a document fails validation."""
+    is_policy_valid = validation.get("isPolicyValid", True)
+    is_rx_valid = validation.get("isPrescriptionValid", True)
+
+    p_reason = ""
+    rx_reason = ""
+    if not is_policy_valid:
+        p_reason = "The uploaded policy document contains no recognizable insurance policy clauses, covered treatments, benefit rules, or insurance terms."
+    if not is_rx_valid:
+        if is_manual_rx:
+            rx_reason = "The self-entered text contains no recognizable medical details (no diagnosis, symptoms, diseases, medicines, or medical tests)."
+        else:
+            rx_reason = "The uploaded document contains no valid diagnosis, medicines, medical tests, procedures, or symptoms."
+
+    if not is_policy_valid and not is_rx_valid:
+        inv_status = "Invalid Policy and Prescription"
+    elif not is_policy_valid:
+        inv_status = "Invalid Policy"
+    else:
+        inv_status = "Invalid Prescription"
+
+    return generate_report(
+        policy_json=policy_json,
+        prescription_json=prescription_json,
+        business_rule_results={},
+        coverage_analysis={
+            "documentValidity": {
+                "policyValid": is_policy_valid,
+                "prescriptionValid": is_rx_valid,
+                "isPolicyValid": is_policy_valid,
+                "isPrescriptionValid": is_rx_valid,
+                "policyInvalidReason": p_reason,
+                "prescriptionInvalidReason": rx_reason,
+                "errors": validation.get("errors", [])
+            },
+            "overallStatus": inv_status,
+            "comparison": []
+        },
+        processing_time_ms=processing_time_ms
+    )
+
+
+async def run_single_policy_analysis(
+    session: AnalysisSession,
+    *,
+    user_id: str,
+    validation: dict,
+    policy_ctx: PolicyContext,
+    policy_text: str,
+    is_manual_rx: bool,
+    start_time: float,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> dict:
+    """
+    Reusable core: validated policy + prescription JSON → decision for ONE policy.
+
+    Runs document-validity gating, the policy start date conflict check, the
+    deterministic rule engine and the LLM coverage analysis for exactly one
+    policy. Used by both `start_analysis_session` (single policy) and the
+    multi-policy orchestrator (once per selected policy).
+    """
+    policy_json = validation["validatedPolicyJson"]
+    prescription_json = validation["validatedPrescriptionJson"]
+    policy_doc = policy_ctx.policy_doc
+
+    # Cache the policy extraction on the Policy record for instant reuse next time
+    if policy_doc and (not policy_doc.extracted_policy_text or not policy_doc.extracted_policy_json):
+        policy_doc.extracted_policy_text = policy_text
+        policy_doc.extracted_policy_json = policy_json
+        if policy_json.get("policyHolder") and not policy_doc.policy_holder_name:
+            policy_doc.policy_holder_name = policy_json.get("policyHolder")
+        await policy_doc.save()
+        logger.info(f"[Claim Analysis] Cached extracted text for policy {policy_doc.id}")
+
+    session.policy_json = policy_json
+    session.prescription_json = prescription_json
+
+    # Early check for document validity
+    is_policy_valid = validation.get("isPolicyValid", True)
+    is_rx_valid = validation.get("isPrescriptionValid", True)
+
+    if not is_policy_valid or not is_rx_valid:
+        logger.warning(
+            f"[Claim Analysis] Document validation failed for policy {session.policy_id}: "
+            f"policyValid={is_policy_valid}, prescriptionValid={is_rx_valid}"
+        )
+        extraction_time_ms = int((time.time() - start_time) * 1000)
+        session.extraction_time_ms = extraction_time_ms
+        session.accumulated_processing_time_ms = extraction_time_ms
+        session.status = "completed"
+        await session.save()
+
+        final_report = _build_invalid_document_report(
+            validation=validation,
+            policy_json=policy_json,
+            prescription_json=prescription_json,
+            is_manual_rx=is_manual_rx,
+            processing_time_ms=extraction_time_ms,
+        )
+
+        # Do NOT store invalid coverage summary report in DB as per user requirement
+        final_report["status"] = "complete"
+        return final_report
+
+    # Check for policy start date conflict between user manual input and document extraction
+    user_entered_start_date = None
+    if policy_doc and policy_doc.policy_start_date:
+        user_entered_start_date = policy_doc.policy_start_date
+    elif policy_ctx.policy_file_id:
+        try:
+            p_by_file = await Policy.find_one(
+                Policy.grid_fs_file_id == policy_ctx.policy_file_id,
+                Policy.user_id == user_id,
+            )
+            if p_by_file and p_by_file.policy_start_date:
+                user_entered_start_date = p_by_file.policy_start_date
+        except Exception:
+            pass
+
+    user_dt, user_disp = _parse_and_format_date(user_entered_start_date)
+    doc_dt, doc_disp = _parse_and_format_date(policy_json.get("policyStartDate"))
+
+    if user_dt and doc_dt and user_dt.date() != doc_dt.date():
+        logger.info(f"[Claim Analysis] Policy start date conflict: user entered {user_disp}, doc extracted {doc_disp}")
+
+        question_data = {
+            "id": "policy_start_date_conflict",
+            "category": "eligibility",
+            "title": "Policy Start Date Conflict",
+            "question": f"Policy mentioned start date is {doc_disp}, but you mentioned {user_disp}. Can I proceed with your option?",
+            "type": "single_choice",
+            "required": True,
+            "options": [
+                f"Use my entered date ({user_disp})",
+                f"Use policy document date ({doc_disp})"
+            ],
+            "reason": "A conflict was found between the start date you entered and the start date extracted from the uploaded policy document."
+        }
+
+        session.questions.append(ClarificationQuestion(
+            id=question_data["id"],
+            title=question_data["title"],
+            question=question_data["question"],
+            type=question_data["type"],
+            category=question_data["category"],
+            required=question_data["required"],
+            options=question_data["options"],
+            reason=question_data["reason"]
+        ))
+
+        session.status = "waiting_for_user"
+        await session.save()
+
+        return {
+            "status": "needs_clarification",
+            "sessionId": str(session.id),
+            "questions": [question_data]
+        }
+    elif user_dt and not doc_dt:
+        policy_json["policyStartDate"] = user_dt.strftime("%Y-%m-%d")
+    elif user_dt and doc_dt and user_dt.date() == doc_dt.date():
+        policy_json["policyStartDate"] = user_dt.strftime("%Y-%m-%d")
+
+    log_section("Rule Engine & Eligibility")
+    logger.info("[Rule Engine] Evaluating policy rules, waiting periods, and exclusions...")
+    br_results = enforce_business_rules(policy_json, prescription_json)
+    session.business_rules = br_results
+    det_res = br_results.get("deterministicResult") or {}
+    det_status = det_res.get("status") or ("ELIGIBLE" if br_results.get("overallEligible") else "NOT_ELIGIBLE")
+    det_reason = det_res.get("reasonCode") or ""
+    logger.info(f"[Rule Engine] Decision: {det_status} ({det_reason})")
+
+    # Track extraction & business rule processing time
+    extraction_time_ms = int((time.time() - start_time) * 1000)
+    session.extraction_time_ms = extraction_time_ms
+    session.accumulated_processing_time_ms = extraction_time_ms
+    session.status = "analyzing"
+    await session.save()
+
+    return await _run_llm_analysis(session, policy_json, prescription_json, br_results, background_tasks)
+
+
 async def start_analysis_session(
     user_id: str,
     prescription_id: str,
@@ -80,75 +449,32 @@ async def start_analysis_session(
     set_current_cost_tracker(tracker)
 
     try:
-        async def process_document(doc_id, doc_label="Document"):
-            logger.debug(f"[Claim Analysis] Fetching file bytes from storage for {doc_label} (ID: {doc_id})...")
-            bytes_data, mime = await _fetch_file_bytes_by_gridfs_id(doc_id, user_id)
-            raw_text = await extract_text_from_document(bytes_data, mime, doc_label=doc_label)
-            return clean_text(raw_text)
+        rx_ctx = await _resolve_prescription_context(user_id, prescription_id)
 
-        # Check if prescription_id refers to a Prescription document or manual prescription
-        is_manual_rx = False
-        manual_rx_text = None
-        rx_doc = None
-        target_rx_file_id = prescription_id
-
-        if prescription_id:
-            try:
-                if len(str(prescription_id)) == 24:
-                    rx_doc = await Prescription.get(ObjectId(prescription_id))
-            except Exception:
-                rx_doc = None
-
-        if rx_doc:
-            if rx_doc.is_manual:
-                is_manual_rx = True
-                manual_rx_text = rx_doc.extracted_prescription_text or ""
-            elif rx_doc.grid_fs_file_id:
-                target_rx_file_id = rx_doc.grid_fs_file_id
-
-        async def load_rx_text():
-            if is_manual_rx and manual_rx_text:
-                logger.debug("[Claim Analysis] Prescription is self-entered manual text by user.")
-                return clean_text(manual_rx_text)
-            try:
-                return await process_document(target_rx_file_id, doc_label="Prescription Document")
-            except Exception as e:
-                # If target_rx_file_id is raw manual text directly passed
-                if prescription_id and len(prescription_id) > 10 and not prescription_id.isalnum():
-                    return clean_text(prescription_id)
-                raise e
-
-        policy_text = ""
-        existing_policy_json = None
-        
         log_section("Document Processing")
-        if policy_doc_id:
-            policy_doc = await Policy.get(ObjectId(policy_doc_id))
-            if not policy_doc or policy_doc.user_id != user_id:
-                raise ValueError("Invalid Policy ID or unauthorized")
-            if policy_doc.extracted_policy_text:
-                logger.info(
-                    f"[Document] Using cached text for Policy {policy_doc.id} ({len(policy_doc.extracted_policy_text)} chars)"
-                )
-                policy_text = policy_doc.extracted_policy_text
-                existing_policy_json = policy_doc.extracted_policy_json or {}
-                rx_text = await load_rx_text()
-            else:
-                logger.info("[Document] Extracting text from policy and prescription documents...")
-                policy_text, rx_text = await asyncio.gather(
-                    process_document(policy_doc.grid_fs_file_id, doc_label="Policy Document"),
-                    load_rx_text()
-                )
+        policy_ctx = await _resolve_policy_context(
+            user_id, policy_doc_id=policy_doc_id, policy_file_id=policy_file_id
+        )
+
+        if policy_ctx.has_cached_text:
+            policy_text = policy_ctx.cached_text
+            existing_policy_json = policy_ctx.cached_json
+            rx_text = await _load_prescription_text(rx_ctx, user_id)
         else:
             logger.info("[Document] Extracting text from policy and prescription documents...")
+            existing_policy_json = None
+            policy_source_id = (
+                policy_ctx.policy_doc.grid_fs_file_id if policy_ctx.policy_doc else policy_file_id
+            )
             policy_text, rx_text = await asyncio.gather(
-                process_document(policy_file_id, doc_label="Policy Document"),
-                load_rx_text()
+                _process_document(policy_source_id, user_id, doc_label="Policy Document"),
+                _load_prescription_text(rx_ctx, user_id)
             )
 
+        policy_ctx.text = policy_text
         session.policy_text = policy_text
         session.prescription_text = rx_text
-        
+
         if existing_policy_json:
             log_section("Prescription Extraction")
             policy_data = {"extractedJson": existing_policy_json}
@@ -164,203 +490,33 @@ async def start_analysis_session(
             policy_data.get("extractedJson"),
             rx_data.get("extractedJson")
         )
-        
-        policy_json = validation["validatedPolicyJson"]
+
         prescription_json = validation["validatedPrescriptionJson"]
 
-        if is_manual_rx:
-            from datetime import datetime
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            prescription_json["isManual"] = True
-            prescription_json["prescriptionSource"] = "Self-entered Prescription"
-            prescription_json["manualText"] = rx_text
-            if not prescription_json.get("visitDate"):
-                prescription_json["visitDate"] = today_str
-            if not prescription_json.get("consultationDate"):
-                prescription_json["consultationDate"] = today_str
+        if rx_ctx.is_manual:
+            _apply_manual_prescription_defaults(prescription_json, rx_text)
 
         # Always persist extracted text and JSON on documents in MongoDB for instant reuse
-        if rx_doc:
-            rx_doc.extracted_prescription_text = rx_text or ""
-            rx_doc.extracted_prescription_json = prescription_json or {}
-            if is_manual_rx:
-                rx_doc.is_manual = True
-            if prescription_json.get("patientName"):
-                rx_doc.patient_name = str(prescription_json.get("patientName"))
-            if prescription_json.get("doctorName"):
-                rx_doc.doctor_name = str(prescription_json.get("doctorName"))
-            if prescription_json.get("hospitalName"):
-                rx_doc.hospital_name = str(prescription_json.get("hospitalName"))
-            if prescription_json.get("diagnosis"):
-                rx_doc.diagnosis = str(prescription_json.get("diagnosis"))
-            if prescription_json.get("prescriptionNumber"):
-                rx_doc.prescription_number = str(prescription_json.get("prescriptionNumber"))
-            if prescription_json.get("visitDate") or prescription_json.get("consultationDate"):
-                rx_doc.visit_date = prescription_json.get("visitDate") or prescription_json.get("consultationDate")
-            rx_doc.processing_status = "completed"
-            await rx_doc.save()
-            logger.info(f"[Claim Analysis] Saved extracted prescription text & JSON to prescription {rx_doc.id}")
-        elif target_rx_file_id:
-            try:
-                new_rx_doc = Prescription(
-                    user_id=user_id,
-                    hospital_name=str(prescription_json.get("hospitalName") or ""),
-                    doctor_name=str(prescription_json.get("doctorName") or ""),
-                    patient_name=str(prescription_json.get("patientName") or ""),
-                    prescription_number=str(prescription_json.get("prescriptionNumber") or ""),
-                    visit_date=prescription_json.get("visitDate") or prescription_json.get("consultationDate") or "",
-                    diagnosis=str(prescription_json.get("diagnosis") or ""),
-                    is_manual=is_manual_rx,
-                    grid_fs_file_id="" if is_manual_rx else str(target_rx_file_id),
-                    original_file_name=session.prescription_id or "",
-                    extracted_prescription_text=rx_text or "",
-                    extracted_prescription_json=prescription_json or {},
-                    processing_status="completed"
-                )
-                await new_rx_doc.insert()
-                session.prescription_id = str(new_rx_doc.id)
-                rx_doc = new_rx_doc
-                logger.info(f"[Claim Analysis] Saved prescription {new_rx_doc.id}")
-            except Exception as rx_err:
-                logger.warning(f"[Claim Analysis] Could not save prescription record: {rx_err}")
+        new_rx_id = await _persist_prescription_extraction(
+            rx_ctx,
+            user_id=user_id,
+            rx_text=rx_text,
+            prescription_json=prescription_json,
+            fallback_original_name=session.prescription_id or "",
+        )
+        if new_rx_id:
+            session.prescription_id = new_rx_id
 
-        if policy_doc and (not policy_doc.extracted_policy_text or not policy_doc.extracted_policy_json):
-            policy_doc.extracted_policy_text = policy_text
-            policy_doc.extracted_policy_json = policy_json
-            if policy_json.get("policyHolder") and not policy_doc.policy_holder_name:
-                policy_doc.policy_holder_name = policy_json.get("policyHolder")
-            await policy_doc.save()
-            logger.info(f"[Claim Analysis] Cached extracted text for policy {policy_doc.id}")
-
-        session.policy_json = policy_json
-        session.prescription_json = prescription_json
-
-        # Early check for document validity
-        is_policy_valid = validation.get("isPolicyValid", True)
-        is_rx_valid = validation.get("isPrescriptionValid", True)
-        
-        if not is_policy_valid or not is_rx_valid:
-            logger.warning(f"[Claim Analysis] Document validation failed: policyValid={is_policy_valid}, prescriptionValid={is_rx_valid}")
-            p_reason = ""
-            rx_reason = ""
-            if not is_policy_valid:
-                p_reason = "The uploaded policy document contains no recognizable insurance policy clauses, covered treatments, benefit rules, or insurance terms."
-            if not is_rx_valid:
-                if is_manual_rx:
-                    rx_reason = "The self-entered text contains no recognizable medical details (no diagnosis, symptoms, diseases, medicines, or medical tests)."
-                else:
-                    rx_reason = "The uploaded document contains no valid diagnosis, medicines, medical tests, procedures, or symptoms."
-
-            if not is_policy_valid and not is_rx_valid:
-                inv_status = "Invalid Policy and Prescription"
-            elif not is_policy_valid:
-                inv_status = "Invalid Policy"
-            else:
-                inv_status = "Invalid Prescription"
-
-            extraction_time_ms = int((time.time() - start_time) * 1000)
-            session.extraction_time_ms = extraction_time_ms
-            session.accumulated_processing_time_ms = extraction_time_ms
-            session.status = "completed"
-            await session.save()
-
-            final_report = generate_report(
-                policy_json=policy_json,
-                prescription_json=prescription_json,
-                business_rule_results={},
-                coverage_analysis={
-                    "documentValidity": {
-                        "policyValid": is_policy_valid,
-                        "prescriptionValid": is_rx_valid,
-                        "isPolicyValid": is_policy_valid,
-                        "isPrescriptionValid": is_rx_valid,
-                        "policyInvalidReason": p_reason,
-                        "prescriptionInvalidReason": rx_reason,
-                        "errors": validation.get("errors", [])
-                    },
-                    "overallStatus": inv_status,
-                    "comparison": []
-                },
-                processing_time_ms=extraction_time_ms
-            )
-
-            # Do NOT store invalid coverage summary report in DB as per user requirement
-            final_report["status"] = "complete"
-            return final_report
-
-        # Check for policy start date conflict between user manual input and document extraction
-        user_entered_start_date = None
-        if policy_doc and policy_doc.policy_start_date:
-            user_entered_start_date = policy_doc.policy_start_date
-        elif policy_file_id:
-            try:
-                p_by_file = await Policy.find_one(Policy.grid_fs_file_id == policy_file_id, Policy.user_id == user_id)
-                if p_by_file and p_by_file.policy_start_date:
-                    user_entered_start_date = p_by_file.policy_start_date
-            except Exception:
-                pass
-
-        user_dt, user_disp = _parse_and_format_date(user_entered_start_date)
-        doc_dt, doc_disp = _parse_and_format_date(policy_json.get("policyStartDate"))
-
-        if user_dt and doc_dt and user_dt.date() != doc_dt.date():
-            logger.info(f"[Claim Analysis] Policy start date conflict: user entered {user_disp}, doc extracted {doc_disp}")
-            
-            question_data = {
-                "id": "policy_start_date_conflict",
-                "category": "eligibility",
-                "title": "Policy Start Date Conflict",
-                "question": f"Policy mentioned start date is {doc_disp}, but you mentioned {user_disp}. Can I proceed with your option?",
-                "type": "single_choice",
-                "required": True,
-                "options": [
-                    f"Use my entered date ({user_disp})",
-                    f"Use policy document date ({doc_disp})"
-                ],
-                "reason": "A conflict was found between the start date you entered and the start date extracted from the uploaded policy document."
-            }
-
-            session.questions.append(ClarificationQuestion(
-                id=question_data["id"],
-                title=question_data["title"],
-                question=question_data["question"],
-                type=question_data["type"],
-                category=question_data["category"],
-                required=question_data["required"],
-                options=question_data["options"],
-                reason=question_data["reason"]
-            ))
-
-            session.status = "waiting_for_user"
-            await session.save()
-
-            return {
-                "status": "needs_clarification",
-                "sessionId": str(session.id),
-                "questions": [question_data]
-            }
-        elif user_dt and not doc_dt:
-            policy_json["policyStartDate"] = user_dt.strftime("%Y-%m-%d")
-        elif user_dt and doc_dt and user_dt.date() == doc_dt.date():
-            policy_json["policyStartDate"] = user_dt.strftime("%Y-%m-%d")
-
-        log_section("Rule Engine & Eligibility")
-        logger.info("[Rule Engine] Evaluating policy rules, waiting periods, and exclusions...")
-        br_results = enforce_business_rules(policy_json, prescription_json)
-        session.business_rules = br_results
-        det_res = br_results.get("deterministicResult") or {}
-        det_status = det_res.get("status") or ("ELIGIBLE" if br_results.get("overallEligible") else "NOT_ELIGIBLE")
-        det_reason = det_res.get("reasonCode") or ""
-        logger.info(f"[Rule Engine] Decision: {det_status} ({det_reason})")
-
-        # Track extraction & business rule processing time
-        extraction_time_ms = int((time.time() - start_time) * 1000)
-        session.extraction_time_ms = extraction_time_ms
-        session.accumulated_processing_time_ms = extraction_time_ms
-        session.status = "analyzing"
-        await session.save()
-
-        return await _run_llm_analysis(session, policy_json, prescription_json, br_results, background_tasks)
+        return await run_single_policy_analysis(
+            session,
+            user_id=user_id,
+            validation=validation,
+            policy_ctx=policy_ctx,
+            policy_text=policy_text,
+            is_manual_rx=rx_ctx.is_manual,
+            start_time=start_time,
+            background_tasks=background_tasks,
+        )
 
     except Exception as e:
         logger.error(f"[Claim Analysis] Session {session.id} failed: {e}")
@@ -536,6 +692,7 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
         prescription_evidence=analysis_data.get("prescriptionEvidence", []),
         clarification_answers_used=clarification_history,
         session_id=str(session.id),
+        parent_session_id=session.parent_session_id or "",
         error_message=coverage_analysis.get("reason") if next_action == "manual_review" else None
     )
     await report.insert()
@@ -545,6 +702,8 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
     logger.info(f"  - Dominance Score: {report.dominance_score}%")
     logger.info(f"  - Processing Time: {total_processing_time}ms ({total_processing_time/1000.0:.2f}s)")
     logger.info(f"  - Session ID:      {session.id}")
+    if session.parent_session_id:
+        logger.info(f"  - Parent Session:  {session.parent_session_id} | Policy: {session.policy_id}")
 
     tracker = get_current_cost_tracker()
     if tracker:
@@ -562,7 +721,8 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
             report_id=str(report.id),
             policy_doc_id=session.policy_id if len(session.policy_id or "") > 20 else None,
             policy_file_id=None, 
-            prescription_id=session.prescription_id
+            prescription_id=session.prescription_id,
+            skip_prescription_metadata=bool(session.parent_session_id)
         )
     else:
         await _background_post_processing(
@@ -570,7 +730,8 @@ async def _run_llm_analysis(session: AnalysisSession, policy_json: dict, prescri
             report_id=str(report.id),
             policy_doc_id=session.policy_id if len(session.policy_id or "") > 20 else None,
             policy_file_id=None,
-            prescription_id=session.prescription_id
+            prescription_id=session.prescription_id,
+            skip_prescription_metadata=bool(session.parent_session_id)
         )
 
     fresh = await AnalysisReport.get(report.id)

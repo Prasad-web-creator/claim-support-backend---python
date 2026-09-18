@@ -37,6 +37,21 @@ class Settings(BaseSettings):
         description="Vision/multimodal AI model",
     )
 
+    AI_MAX_CONCURRENT_REQUESTS: int = Field(
+        default=3, ge=1, le=20,
+        description="Max simultaneous in-flight Gemini requests across the process",
+    )
+
+    # ─── Multi-Policy Analysis ────────────────────────────────────────────────
+    MAX_POLICIES_PER_ANALYSIS: int = Field(
+        default=5, ge=1, le=20,
+        description="Max policies allowed in a single multi-policy analysis request",
+    )
+    MULTI_POLICY_MAX_CONCURRENCY: int = Field(
+        default=2, ge=1, le=10,
+        description="Max policy analyses processed concurrently within one multi-policy session",
+    )
+
     # ─── Policy RAG / File Search ─────────────────────────────────────────────
     RAG_PROVIDER: str = Field(default="local", description="RAG search provider: local | gemini")
     RAG_TOP_K: int = Field(default=5, ge=1, le=20, description="Top K relevant clauses to retrieve")
@@ -61,7 +76,7 @@ class Settings(BaseSettings):
     DATA_CLEANUP_MAX_PERCENTAGE: float = Field(default=0.05, ge=0.01, le=1.0, description="Max percentage to delete per run")
     DATA_CLEANUP_MAX_COUNT: int = Field(default=10000, description="Absolute maximum documents to delete per run")
     DATA_CLEANUP_COLLECTIONS_ALLOWLIST: str = Field(
-        default="policies,prescriptions,analysisreports,analysissessions,analysisauditlogs,activitylogs,storedfiles",
+        default="policies,prescriptions,analysisreports,analysissessions,multipolicyanalysissessions,analysisauditlogs,activitylogs,storedfiles",
         description="Comma-separated allowed collections for cleanup"
     )
 

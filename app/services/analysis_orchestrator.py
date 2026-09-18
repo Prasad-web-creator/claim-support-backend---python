@@ -78,10 +78,16 @@ async def _background_post_processing(
     report_id: str,
     policy_doc_id: Optional[str],
     policy_file_id: Optional[str],
-    prescription_id: str
+    prescription_id: str,
+    skip_prescription_metadata: bool = False
 ):
     """
     Executes Metadata Extraction and RAG Indexing in the background.
+
+    `skip_prescription_metadata` is set for the children of a multi-policy
+    session: the prescription is identical for every policy, so its metadata is
+    extracted once instead of once per policy. The prescription record is still
+    updated, using the already-extracted prescription JSON.
     """
     try:
         report = await AnalysisReport.get(ObjectId(report_id))
@@ -94,11 +100,16 @@ async def _background_post_processing(
         policy_meta = {}
         rx_meta = {}
         try:
-            policy_meta, rx_meta = await asyncio.gather(
-                extract_policy_metadata(report.policy_text or ""),
-                extract_prescription_metadata(report.prescription_text or ""),
-                return_exceptions=True
-            )
+            if skip_prescription_metadata:
+                logger.debug("[Background] Reusing shared prescription extraction (multi-policy session).")
+                policy_meta = await extract_policy_metadata(report.policy_text or "")
+                rx_meta = {}
+            else:
+                policy_meta, rx_meta = await asyncio.gather(
+                    extract_policy_metadata(report.policy_text or ""),
+                    extract_prescription_metadata(report.prescription_text or ""),
+                    return_exceptions=True
+                )
             if isinstance(policy_meta, Exception):
                 logger.error(f"[Background] Policy metadata error: {policy_meta}")
                 policy_meta = {}

@@ -39,6 +39,7 @@ from app.models.analysis_session import AnalysisSession
 from app.models.policy import Policy
 from app.models.prescription import Prescription
 from app.models.stored_file import StoredFile
+from app.models.multi_policy_session import MultiPolicyAnalysisSession
 
 from app.services.ttl_service import ensure_ttl_indexes
 from app.services.cleanup_service import run_cleanup
@@ -65,7 +66,7 @@ async def lifespan(app: FastAPI):
     # Ensure TTL Indexes on all non-permanent models
     models = [
         Policy, Prescription, AnalysisReport, AnalysisSession, 
-        AnalysisAuditLog, ActivityLog, StoredFile
+        MultiPolicyAnalysisSession, AnalysisAuditLog, ActivityLog, StoredFile
     ]
     await ensure_ttl_indexes(models)
     

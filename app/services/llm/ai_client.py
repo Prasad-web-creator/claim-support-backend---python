@@ -192,6 +192,8 @@ def parse_ai_json_response(text: str) -> dict:
 
 
 _global_client = None
+_llm_semaphore: Optional[asyncio.Semaphore] = None
+
 
 def get_ai_client() -> genai.Client:
     global _global_client
@@ -201,6 +203,20 @@ def get_ai_client() -> genai.Client:
             raise ValueError("GEMINI_API_KEY is not defined in environment variables.")
         _global_client = genai.Client(api_key=settings.GEMINI_API_KEY)
     return _global_client
+
+
+def get_llm_semaphore() -> asyncio.Semaphore:
+    """
+    Process-wide bound on simultaneous in-flight Gemini requests.
+
+    Multi-policy analysis fans out N coverage analyses at once; without this the
+    provider returns 429/503 and every call burns its full retry budget.
+    Created lazily so it binds to the running event loop.
+    """
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        _llm_semaphore = asyncio.Semaphore(get_settings().AI_MAX_CONCURRENT_REQUESTS)
+    return _llm_semaphore
 
 
 async def extract_json_with_retry(
@@ -248,20 +264,21 @@ async def extract_json_with_retry(
 
             llm_start = time.time()
 
-            response = await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model=model_name,
-                    contents=user_content,
-                    config=types.GenerateContentConfig(
-                        system_instruction=current_prompt,
-                        response_mime_type="application/json",
-                        temperature=0.1,
-                        max_output_tokens=max_tokens,
-                        response_schema=response_schema,
+            async with get_llm_semaphore():
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=model_name,
+                        contents=user_content,
+                        config=types.GenerateContentConfig(
+                            system_instruction=current_prompt,
+                            response_mime_type="application/json",
+                            temperature=0.1,
+                            max_output_tokens=max_tokens,
+                            response_schema=response_schema,
+                        ),
                     ),
-                ),
-                timeout=180.0,
-            )
+                    timeout=180.0,
+                )
 
             llm_end = time.time()
             content = response.text
@@ -392,19 +409,20 @@ async def extract_json_multimodal(
             if text_content and text_content.strip():
                 contents.append(types.Part.from_text(text=text_content))
 
-            response = await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=current_prompt,
-                        response_mime_type="application/json",
-                        temperature=0.1,
-                        max_output_tokens=max_tokens,
+            async with get_llm_semaphore():
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=current_prompt,
+                            response_mime_type="application/json",
+                            temperature=0.1,
+                            max_output_tokens=max_tokens,
+                        ),
                     ),
-                ),
-                timeout=180.0,
-            )
+                    timeout=180.0,
+                )
 
             content = response.text
             usage = response.usage_metadata
@@ -502,18 +520,19 @@ async def extract_text_multimodal(
             if text_content and text_content.strip():
                 contents.append(types.Part.from_text(text=text_content))
 
-            response = await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        temperature=0.1,
-                        max_output_tokens=max_tokens,
+            async with get_llm_semaphore():
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            temperature=0.1,
+                            max_output_tokens=max_tokens,
+                        ),
                     ),
-                ),
-                timeout=180.0,
-            )
+                    timeout=180.0,
+                )
 
             usage = response.usage_metadata
 
