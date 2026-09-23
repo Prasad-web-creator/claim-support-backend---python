@@ -12,15 +12,7 @@ from pydantic import Field, field_validator
 from app.models.counter import Counter
 
 
-def _sanitize_nulls(data: Any) -> Any:
-    """Recursively converts None values in dictionaries and lists to empty strings or empty structures."""
-    if isinstance(data, dict):
-        return {k: _sanitize_nulls(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [_sanitize_nulls(item) for item in data]
-    elif data is None:
-        return ""
-    return data
+from app.core.sanitize import sanitize_nulls as _sanitize_nulls
 
 
 class AnalysisReport(Document):

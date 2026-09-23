@@ -302,6 +302,21 @@ async def delete_report_group(user_id: str, group_id: str) -> dict:
             if report and report.user_id == user_id:
                 await report.delete()
                 deleted += 1
+
+        # A report whose id never made it back into policy_analyses (analysis
+        # still running at delete time, a retry that rewrote the entry, a write
+        # that failed) would survive the loop above. It would then be invisible:
+        # excluded from the list by _UNGROUPED_REPORT_CLAUSE because it claims a
+        # parent, while the parent no longer exists — yet still counted on the
+        # dashboard. Sweep by parentSessionId so the group cannot leave orphans.
+        sweep = await AnalysisReport.find(
+            AnalysisReport.user_id == user_id,
+            {"parentSessionId": group_id},
+        ).to_list()
+        for report in sweep:
+            await report.delete()
+            deleted += 1
+
         await session.delete()
         logger.info(
             f"[ReportGroups] Deleted multi-policy group {group_id} "
