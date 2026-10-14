@@ -52,6 +52,8 @@ class AnalysisReport(Document):
     business_rules: Optional[dict] = Field(default_factory=dict, alias="businessRules")
     document_validity: Optional[dict] = Field(default_factory=dict, alias="documentValidity")
     reference_comparison: Optional[dict] = Field(default_factory=dict, alias="referenceComparison")
+    # Deterministic Policy Continuity Check (see app/services/coverage/policy_continuity.py).
+    policy_continuity: Optional[dict] = Field(default_factory=dict, alias="policyContinuity")
 
     # ─── Snapshot Caches ──────────────────────────────────────────────────────
     policy_json: Optional[dict] = Field(default_factory=dict, alias="policyJson")
@@ -118,6 +120,7 @@ class AnalysisReport(Document):
         "policy_json",
         "prescription_json",
         "reference_comparison",
+        "policy_continuity",
         mode="before",
     )
     @classmethod
@@ -176,7 +179,7 @@ class AnalysisReport(Document):
         dict_fields = [
             "coverage_breakdown", "coverage_analysis", "business_rules",
             "document_validity", "policy_json", "prescription_json",
-            "reference_comparison"
+            "reference_comparison", "policy_continuity"
         ]
         for field in dict_fields:
             val = getattr(self, field, None)

@@ -121,8 +121,37 @@ Return ONLY a valid JSON object with the following fields:
 - specialConditions (array of strings)
 - notes (string or null)"""
 
+# Policy continuity extraction prompt — facts only. The backend decides continuity.
+POLICY_CONTINUITY_EXTRACTION_PROMPT = """You are a strict data extraction AI. Extract the policy period and coverage-history facts from the given insurance policy text.
+Do NOT decide whether coverage was continuous. Do NOT calculate anything. Extract ONLY what is explicitly written. Never guess.
+
+CRITICAL RULES:
+1. Return ONLY JSON. No markdown, no explanations.
+2. If a value is not explicitly written in the text, return null. Never infer a previous policy from the absence of one.
+3. Return every date in YYYY-MM-DD format when the full date is written; otherwise copy it exactly as written.
+4. Policy numbers must be copied exactly as written.
+5. isRenewal: true ONLY if the text says the policy is a renewal (e.g. "Renewal", "Renewed", "Policy Year 3", "Renewal of policy no."); false ONLY if the text says it is a fresh/new policy (e.g. "Fresh", "New Business", "First Year"); otherwise null.
+6. continuousCoverageSince: a date the text presents as the start of uninterrupted cover across renewals, e.g. "Continuous coverage since", "Insured with us since", "Member since", "First inception date", "Date of first enrollment", "Coverage continuous from". Do NOT use the start date of the current policy period for this field unless the text explicitly labels it that way.
+7. previousPolicyNumber / previousPolicyStartDate / previousPolicyEndDate / previousInsurer: only when the text explicitly refers to a previous or expiring policy (including portability/migration from another insurer).
+8. continuityEvidence: up to 5 short verbatim quotes (max 200 characters each) from the text that support the fields above. Empty array if none.
+
+Return ONLY a valid JSON object with these fields:
+- policyNumber (string or null)
+- policyHolder (string or null)
+- insuranceCompany (string or null)
+- policyStartDate (string or null) — start of the CURRENT policy period
+- policyEndDate (string or null) — end of the CURRENT policy period
+- isRenewal (boolean or null)
+- renewalInformation (string or null) — renewal wording as written, e.g. "Renewal - Policy Year 3"
+- previousPolicyNumber (string or null)
+- previousPolicyStartDate (string or null)
+- previousPolicyEndDate (string or null)
+- previousInsurer (string or null)
+- continuousCoverageSince (string or null)
+- continuityEvidence (array of strings)"""
+
 # Prescription extraction prompt
-PRESCRIPTION_EXTRACTION_PROMPT = """You are a strict medical data extraction AI. Your task is to extract structured medical information from the given prescription/medical document text.
+PRESCRIPTION_EXTRACTION_PROMPT ="""You are a strict medical data extraction AI. Your task is to extract structured medical information from the given prescription/medical document text.
 Extract ONLY what is explicitly stated in the text. Do not make medical assumptions.
 
 CRITICAL RULES:

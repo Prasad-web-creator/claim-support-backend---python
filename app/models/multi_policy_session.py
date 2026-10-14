@@ -77,6 +77,8 @@ class MultiPolicyAnalysisSession(Document):
 
     policy_analyses: List[PolicyAnalysisEntry] = Field(default_factory=list, alias="policyAnalyses")
     comparison_summary: Optional[dict] = Field(default_factory=dict, alias="comparisonSummary")
+    # Policy Continuity Check per policy id, evaluated across every policy in the session.
+    policy_continuity: Optional[dict] = Field(default_factory=dict, alias="policyContinuity")
 
     total_processing_time_ms: int = Field(default=0, alias="totalProcessingTimeMs")
     error_message: Optional[str] = Field(default="", alias="errorMessage")
@@ -91,7 +93,7 @@ class MultiPolicyAnalysisSession(Document):
             return ""
         return str(v)
 
-    @field_validator("prescription_json", "comparison_summary", mode="before")
+    @field_validator("prescription_json", "comparison_summary", "policy_continuity", mode="before")
     @classmethod
     def sanitize_dict_fields(cls, v):
         if v is None:
@@ -139,4 +141,8 @@ class MultiPolicyAnalysisSession(Document):
             self.prescription_json = _sanitize_nulls(self.prescription_json)
         if self.comparison_summary is None:
             self.comparison_summary = {}
+        if self.policy_continuity is None:
+            self.policy_continuity = {}
+        else:
+            self.policy_continuity = _sanitize_nulls(self.policy_continuity)
         self.updated_at = datetime.now(timezone.utc)

@@ -1047,3 +1047,90 @@ async def test_a_policy_the_user_named_keeps_its_name(harness, monkeypatch):
     result = await mpo.start_multi_policy_analysis(USER, harness.rx_id, [harness.id("A")])
 
     assert harness.entry(result, "A")["policyName"] == "My Family Cover"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Policy Continuity Check across the session's policies
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _set_policy_json(policy_id, **fields):
+    from beanie import PydanticObjectId
+    policy = await Policy.get(PydanticObjectId(policy_id))
+    policy.extracted_policy_json = dict(VALID_POLICY_JSON, **fields)
+    await policy.save()
+
+
+async def test_consecutive_policies_verify_continuity_for_every_row(harness):
+    await harness.add_policy("2025", cached=True)
+    await harness.add_policy("2026", cached=True)
+    await harness.add_prescription()
+    # Claim (visit) date in VALID_RX_JSON is 2026-06-14.
+    await _set_policy_json(harness.id("2025"), policyNumber="P-1",
+                           policyStartDate="2025-01-01", policyEndDate="2025-12-31")
+    await _set_policy_json(harness.id("2026"), policyNumber="P-1",
+                           policyStartDate="2026-01-01", policyEndDate="2026-12-31")
+
+    result = await mpo.start_multi_policy_analysis(
+        USER, harness.rx_id, [harness.id("2025"), harness.id("2026")]
+    )
+
+    for label in ("2025", "2026"):
+        continuity = harness.entry(result, label)["continuity"]
+        assert continuity["statusCode"] == "VERIFIED", label
+        assert continuity["originalPolicyStartDate"] == "2025-01-01"
+
+
+async def test_unrelated_policies_do_not_establish_each_others_history(harness):
+    await harness.add_policy("A", cached=True)
+    await harness.add_policy("B", cached=True)
+    await harness.add_prescription()
+    await _set_policy_json(harness.id("A"), policyNumber="A-1", insuranceCompany="Insurer A",
+                           policyStartDate="2026-01-01", policyEndDate="2026-12-31")
+    await _set_policy_json(harness.id("B"), policyNumber="B-1", insuranceCompany="Insurer B",
+                           policyStartDate="2026-03-01", policyEndDate="2027-02-28")
+
+    result = await mpo.start_multi_policy_analysis(
+        USER, harness.rx_id, [harness.id("A"), harness.id("B")]
+    )
+
+    assert harness.entry(result, "A")["continuity"]["statusCode"] == "CANNOT_BE_ESTABLISHED"
+    assert harness.entry(result, "B")["continuity"]["statusCode"] == "CANNOT_BE_ESTABLISHED"
+
+
+async def test_continuity_is_written_to_each_report(harness, monkeypatch, db):
+    from app.models.analysis_report import AnalysisReport
+
+    await harness.add_policy("2025", cached=True)
+    await harness.add_policy("2026", cached=True)
+    await harness.add_prescription()
+    await _set_policy_json(harness.id("2025"), policyNumber="P-1",
+                           policyStartDate="2025-01-01", policyEndDate="2025-12-31")
+    await _set_policy_json(harness.id("2026"), policyNumber="P-1",
+                           policyStartDate="2026-01-01", policyEndDate="2026-12-31")
+
+    async def run_with_report(session, *, user_id, validation, policy_ctx, policy_text,
+                              is_manual_rx, start_time, background_tasks=None, on_stage=None):
+        report = AnalysisReport(
+            user_id=user_id,
+            policy_id=session.policy_id,
+            parent_session_id=session.parent_session_id,
+            policy_json=validation["validatedPolicyJson"],
+            prescription_json=validation["validatedPrescriptionJson"],
+            overall_status="Covered",
+        )
+        await report.insert()
+        return {"status": "complete", "_id": str(report.id), "overallStatus": "Covered"}
+
+    monkeypatch.setattr(mpo, "run_single_policy_analysis", run_with_report)
+
+    result = await mpo.start_multi_policy_analysis(
+        USER, harness.rx_id, [harness.id("2025"), harness.id("2026")]
+    )
+
+    reports = await AnalysisReport.find(AnalysisReport.parent_session_id == result["sessionId"]).to_list()
+    assert len(reports) == 2
+    for report in reports:
+        assert report.policy_continuity["statusCode"] == "VERIFIED"
+        live = await mpo.continuity_for_report(report)
+        assert live["statusCode"] == "VERIFIED"
+        assert live["currentPolicy"]["policyId"] == harness.id("2026")

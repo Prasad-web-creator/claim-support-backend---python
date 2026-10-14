@@ -73,6 +73,11 @@ async def single(monkeypatch, db):
 
     monkeypatch.setattr(aio, "analyze_coverage", fake_analyze_coverage)
 
+    async def fake_ensure_continuity(policy_json, policy_text):
+        return False
+
+    monkeypatch.setattr(aio, "ensure_continuity_fields", fake_ensure_continuity)
+
     async def fake_background(**kwargs):
         return None
 
@@ -433,3 +438,49 @@ async def test_background_metadata_flag_defaults_to_full_extraction(single, monk
 
     # A classic single-policy session has no parent, so nothing is skipped
     assert calls["skip_prescription_metadata"] is False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Policy Continuity Check
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def test_single_policy_report_carries_policy_continuity(single):
+    policy = await single.add_policy()
+    rx = await single.add_prescription()
+
+    result = await aio.start_analysis_session(
+        user_id=USER, prescription_id=str(rx.id), policy_doc_id=str(policy.id)
+    )
+
+    # The test policy states no period, so continuity cannot be established —
+    # and missing history is never reported as a gap.
+    continuity = result["policyContinuity"]
+    assert continuity["statusCode"] == "CANNOT_BE_ESTABLISHED"
+    assert continuity["coverageGaps"] == []
+
+    stored = await AnalysisReport.get(result["_id"])
+    assert stored.policy_continuity["status"] == continuity["status"]
+
+
+async def test_cached_policy_gets_continuity_backfilled_once(single, monkeypatch):
+    calls = []
+
+    async def fake_extract_continuity(text):
+        calls.append(text)
+        return {"isRenewal": False}
+
+    import app.services.extraction.policy_continuity_extraction as pce
+    monkeypatch.setattr(pce, "extract_policy_continuity_fields", fake_extract_continuity)
+    monkeypatch.setattr(aio, "ensure_continuity_fields", pce.ensure_continuity_fields)
+
+    policy = await single.add_policy(cached=True)
+    policy.extracted_policy_text = "POLICY SCHEDULE. Period of insurance 01/01/2026 to 31/12/2026. Fresh policy."
+    await policy.save()
+    rx = await single.add_prescription()
+
+    await aio.start_analysis_session(user_id=USER, prescription_id=str(rx.id), policy_doc_id=str(policy.id))
+    await aio.start_analysis_session(user_id=USER, prescription_id=str(rx.id), policy_doc_id=str(policy.id))
+
+    assert len(calls) == 1
+    refreshed = await Policy.get(policy.id)
+    assert refreshed.extracted_policy_json["continuity"]["isRenewal"] is False

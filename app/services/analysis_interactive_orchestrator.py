@@ -15,6 +15,7 @@ from app.services.extraction.text_cleaning import clean_text
 from app.services.extraction.policy_extraction import extract_policy_details
 from app.services.extraction.prescription_extraction import extract_prescription_details
 from app.services.extraction.json_validation import validate_extracted_json
+from app.services.extraction.policy_continuity_extraction import CONTINUITY_KEY, ensure_continuity_fields
 from app.services.coverage.business_rules import enforce_business_rules
 from app.services.coverage.coverage_analysis import analyze_coverage
 from app.services.coverage.report_generator import generate_report
@@ -420,6 +421,14 @@ async def run_single_policy_analysis(
         final_report["status"] = "complete"
         return final_report
 
+    # Policies extracted before the continuity check existed are read for their
+    # coverage-history facts once; the result is cached on the Policy record.
+    if await ensure_continuity_fields(policy_json, policy_text) and policy_doc:
+        stored = dict(policy_doc.extracted_policy_json or {})
+        stored[CONTINUITY_KEY] = policy_json[CONTINUITY_KEY]
+        policy_doc.extracted_policy_json = stored
+        await policy_doc.save()
+
     # Check for policy start date conflict between user manual input and document extraction
     user_entered_start_date = None
     if policy_doc and policy_doc.policy_start_date:
@@ -771,6 +780,7 @@ async def _run_llm_analysis(
         comparison=final_report.get("comparison"),
         processing_time_ms=total_processing_time,
         reference_comparison=final_report.get("referenceComparison") or {},
+        policy_continuity=final_report.get("policyContinuity") or {},
         
         decision_type="Automatic" if next_action == "generate_report" else "Manual Review",
         confidence_score=confidence,

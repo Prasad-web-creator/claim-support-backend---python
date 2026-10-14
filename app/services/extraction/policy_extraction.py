@@ -8,6 +8,10 @@ from app.services.llm.ai_client import extract_json_with_retry
 from app.services.llm.prompts import POLICY_EXTRACTION_PROMPT, POLICY_FIELDS, REQUIRED_POLICY_FIELDS
 from app.utils.document_splitter import split_text_intelligently, merge_extracted_json
 from app.utils.extraction_validator import validate_extraction
+from app.services.extraction.policy_continuity_extraction import (
+    extract_policy_continuity_fields,
+    merge_continuity_fields,
+)
 
 
 async def extract_policy_details(policy_text: str) -> dict:
@@ -57,7 +61,8 @@ async def extract_policy_details(policy_text: str) -> dict:
             return i, None
 
     tasks = [extract_chunk(i, chunk) for i, chunk in enumerate(chunks)]
-    results = await asyncio.gather(*tasks)
+    # Continuity facts come from their own focused pass, run alongside the chunks.
+    *results, continuity = await asyncio.gather(*tasks, extract_policy_continuity_fields(policy_text))
 
     # Sort results to ensure original order
     results.sort(key=lambda x: x[0])
@@ -92,6 +97,9 @@ async def extract_policy_details(policy_text: str) -> dict:
         all_expected_fields=POLICY_FIELDS
     )
     
+    if continuity and isinstance(validation_result["cleanedJson"], dict):
+        merge_continuity_fields(validation_result["cleanedJson"], continuity)
+
     logger.info(f"[Policy] Extraction completed (Valid: {validation_result['isValid']}, Confidence: {validation_result['confidence']}%)")
     
     return {

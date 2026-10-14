@@ -22,10 +22,12 @@ from beanie import PydanticObjectId as ObjectId
 
 from app.core.config import get_settings
 from app.core.logging import logger, log_section
+from app.models.analysis_report import AnalysisReport
 from app.models.analysis_session import AnalysisSession
 from app.models.multi_policy_session import MultiPolicyAnalysisSession, PolicyAnalysisEntry
 from app.models.policy import Policy
 from app.services.coverage.policy_comparison import build_comparison_summary
+from app.services.coverage.policy_continuity import evaluate_policy_continuity
 from app.services.extraction.json_validation import validate_extracted_json
 from app.services.extraction.policy_extraction import extract_policy_details
 from app.services.extraction.prescription_extraction import extract_prescription_details
@@ -232,10 +234,96 @@ def _attach_entry(parent: MultiPolicyAnalysisSession, entry: PolicyAnalysisEntry
             return
 
 
+async def _load_report(report_id: str) -> Optional[AnalysisReport]:
+    try:
+        return await AnalysisReport.get(ObjectId(report_id)) if report_id else None
+    except Exception:
+        return None
+
+
+async def evaluate_session_continuity(parent: MultiPolicyAnalysisSession) -> tuple:
+    """
+    Policy Continuity Check for every policy in a session, evaluated across all
+    of the session's policy documents.
+
+    Each policy is read from its report when it has one (that copy carries any
+    start date the user confirmed), otherwise from the Policy record's cached
+    extraction. Returns ({policy_id: continuity}, {policy_id: report}).
+    """
+    inputs, reports, claim_rx = [], {}, {}
+    for entry in parent.policy_analyses:
+        report = await _load_report(entry.report_id or "")
+        if report is not None and report.user_id != parent.user_id:
+            report = None
+        try:
+            policy = await Policy.get(ObjectId(entry.policy_id))
+        except Exception:
+            policy = None
+        if policy is not None and policy.user_id != parent.user_id:
+            policy = None
+
+        policy_json = (report.policy_json if report and report.policy_json else None) or (
+            policy.extracted_policy_json if policy else None
+        ) or {}
+        label = "" if is_placeholder_policy_name(entry.policy_name) else (entry.policy_name or "")
+        inputs.append({
+            "policyId": entry.policy_id,
+            "label": label,
+            "policyJson": policy_json,
+            "fallbackStartDate": policy.policy_start_date if policy else None,
+        })
+        if report is not None:
+            reports[entry.policy_id] = report
+            # A clarification answer may have corrected this policy's treatment date.
+            claim_rx[entry.policy_id] = report.prescription_json or None
+
+    results = {
+        entry.policy_id: evaluate_policy_continuity(
+            inputs,
+            claim_rx.get(entry.policy_id) or parent.prescription_json or {},
+            current_policy_id=entry.policy_id,
+        )
+        for entry in parent.policy_analyses
+    }
+    return results, reports
+
+
+async def _refresh_continuity(parent: MultiPolicyAnalysisSession) -> None:
+    """Store the session-wide continuity result on the parent and on each report."""
+    try:
+        results, reports = await evaluate_session_continuity(parent)
+        parent.policy_continuity = results
+        for policy_id, report in reports.items():
+            report.policy_continuity = results.get(policy_id) or {}
+            await report.save()
+    except Exception as e:
+        # Continuity is informational; it must never fail the analysis itself.
+        logger.warning(f"[MultiPolicy] session={parent.id} continuity check failed: {e}")
+
+
+async def continuity_for_report(report: AnalysisReport) -> Optional[dict]:
+    """
+    Live session-wide continuity for a report produced inside a multi-policy
+    session, or None for a single-policy report. Evaluated on read so a report
+    opened while sibling policies are still running reflects every document.
+    """
+    if not report.parent_session_id:
+        return None
+    try:
+        parent = await MultiPolicyAnalysisSession.get(ObjectId(report.parent_session_id))
+    except Exception:
+        parent = None
+    if not parent or parent.user_id != report.user_id:
+        return None
+    results, _ = await evaluate_session_continuity(parent)
+    return results.get(report.policy_id)
+
+
 async def _refresh_parent_status(parent: MultiPolicyAnalysisSession) -> MultiPolicyAnalysisSession:
-    """Recompute the parent status + comparison summary and persist."""
+    """Recompute the parent status, comparison summary and continuity, and persist."""
     parent.status = _derive_parent_status(parent.policy_analyses)
     parent.comparison_summary = build_comparison_summary(parent.policy_analyses)
+    await _refresh_continuity(parent)
     await parent.save()
     return parent
 
@@ -841,6 +929,18 @@ async def _get_owned_parent(parent_session_id: str, user_id: str) -> MultiPolicy
     return parent
 
 
+def _continuity_brief(result) -> dict:
+    """The at-a-glance part of a continuity result, for the per-policy rows."""
+    if not isinstance(result, dict) or not result.get("status"):
+        return {}
+    return {
+        "status": result.get("status") or "",
+        "statusCode": result.get("statusCode") or "",
+        "summary": result.get("summary") or "",
+        "originalPolicyStartDate": result.get("originalPolicyStartDate") or "",
+    }
+
+
 def serialize_multi_session(
     parent: MultiPolicyAnalysisSession,
     include_prescription_json: bool = True,
@@ -886,6 +986,7 @@ def serialize_multi_session(
                 "totalSteps": _entry_progress(e)[1],
                 "startedAt": e.started_at.isoformat() if e.started_at else None,
                 "completedAt": e.completed_at.isoformat() if e.completed_at else None,
+                "continuity": _continuity_brief((parent.policy_continuity or {}).get(e.policy_id)),
             }
             for e in parent.policy_analyses
         ],

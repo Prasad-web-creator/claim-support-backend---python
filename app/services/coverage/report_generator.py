@@ -1,5 +1,6 @@
 from datetime import datetime
 from app.services.coverage.reference_benchmark_service import generate_reference_comparison
+from app.services.coverage.policy_continuity import evaluate_policy_continuity
 
 
 def _is_meaningful(val) -> bool:
@@ -386,6 +387,13 @@ def generate_report(
         coverage_analysis=coverage_analysis,
     )
 
+    # Continuity from this policy's own document. A multi-policy session later
+    # re-evaluates it across every policy in the session.
+    policy_continuity = (
+        {} if is_doc_invalid
+        else evaluate_policy_continuity([{"policyJson": policy_json}], prescription_json)
+    )
+
     combined_blocked = list(coverage_analysis.get("blockedPolicyClauses", []))
     for b in all_blockers:
         if b not in combined_blocked:
@@ -418,4 +426,5 @@ def generate_report(
         "prescriptionJson": prescription_json,
         "policyJson": policy_json,
         "referenceComparison": reference_comparison,
+        "policyContinuity": policy_continuity,
     }

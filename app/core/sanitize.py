@@ -32,6 +32,9 @@ LIST_VALUED_KEYS = frozenset({
     "comparison", "policyClausesUsed", "prescriptionEvidence",
     "clarificationAnswersUsed", "errors", "questions", "options",
     "policyAnalyses", "reportIds",
+    # policyContinuity
+    "continuityEvidence", "coverageGaps", "continuityConflicts", "policiesEvaluated",
+    "missingInformation", "betweenPolicies", "policyLabels",
 })
 
 
