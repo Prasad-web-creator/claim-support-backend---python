@@ -1,5 +1,5 @@
 from typing import Awaitable, Callable, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import BackgroundTasks
 import time
 import asyncio
@@ -19,6 +19,7 @@ from app.services.extraction.policy_continuity_extraction import CONTINUITY_KEY,
 from app.services.coverage.business_rules import enforce_business_rules
 from app.services.coverage.coverage_analysis import analyze_coverage
 from app.services.coverage.report_generator import generate_report
+from app.services.rule_engine.date_utils import parse_flexible_date
 from app.services.llm.ai_client import AnalysisCostTracker, set_current_cost_tracker, get_current_cost_tracker
 from app.services.analysis_orchestrator import _fetch_file_bytes_by_gridfs_id, _background_post_processing
 
@@ -117,9 +118,37 @@ def _parse_and_format_date(date_val):
                     break
                 except Exception:
                     continue
+    if not parsed:
+        # Dates as printed on documents: "01-Apr-2026 00:00 Hrs", "April 1, 2026", "1st April 2026"
+        flexible = parse_flexible_date(date_val)
+        if flexible:
+            parsed = datetime(flexible.year, flexible.month, flexible.day)
     if parsed:
         return parsed, parsed.strftime("%d-%m-%Y")
     return None, None
+
+
+def _date_from_answer(answer) -> Optional[datetime]:
+    """A date from a clarification answer: a picked date ("14-Oct-2026"), an option containing one, or today/yesterday."""
+    text = str(answer or "").strip()
+    if not text:
+        return None
+    parsed, _ = _parse_and_format_date(text)
+    if parsed:
+        return parsed
+    import re
+    match = re.search(r"\d{1,2}[-/ ][A-Za-z]{3,9}[-/ ]\d{4}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4}|\d{4}-\d{2}-\d{2}", text)
+    if match:
+        parsed, _ = _parse_and_format_date(match.group(0))
+        if parsed:
+            return parsed
+    lower = text.lower()
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if "yesterday" in lower:
+        return today - timedelta(days=1)
+    if "today" in lower:
+        return today
+    return None
 
 class PrescriptionContext:
     """
@@ -867,49 +896,37 @@ async def resume_analysis_session(
     # Check if policy start date conflict was answered
     date_ans = answers.get("policy_start_date_conflict")
     if date_ans:
-        import re
-        match = re.search(r"(\d{2}[-/]\d{2}[-/]\d{4}|\d{4}[-/]\d{2}[-/]\d{2})", str(date_ans))
-        if match:
-            chosen_parsed, _ = _parse_and_format_date(match.group(1))
-            if chosen_parsed:
-                chosen_iso_date = chosen_parsed.strftime("%Y-%m-%d")
-                if not session.policy_json:
-                    session.policy_json = {}
-                session.policy_json["policyStartDate"] = chosen_iso_date
-                logger.info(f"[Clarification] Resolved policy start date from user answer: {chosen_iso_date}")
-                
-                # Persist chosen start date in Policy MongoDB record
-                if session.policy_id:
-                    try:
-                        if len(str(session.policy_id)) == 24:
-                            pol_record = await Policy.get(ObjectId(session.policy_id))
-                            if pol_record:
-                                pol_record.policy_start_date = chosen_parsed
-                                if pol_record.extracted_policy_json:
-                                    pol_record.extracted_policy_json["policyStartDate"] = chosen_iso_date
-                                await pol_record.save()
-                                logger.debug(f"[Clarification] Saved resolved policy start date {chosen_parsed} to Policy {pol_record.id}")
-                    except Exception as pe:
-                        logger.error(f"[Clarification] Error updating policy start date in DB: {pe}")
+        chosen_parsed = _date_from_answer(date_ans)
+        if chosen_parsed:
+            chosen_iso_date = chosen_parsed.strftime("%Y-%m-%d")
+            if not session.policy_json:
+                session.policy_json = {}
+            session.policy_json["policyStartDate"] = chosen_iso_date
+            logger.info(f"[Clarification] Resolved policy start date from user answer: {chosen_iso_date}")
 
-    # Check if treatment date was answered
+            # Persist chosen start date in Policy MongoDB record
+            if session.policy_id:
+                try:
+                    if len(str(session.policy_id)) == 24:
+                        pol_record = await Policy.get(ObjectId(session.policy_id))
+                        if pol_record:
+                            pol_record.policy_start_date = chosen_parsed
+                            if pol_record.extracted_policy_json:
+                                pol_record.extracted_policy_json["policyStartDate"] = chosen_iso_date
+                            await pol_record.save()
+                            logger.debug(f"[Clarification] Saved resolved policy start date {chosen_parsed} to Policy {pol_record.id}")
+                except Exception as pe:
+                    logger.error(f"[Clarification] Error updating policy start date in DB: {pe}")
+
+    # Check if treatment date was answered (a picked date such as "14-Oct-2026", or today/yesterday)
     treatment_date_ans = answers.get("prescription_treatment_date")
     if treatment_date_ans:
-        import re
-        match = re.search(r"(\d{2}[-/]\d{2}[-/]\d{4}|\d{4}[-/]\d{2}[-/]\d{2})", str(treatment_date_ans))
-        if match:
-            chosen_parsed, _ = _parse_and_format_date(match.group(1))
-            if chosen_parsed:
-                if not session.prescription_json:
-                    session.prescription_json = {}
-                session.prescription_json["visitDate"] = chosen_parsed.strftime("%Y-%m-%d")
-                session.prescription_json["consultationDate"] = chosen_parsed.strftime("%Y-%m-%d")
-        elif "today" in str(treatment_date_ans).lower():
+        chosen_parsed = _date_from_answer(treatment_date_ans)
+        if chosen_parsed:
             if not session.prescription_json:
                 session.prescription_json = {}
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            session.prescription_json["visitDate"] = today_str
-            session.prescription_json["consultationDate"] = today_str
+            session.prescription_json["visitDate"] = chosen_parsed.strftime("%Y-%m-%d")
+            session.prescription_json["consultationDate"] = chosen_parsed.strftime("%Y-%m-%d")
 
     # Check if hospitalization status was answered
     hosp_ans = str(answers.get("hospitalization_status", "") or answers.get("admission_type", "")).lower()
@@ -934,7 +951,16 @@ async def resume_analysis_session(
     # Check if symptom onset / duration / past medical history was answered
     onset_ans = str(answers.get("symptom_onset_duration", "")).lower()
     pmh_ans = str(answers.get("past_medical_history", "")).lower()
-    if "pre-existing" in onset_ans or "pre-existing" in pmh_ans or "prior to policy" in onset_ans or "yes, previously" in pmh_ans or "years ago" in onset_ans or "months before" in onset_ans or "chronic" in onset_ans:
+    onset_date = _date_from_answer(answers.get("symptom_onset_duration")) if "today" not in onset_ans else None
+    if onset_date:
+        # The user entered the actual onset date: pre-existing if it is before the policy started.
+        if not session.prescription_json:
+            session.prescription_json = {}
+        session.prescription_json["diagnosisDate"] = onset_date.strftime("%Y-%m-%d")
+        pol_start_dt, _ = _parse_and_format_date((session.policy_json or {}).get("policyStartDate"))
+        if pol_start_dt:
+            session.prescription_json["isPreExisting"] = onset_date < pol_start_dt
+    elif "pre-existing" in onset_ans or "pre-existing" in pmh_ans or "prior to policy" in onset_ans or "yes, previously" in pmh_ans or "years ago" in onset_ans or "months before" in onset_ans or "chronic" in onset_ans:
         if not session.prescription_json:
             session.prescription_json = {}
         session.prescription_json["isPreExisting"] = True

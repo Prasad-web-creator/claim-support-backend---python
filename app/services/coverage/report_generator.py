@@ -117,6 +117,9 @@ def generate_report(
         overall_status = "Invalid Policy"
     elif not rx_valid:
         overall_status = "Invalid Prescription"
+    elif total_items > 0 and covered_count + partially_covered_count + not_covered_count == 0:
+        # Only "Manual Review" items: nothing was decided automatically.
+        overall_status = "Manual Review Required"
     elif total_items > 0:
         if not_covered_count >= partially_covered_count and not_covered_count >= covered_count:
             overall_status = "Not Covered"
@@ -151,8 +154,9 @@ def generate_report(
             if b not in all_blockers:
                 all_blockers.append(b)
 
+    # A case referred for manual review (e.g. an unreadable date) is undecided, not rejected.
     is_blocked = (
-        (business_rule_results.get("overallEligible") is False)
+        (business_rule_results.get("overallEligible") is False and det_res.get("status") != "MANUAL_REVIEW")
         or (det_res.get("status") in ("NOT_COVERED", "NOT_CURRENTLY_COVERED"))
         or (len(all_blockers) > 0)
     )

@@ -163,11 +163,13 @@ async def _background_post_processing(
                 if parsed_sum is not None:
                     target_policy_doc.coverage_amount = parsed_sum
                 
+                # Only fill dates that are missing: a start date entered or confirmed by the
+                # user must survive, or the next analysis cannot detect a start date conflict.
                 p_start = _safe_parse_datetime(policy_meta.get("policy_start_date"))
-                if p_start:
+                if p_start and not target_policy_doc.policy_start_date:
                     target_policy_doc.policy_start_date = p_start
                 p_end = _safe_parse_datetime(policy_meta.get("policy_expiry_date"))
-                if p_end:
+                if p_end and not target_policy_doc.policy_end_date:
                     target_policy_doc.policy_end_date = p_end
 
                 target_policy_doc.processing_status = "completed"

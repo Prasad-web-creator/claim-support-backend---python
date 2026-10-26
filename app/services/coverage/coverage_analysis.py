@@ -455,7 +455,10 @@ def _format_item_card(
     
     # Normalize status to strictly one of 3 allowed values
     status_lower = str(current_status).strip().lower()
-    if "partially" in status_lower:
+    if "manual" in status_lower or "review" in status_lower:
+        final_status = "Manual Review"
+        is_covered = False
+    elif "partially" in status_lower:
         final_status = "Partially Covered"
         is_covered = True
     elif "not" in status_lower or "reject" in status_lower or "deni" in status_lower or "fail" in status_lower or "uncover" in status_lower:
@@ -493,18 +496,27 @@ def _format_item_card(
 
     p_start_comp = _format_date_compact(p_start_raw)
     p_end_comp = _format_date_compact(p_end_raw)
-    period_str = f"{p_start_comp or '15-01-2022'} to {p_end_comp or '10-01-2024'}"
+    period_str = f"{p_start_comp or 'Not available'} to {p_end_comp or 'Not available'}"
 
     cov_amt = policy_json.get("coverageAmount")
-    cov_str = f"₹{cov_amt:,}" if isinstance(cov_amt, (int, float)) and cov_amt > 0 else "₹5,00,000"
+    cov_str = f"₹{cov_amt:,}" if isinstance(cov_amt, (int, float)) and cov_amt > 0 else "the policy Sum Insured"
     waiting_days = policy_json.get("waitingPeriodDays") or 30
 
     blockers_str = " ".join(blockers or []).lower()
     code_str = (reason_code or "").upper()
 
     # Determine status reason, policy evidence, and financial status
+    # Undecided: the automated analysis could not reach a decision for this item
+    if final_status == "Manual Review":
+        status_reason = (
+            f"Coverage for {item_name} could not be confirmed automatically from the policy and prescription. "
+            f"This item has been referred for manual review."
+        )
+        policy_evidence = f"Period of Insurance : {period_str}. Decision pending manual review."
+        financial_status = "Payable amount will be confirmed after manual review."
+
     # Case 0: All Blockers Aggregation
-    if final_status == "Not Covered" and blockers and len(blockers) > 0:
+    elif final_status == "Not Covered" and blockers and len(blockers) > 0:
         is_covered = False
         reasons_list = "\n".join(f"• {b}" for b in blockers)
         status_reason = (
@@ -522,8 +534,8 @@ def _format_item_card(
     elif "POLICY_EXPIRED" in code_str or "expir" in blockers_str or "after policy" in blockers_str:
         final_status = "Not Covered"
         is_covered = False
-        end_disp = p_end_read or "10 January 2024"
-        visit_disp = v_date_read or "15 March 2024"
+        end_disp = p_end_read or "the policy end date"
+        visit_disp = v_date_read or "the treatment date"
         status_reason = (
             f"Your insurance policy expired on {end_disp}. Your doctor visit was on {visit_disp}. "
             f"Claims cannot be paid for treatments taken after the policy has ended. Under your policy terms, "
@@ -541,8 +553,8 @@ def _format_item_card(
     elif "POLICY_NOT_YET_EFFECTIVE" in code_str or "prior to policy start" in blockers_str:
         final_status = "Not Covered"
         is_covered = False
-        start_disp = p_start_read or "01 January 2024"
-        visit_disp = v_date_read or "15 December 2023"
+        start_disp = p_start_read or "the policy start date"
+        visit_disp = v_date_read or "the treatment date"
         status_reason = (
             f"Your insurance policy starts on {start_disp}. Your doctor visit was on {visit_disp}. "
             f"Claims cannot be paid for medical consultations or treatments received prior to the policy inception date. "
@@ -694,7 +706,7 @@ def _format_item_card(
 
 
 def _generate_fallback_comparison(prescription_json: dict, policy_json: dict | None = None) -> list[dict]:
-    """Generates a structured comparison array if the AI fails to produce one."""
+    """Item list used when the AI produced none; nothing was decided, so items await manual review."""
     comparison = []
     
     if not prescription_json:
@@ -706,10 +718,10 @@ def _generate_fallback_comparison(prescription_json: dict, policy_json: dict | N
         raw_item = {
             "item": str(diag),
             "itemType": "Diagnosis",
-            "coverageStatus": "Not Covered",
+            "coverageStatus": "Manual Review",
             "isCovered": False,
         }
-        comparison.append(_format_item_card(raw_item, policy_json, prescription_json, override_status="Not Covered"))
+        comparison.append(_format_item_card(raw_item, policy_json, prescription_json, override_status="Manual Review"))
             
     # Tests
     for test in prescription_json.get("medicalTests", []):
@@ -717,10 +729,10 @@ def _generate_fallback_comparison(prescription_json: dict, policy_json: dict | N
             raw_item = {
                 "item": test.get("name"),
                 "itemType": "Test",
-                "coverageStatus": "Not Covered",
+                "coverageStatus": "Manual Review",
                 "isCovered": False,
             }
-            comparison.append(_format_item_card(raw_item, policy_json, prescription_json, override_status="Not Covered"))
+            comparison.append(_format_item_card(raw_item, policy_json, prescription_json, override_status="Manual Review"))
             
     # Procedures
     for proc in prescription_json.get("procedures", []):
@@ -728,9 +740,9 @@ def _generate_fallback_comparison(prescription_json: dict, policy_json: dict | N
             raw_item = {
                 "item": proc.get("name"),
                 "itemType": "Procedure",
-                "coverageStatus": "Not Covered",
+                "coverageStatus": "Manual Review",
                 "isCovered": False,
             }
-            comparison.append(_format_item_card(raw_item, policy_json, prescription_json, override_status="Not Covered"))
+            comparison.append(_format_item_card(raw_item, policy_json, prescription_json, override_status="Manual Review"))
             
     return comparison

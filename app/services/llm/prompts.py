@@ -114,6 +114,9 @@ Return ONLY a valid JSON object with the following fields:
 - icu (string or null)
 - emergency (string or null)
 - dayCare (string or null)
+- preHospitalizationDays (number or null) — days BEFORE admission for which medical expenses are covered
+- postHospitalizationDays (number or null) — days AFTER discharge for which medical expenses are covered
+- modernTreatmentsLimit (string or null) — limit on modern treatment methods / robotic surgery exactly as written, e.g. "Up to 50% of Sum Insured"
 - preExistingDiseases (string or null)
 - networkHospitalRules (string or null)
 - coPay (string or null)
@@ -355,7 +358,8 @@ POLICY_FIELDS = [
     "policyStartDate", "policyEndDate", "coverageAmount", "waitingPeriodDays",
     "roomEligibility", "coveredDiseases", "excludedDiseases", "coveredTreatments",
     "excludedTreatments", "medicinesCoverage", "medicalTestsCoverage",
-    "hospitalization", "icu", "emergency", "dayCare", "preExistingDiseases",
+    "hospitalization", "icu", "emergency", "dayCare", "preHospitalizationDays",
+    "postHospitalizationDays", "modernTreatmentsLimit", "preExistingDiseases",
     "networkHospitalRules", "coPay", "deductibles", "specialConditions", "notes",
 ]
 

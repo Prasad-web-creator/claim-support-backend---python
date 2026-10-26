@@ -30,9 +30,6 @@ def parse_flexible_date(val: Any) -> Optional[date]:
     if not s or s.lower() in ("unknown", "null", "none", "n/a", "undefined", ""):
         return None
 
-    # Handle ISO timestamps with time/tz parts
-    clean_s = s.split("T")[0].split(" ")[0].strip()
-
     formats = (
         "%Y-%m-%d",
         "%d/%m/%Y",
@@ -42,15 +39,27 @@ def parse_flexible_date(val: Any) -> Optional[date]:
         "%Y/%m/%d",
         "%d-%b-%Y",
         "%d-%B-%Y",
+        "%d %b %Y",
+        "%d %B %Y",
         "%b %d, %Y",
         "%B %d, %Y",
+        "%b %d %Y",
+        "%B %d %Y",
     )
 
-    for fmt in formats:
-        try:
-            return datetime.strptime(clean_s, fmt).date()
-        except Exception:
-            continue
+    # Documents print dates with times and suffixes ("12-Oct-2026, 09:40 AM",
+    # "01-Apr-2026 00:00 Hrs", "1st April 2026"), so strip those before matching.
+    no_time = re.sub(r"[T,]?\s*\d{1,2}:\d{2}.*$", "", s)
+    no_time = re.sub(r"\b(hrs|hours|midnight|noon)\b.*$", "", no_time, flags=re.IGNORECASE)
+    no_time = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", no_time, flags=re.IGNORECASE).strip(" ,")
+    candidates = [s, no_time, s.split("T")[0].split(" ")[0].strip()]
+
+    for clean_s in candidates:
+        for fmt in formats:
+            try:
+                return datetime.strptime(clean_s, fmt).date()
+            except Exception:
+                continue
 
     # Try epoch timestamp
     try:
@@ -61,6 +70,15 @@ def parse_flexible_date(val: Any) -> Optional[date]:
     except Exception:
         pass
 
+    return None
+
+
+def first_parsed_date(*values: Any) -> Optional[date]:
+    """First value that parses as a date; an unreadable field does not hide a readable one after it."""
+    for v in values:
+        d = parse_flexible_date(v)
+        if d:
+            return d
     return None
 
 

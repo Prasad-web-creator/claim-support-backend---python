@@ -15,7 +15,7 @@ from app.services.rule_engine.models import (
     RuleEvidence,
 )
 from app.services.rule_engine.date_utils import (
-    parse_flexible_date,
+    first_parsed_date,
     check_policy_period,
 )
 
@@ -33,26 +33,26 @@ class PolicyValidityEvaluator:
         results: List[RuleCheckResult] = []
 
         # 1. Parse policy dates
-        start_date = parse_flexible_date(
-            policy_data.get("policyStartDate")
-            or policy_data.get("policyEffectiveDate")
-            or policy_data.get("effectiveFrom")
-            or policy_data.get("inceptionDate")
+        start_date = first_parsed_date(
+            policy_data.get("policyStartDate"),
+            policy_data.get("policyEffectiveDate"),
+            policy_data.get("effectiveFrom"),
+            policy_data.get("inceptionDate"),
         )
-        end_date = parse_flexible_date(
-            policy_data.get("policyEndDate")
-            or policy_data.get("policyExpirationDate")
-            or policy_data.get("effectiveTo")
-            or policy_data.get("expiryDate")
+        end_date = first_parsed_date(
+            policy_data.get("policyEndDate"),
+            policy_data.get("policyExpirationDate"),
+            policy_data.get("effectiveTo"),
+            policy_data.get("expiryDate"),
         )
 
         # 2. Parse treatment/consultation date
-        treatment_date = parse_flexible_date(
-            prescription_data.get("visitDate")
-            or prescription_data.get("consultationDate")
-            or prescription_data.get("treatmentDate")
-            or prescription_data.get("admissionDate")
-            or as_of_date
+        treatment_date = first_parsed_date(
+            prescription_data.get("visitDate"),
+            prescription_data.get("consultationDate"),
+            prescription_data.get("treatmentDate"),
+            prescription_data.get("admissionDate"),
+            as_of_date,
         )
 
         # Fallback for self-entered queries if no date given

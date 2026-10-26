@@ -17,7 +17,7 @@ from app.services.rule_engine.models import (
     NormalizedCondition,
 )
 from app.services.rule_engine.date_utils import (
-    parse_flexible_date,
+    first_parsed_date,
     completed_calendar_months,
     days_between,
 )
@@ -103,15 +103,16 @@ class WaitingPeriodEvaluator:
     ) -> List[RuleCheckResult]:
         results: List[RuleCheckResult] = []
 
-        start_date = parse_flexible_date(
-            policy_data.get("policyStartDate")
-            or policy_data.get("policyEffectiveDate")
-            or policy_data.get("effectiveFrom")
+        start_date = first_parsed_date(
+            policy_data.get("policyStartDate"),
+            policy_data.get("policyEffectiveDate"),
+            policy_data.get("effectiveFrom"),
         )
-        treatment_date = parse_flexible_date(
-            prescription_data.get("visitDate")
-            or prescription_data.get("consultationDate")
-            or prescription_data.get("treatmentDate")
+        treatment_date = first_parsed_date(
+            prescription_data.get("visitDate"),
+            prescription_data.get("consultationDate"),
+            prescription_data.get("treatmentDate"),
+            prescription_data.get("admissionDate"),
         )
 
         if not start_date or not treatment_date:
@@ -123,10 +124,10 @@ class WaitingPeriodEvaluator:
 
         # 1. Pre-Existing Disease (PED) Check
         is_ped = prescription_data.get("isPreExisting") is True
-        diag_date = parse_flexible_date(
-            prescription_data.get("diagnosisDate")
-            or prescription_data.get("diseaseOnsetDate")
-            or prescription_data.get("symptomOnsetDate")
+        diag_date = first_parsed_date(
+            prescription_data.get("diagnosisDate"),
+            prescription_data.get("diseaseOnsetDate"),
+            prescription_data.get("symptomOnsetDate"),
         )
         if diag_date and diag_date < start_date:
             is_ped = True

@@ -64,6 +64,63 @@ NEUTRAL_BENCHMARK_STANDARDS = {
 }
 
 
+# Comparison chips, best to worst for the analysed policy. Worded from the
+# policy holder's side; the app colours them by level.
+SAME_AS_BEST = "Same as best plan"
+BEST_OFFERS_MORE = "Best plan offers more"
+MAY_COST_EXTRA = "May cost you extra"
+NOT_COVERED_YOU_PAY = "Not covered - you pay"
+NOT_STATED = "Not stated in policy"
+
+
+def _policy_search_text(policy_json: Dict[str, Any]) -> str:
+    """Every extracted value as one lowercase string, for wording-based lookups."""
+    import json
+    return json.dumps(policy_json, default=str, ensure_ascii=False).lower()
+
+
+def _as_days(value: Any) -> Optional[int]:
+    try:
+        days = int(float(str(value).strip()))
+        return days if 0 < days <= 730 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _hospitalization_windows(policy_json: Dict[str, Any]) -> tuple:
+    """(pre_days, post_days) from the extracted fields, else from policy wording; None when not stated."""
+    pre = _as_days(policy_json.get("preHospitalizationDays"))
+    post = _as_days(policy_json.get("postHospitalizationDays"))
+    text = _policy_search_text(policy_json)
+    if pre is None:
+        m = (re.search(r"(\d{1,3})\s*days?\s*(?:immediately\s+)?(?:prior to|before)\s+(?:the\s+)?(?:date of\s+)?(?:admission|hospitali[sz]ation)", text)
+             or re.search(r"pre[- ]?hospitali[sz]ation[^0-9]{0,40}?(\d{1,3})\s*days", text))
+        pre = _as_days(m.group(1)) if m else None
+    if post is None:
+        m = (re.search(r"(\d{1,3})\s*days?\s*(?:immediately\s+)?(?:after|post|following)\s+(?:the\s+)?(?:date of\s+)?(?:discharge|hospitali[sz]ation)", text)
+             or re.search(r"post[- ]?hospitali[sz]ation[^0-9]{0,40}?(\d{1,3})\s*days", text))
+        post = _as_days(m.group(1)) if m else None
+    return pre, post
+
+
+def _modern_treatment_limit(policy_json: Dict[str, Any]) -> tuple:
+    """(display text, capped) for modern treatments; (None, None) when the policy does not state it."""
+    stated = str(policy_json.get("modernTreatmentsLimit") or "").strip()
+    text = stated.lower() if stated else _policy_search_text(policy_json)
+    m = (re.search(r"modern treatment[^.\"]{0,120}?(\d{1,3})\s*%\s*of\s*(?:the\s*)?sum insured", text)
+         or (re.search(r"(\d{1,3})\s*%\s*of\s*(?:the\s*)?sum insured", text) if stated else None))
+    if m and int(m.group(1)) < 100:
+        return stated or f"Up to {int(m.group(1))}% of Sum Insured", True
+    if re.search(r"modern treatment[^.\"]{0,80}?(?:rs\.?|inr|₹)\s*[\d,]+", text) or (
+            stated and re.search(r"(?:rs\.?|inr|₹)\s*[\d,]+|sub-?limit", text)):
+        return stated or "Subject to a monetary sub-limit", True
+    if any(kw in text for kw in ("modern treatment sublimit", "robotic surgery cap", "sub-limit on modern")):
+        return stated or "Subject to Sub-limits", True
+    if stated or re.search(r"modern treatment[^.\"]{0,80}?(?:up to (?:the )?(?:full )?sum insured|100\s*%)", text):
+        return stated or "Covered up to Sum Insured", False
+    return None, None
+
+
 def _benchmark_standard(key: str) -> str:
     """Benchmark wording for display: neutral text where a brand name exists."""
     return NEUTRAL_BENCHMARK_STANDARDS.get(key) or str(BENCHMARK_POLICY_SPEC.get(key) or "")
@@ -192,7 +249,7 @@ def generate_reference_comparison(
         "feature": "Base Sum Insured",
         "userPolicy": user_si_str,
         "benchmarkStandard": BENCHMARK_POLICY_SPEC["baseSumInsured"],
-        "comparisonStatus": "Superior Benchmark" if "unlimited" not in _clean_str(user_si_str) else "Parity",
+        "comparisonStatus": BEST_OFFERS_MORE if "unlimited" not in _clean_str(user_si_str) else SAME_AS_BEST,
         "insight": "Benchmark plan provides limitless coverage from Day 1 with zero capping on admissible claims."
     })
 
@@ -203,7 +260,7 @@ def generate_reference_comparison(
         "feature": "Room Rent Category",
         "userPolicy": str(user_room).strip(),
         "benchmarkStandard": _benchmark_standard("roomRentCategory"),
-        "comparisonStatus": "Parity" if is_room_unlimited else "Potential Gap",
+        "comparisonStatus": SAME_AS_BEST if is_room_unlimited else MAY_COST_EXTRA,
         "insight": "Room rent capping often causes proportionate deductions across the entire hospital bill. Benchmark covers Any Room without deduction."
     })
 
@@ -218,27 +275,38 @@ def generate_reference_comparison(
         "feature": "Consumables & Non-Payables",
         "userPolicy": "Covered via Rider" if has_consumables else "Excluded by Default (Standard IRDAI Lists I-IV)",
         "benchmarkStandard": _benchmark_standard("consumablesCoverage"),
-        "comparisonStatus": "Parity" if has_consumables else "Coverage Gap",
+        "comparisonStatus": SAME_AS_BEST if has_consumables else NOT_COVERED_YOU_PAY,
         "insight": "Consumable items (gloves, PPE, syringes, administrative fees) make up 10-15% of a modern hospital bill. The benchmark reimburses them in full."
     })
 
-    # D. Modern Treatments
-    has_modern_capping = any(kw in exclusions_text for kw in ["modern treatment sublimit", "robotic surgery cap", "sub-limit on modern"])
+    # D. Modern Treatments (read from the policy; never assumed)
+    modern_text, modern_capped = _modern_treatment_limit(policy_json)
     feature_comparisons.append({
         "feature": "Modern Treatments & Robotic Surgery",
-        "userPolicy": "Subject to Sub-limits" if has_modern_capping else "Covered up to Sum Insured",
+        "userPolicy": modern_text or "Not stated in the policy",
         "benchmarkStandard": BENCHMARK_POLICY_SPEC["modernTreatments"],
-        "comparisonStatus": "Potential Gap" if has_modern_capping else "Parity",
+        "comparisonStatus": NOT_STATED if modern_capped is None else (MAY_COST_EXTRA if modern_capped else SAME_AS_BEST),
         "insight": "Advanced treatments like robotic surgeries, stem cell therapies, and balloon sinuplasty are covered up to full Sum Insured in the benchmark standard."
     })
 
-    # E. Pre & Post Hospitalization Duration
+    # E. Pre & Post Hospitalization Duration (read from the policy; never assumed)
+    bench_pre = BENCHMARK_POLICY_SPEC["preHospitalizationDays"]
+    bench_post = BENCHMARK_POLICY_SPEC["postHospitalizationDays"]
+    pre_days, post_days = _hospitalization_windows(policy_json)
+    if pre_days is None and post_days is None:
+        window_text, window_status = "Not stated in the policy", NOT_STATED
+    else:
+        window_text = f"{pre_days if pre_days is not None else 'Not stated'} Days Pre / " \
+                      f"{post_days if post_days is not None else 'Not stated'} Days Post"
+        shorter = (pre_days is not None and pre_days < bench_pre) or (post_days is not None and post_days < bench_post)
+        complete = pre_days is not None and post_days is not None
+        window_status = MAY_COST_EXTRA if shorter else (SAME_AS_BEST if complete else NOT_STATED)
     feature_comparisons.append({
         "feature": "Pre & Post Hospitalization Coverage",
-        "userPolicy": "Standard 30 Days Pre / 60 Days Post",
-        "benchmarkStandard": f"{BENCHMARK_POLICY_SPEC['preHospitalizationDays']} Days Pre / {BENCHMARK_POLICY_SPEC['postHospitalizationDays']} Days Post",
-        "comparisonStatus": "Extended Window in Benchmark",
-        "insight": "Benchmark provides 6 months (180 days) post-discharge follow-up tests, medicines, and consultation coverage."
+        "userPolicy": window_text,
+        "benchmarkStandard": f"{bench_pre} Days Pre / {bench_post} Days Post",
+        "comparisonStatus": window_status,
+        "insight": f"Benchmark covers medical expenses {bench_pre} days before admission and {bench_post} days after discharge (follow-up tests, medicines and consultations)."
     })
 
     # ──────────────────────────────────────────────────────────────────────────

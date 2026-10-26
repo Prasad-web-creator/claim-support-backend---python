@@ -2741,6 +2741,7 @@ CRITICAL RULES FOR QUESTIONS:
 - Only ask new, relevant questions.
 - Reuse previously collected information from the history.
 - Do not ask duplicate or semantically equivalent questions.
+- Whenever a question asks for a date (consultation, admission, symptom onset, diagnosis), use "type": "date" with an empty "options" array so the user picks the exact date from a calendar. NEVER offer relative choices such as "Today", "Yesterday", "Last month" or "Last year" for a date.
 
 MANDATORY QUESTIONNAIRE PER ANALYSIS TYPE (ROUND 1):
 1. FOR UPLOADED PRESCRIPTION DOCUMENTS:
@@ -2780,10 +2781,10 @@ MANDATORY QUESTIONNAIRE PER ANALYSIS TYPE (ROUND 1):
         "id": "prescription_treatment_date",
         "category": "eligibility",
         "title": "Treatment / Consultation Date",
-        "question": "The uploaded prescription does not show a clear consultation date. When did you visit the doctor or receive this treatment?",
-        "type": "single_choice",
+        "question": "The uploaded prescription does not show a clear consultation date. On which date did you visit the doctor or receive this treatment?",
+        "type": "date",
         "required": true,
-        "options": ["Today", "Yesterday", "Within past 7 days", "Pre-existing / past visit date"],
+        "options": [],
         "reason": "Required to verify policy active dates and check waiting periods from policy start date."
       }
 
@@ -2794,15 +2795,10 @@ MANDATORY QUESTIONNAIRE PER ANALYSIS TYPE (ROUND 1):
         "id": "symptom_onset_duration",
         "category": "clinical",
         "title": "Symptom Onset & Duration",
-        "question": "When did your symptoms, pain, or medical condition first begin? Did it start today or on an earlier date?",
-        "type": "single_choice",
+        "question": "On which date did your symptoms, pain, or medical condition first begin? An approximate date is fine.",
+        "type": "date",
         "required": true,
-        "options": [
-          "Started today / suddenly (Acute onset - New illness)",
-          "Diagnosed more than 2 years ago (Long-standing pre-existing)",
-          "Diagnosed 1 to 2 years ago (Pre-existing)",
-          "Diagnosed within past 1 to 6 months before policy"
-        ],
+        "options": [],
         "reason": "Needed to determine whether this is an acute illness or a pre-existing condition, and calculate waiting period compliance."
       }
    b) Past Medical History / Pre-Existing Status:
