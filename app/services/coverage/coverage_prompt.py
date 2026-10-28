@@ -22,7 +22,7 @@ A professional insurance claim adjudication engine MUST follow this strict prior
    (Consultation date within Policy Start & End dates; Pre-existing disease (PED) onset check; Waiting period completion check.)
         ↓
 3. Missing Information & Clinical Intake Clarification  ← INTERACTIVE GATE
-   (If treatment date, symptom onset, or critical clinical history is missing, bundle all questions into a single questionnaire.)
+   (Uploaded prescriptions only: if treatment date, symptom onset, or critical clinical history is missing, bundle all questions into a single questionnaire. Self-entered prescriptions are never asked questions.)
         ↓
 4. Medical Necessity & Clinical Causation Reasoning
         ↓
@@ -2733,7 +2733,7 @@ Return this if you have high confidence (e.g. >80%) and all necessary informatio
 ```
 
 **Case 2: Need Clarification (Ask Questions)**
-MANDATORY PROTOCOL: To ensure 100% accuracy and prevent assumptions, EVERY coverage analysis session MUST start with an interactive user questionnaire (Round 1) whenever "PREVIOUS CLARIFICATION HISTORY" is empty.
+MANDATORY PROTOCOL: To ensure 100% accuracy and prevent assumptions, every UPLOADED prescription analysis MUST start with an interactive user questionnaire (Round 1) whenever "PREVIOUS CLARIFICATION HISTORY" is empty. Self-entered prescriptions NEVER get questions (see 2 below).
 
 CRITICAL RULES FOR QUESTIONS:
 - ALL questions for the session MUST be returned together in a SINGLE "questions" array so that the mobile app presents them in ONE unified dialog box.
@@ -2758,7 +2758,8 @@ MANDATORY QUESTIONNAIRE PER ANALYSIS TYPE (ROUND 1):
           "Outpatient consultation (OPD / Clinic)",
           "Admitted to hospital (Inpatient > 24 hours)",
           "Daycare procedure (< 24 hours in hospital)",
-          "Planned future admission"
+          "Planned future admission",
+          "Not decided yet"
         ],
         "reason": "Needed to verify Inpatient/Daycare policy eligibility versus OPD exclusions."
       }
@@ -2788,53 +2789,25 @@ MANDATORY QUESTIONNAIRE PER ANALYSIS TYPE (ROUND 1):
         "reason": "Required to verify policy active dates and check waiting periods from policy start date."
       }
 
-2. FOR MANUAL / SELF-ENTERED PRESCRIPTIONS (DOCTOR-STYLE CLINICAL INTAKE):
-   When PRESCRIPTION SOURCE is "Self-entered Prescription (Manual Text)" and no previous clarification history is present, you MUST act like a doctor conducting a structured clinical intake and return ALL of the following in the single "questions" array:
-   a) Symptom Onset & Duration:
-      {
-        "id": "symptom_onset_duration",
-        "category": "clinical",
-        "title": "Symptom Onset & Duration",
-        "question": "On which date did your symptoms, pain, or medical condition first begin? An approximate date is fine.",
-        "type": "date",
-        "required": true,
-        "options": [],
-        "reason": "Needed to determine whether this is an acute illness or a pre-existing condition, and calculate waiting period compliance."
-      }
-   b) Past Medical History / Pre-Existing Status:
-      {
-        "id": "past_medical_history",
-        "category": "eligibility",
-        "title": "Past Medical History",
-        "question": "Have you ever been diagnosed with or treated for this condition before your insurance policy start date?",
-        "type": "single_choice",
-        "required": true,
-        "options": [
-          "No, this is the first time (New illness)",
-          "Yes, previously diagnosed / pre-existing condition"
-        ],
-        "reason": "Required to evaluate Pre-Existing Disease (PED) clauses and policy waiting periods."
-      }
-   c) Hospitalization / Admission Status:
-      {
-        "id": "hospitalization_status",
-        "category": "clinical",
-        "title": "Hospital Admission Status",
-        "question": "Is hospital admission required for this treatment?",
-        "type": "single_choice",
-        "required": true,
-        "options": [
-          "Outpatient consultation (OPD / Clinic)",
-          "Inpatient admission (> 24 hours)",
-          "Daycare procedure",
-          "Not required"
-        ],
-        "reason": "Required to evaluate hospitalization room rent and daycare clauses."
-      }
+2. FOR MANUAL / SELF-ENTERED PRESCRIPTIONS: NO QUESTIONS.
+   A self-entered prescription is a check made BEFORE treatment: "If I go to hospital for this today, is it covered?".
+   It is answered from the typed text, TODAY'S DATE and the policy document only.
+   - NEVER return "ask_questions" for a self-entered prescription. Return "generate_report" directly.
+   - Do not ask for or validate patient name, member details, doctor, hospital, admission date or symptom onset.
+   - The treatment date is today (the Evaluation Date). Check the policy period and every waiting period against today.
+   - Evaluate it as a hospital admission (in-patient or day care) unless the text says out-patient.
+   - Accept ANY medical term (symptom, illness, disease, procedure, test, medicine, pregnancy), even a single word.
+   - Use the POLICY CLAUSE SEARCH result: quote the policy passages that name the term exactly. When the policy does
+     not name it, explain the decision from the governing clauses (benefit, definitions, waiting periods, exclusions).
+   - Where the answer depends on facts the text does not give (for example whether the condition existed before the
+     cover started, or a stay of 24 hours or more), state the condition and its effect in the reason instead of asking.
+   - Show, for each term, Covered / Not Covered / Covered after the waiting period ends (with the date).
 
 DECISION RULES FOR WAITING PERIODS & PRE-EXISTING DISEASES:
-- The Policy Start Date (policyStartDate) is the anchor for all waiting period calculations.
-- Days Active = Consultation/Treatment Date - Policy Start Date.
+- Waiting periods are counted from the start of CONTINUOUS cover: "Waiting periods count from" in the APPLICABLE POLICY section (the first inception date before renewals, declared by the user). Only when it is absent, use the Policy Start Date (policyStartDate).
+- Whether the policy is ACTIVE on the treatment date is always checked against the current Policy Start and Expiry dates, never the inception date.
+- Days Active = Consultation/Treatment Date - waiting period start.
+- When a waiting period is not yet completed, state the date from which the condition becomes covered.
 - If a condition is Pre-Existing (diagnosed or onset before policy start date), the required waiting period is the policy's PED / specific waiting period (e.g. 150 days, 1/2/3/4 years).
 - If Days Active < Required Waiting Period: The Coverage Status MUST be "Not Covered" with explicit reason: "Pre-existing condition. Policy has a {waitingDays}-day waiting period from policy start date. Only {daysActive} days have elapsed."
 - If Days Active >= Required Waiting Period: Waiting period is satisfied.

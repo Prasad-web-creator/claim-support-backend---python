@@ -14,6 +14,13 @@ from app.services.rule_engine.models import (
     RuleEvidence,
     NormalizedCondition,
 )
+from app.services.rule_engine.policy_exclusions import (
+    claim_texts,
+    find_exclusion_clause,
+    find_schedule_not_covered,
+    match_policy_exclusion,
+    policy_exclusion_entries,
+)
 
 
 class ExclusionEvaluator:
@@ -97,36 +104,67 @@ class ExclusionEvaluator:
                     )
                 )
 
-        # 2. Evaluate against Policy Contractual Excluded Diseases List
-        excluded_diseases = [
-            str(d).strip().lower()
-            for d in (policy_data.get("excludedDiseases") or policy_data.get("exclusions") or [])
-            if d
-        ]
-
-        if excluded_diseases:
-            for norm in normalized_conditions:
-                text_lower = norm.original_text.lower()
-                norm_lower = norm.normalized_value.lower()
-                for excl in excluded_diseases:
-                    if excl in text_lower or text_lower in excl or excl in norm_lower:
-                        results.append(
-                            RuleCheckResult(
-                                rule_type=RuleType.PERMANENT_EXCLUSION,
-                                rule_id="EXCL-CONTRACT-001",
-                                condition=norm.normalized_value,
-                                status=RuleStatus.FAILED,
-                                reason_code=ReasonCode.PERMANENT_EXCLUSION,
-                                description=f"Contractual Exclusion: Diagnosis '{norm.original_text}' is explicitly listed in policy exclusions list.",
-                                evidence=RuleEvidence(
-                                    source_document=policy_data.get("sourceDocument") or "Policy_Document.pdf",
-                                    page=1,
-                                    section="Schedule of Exclusions",
-                                    text_snippet=f"Explicitly excluded illness: {excl}",
-                                    authority_level="CONTRACTUAL_POLICY_WORDING",
-                                ),
-                                metadata={"excludedDisease": excl, "originalText": norm.original_text},
-                            )
-                        )
+        # 2. Evaluate against the exclusions written in the customer's own policy
+        contract_result = cls._evaluate_policy_exclusions(policy_data, prescription_data)
+        if contract_result:
+            results.append(contract_result)
 
         return results
+
+    @staticmethod
+    def _evaluate_policy_exclusions(
+        policy_data: Dict[str, Any],
+        prescription_data: Dict[str, Any],
+    ) -> Optional[RuleCheckResult]:
+        """
+        Matches the claim against excludedDiseases / excludedTreatments / exclusions and
+        quotes the policy clause that states the exclusion.
+
+        The description is "<reason> - <policy wording>" so the report can show the
+        reason and the quoted wording separately.
+        """
+        match = match_policy_exclusion(claim_texts(prescription_data), policy_exclusion_entries(policy_data))
+        if not match:
+            return None
+
+        policy_text = policy_data.get("policyText")
+        claimed = match["claimText"]
+        clause = find_exclusion_clause(policy_text, match["term"])
+        schedule_row = find_schedule_not_covered(policy_text, match["term"])
+
+        if clause:
+            clause_ref = f"{clause['section']} {clause['title']}"
+            reason = f"{claimed} is permanently excluded under policy clause {clause_ref}"
+            wording = f"{clause_ref}: \"{clause['wording']}\""
+        else:
+            clause_ref = "Policy Exclusions"
+            reason = f"{claimed} is permanently excluded under this policy (listed exclusion: \"{match['entry']}\")"
+            wording = f"Policy exclusion: \"{match['entry']}\""
+        if schedule_row:
+            reason += f", and the policy schedule states \"{schedule_row}\""
+            wording += f" Policy schedule: \"{schedule_row}\"."
+        reason += ". The waiting period does not apply because this treatment is never covered under the policy."
+        # " - " separates reason from wording, so it must not appear inside the reason.
+        reason = reason.replace(" - ", " – ")
+
+        return RuleCheckResult(
+            rule_type=RuleType.PERMANENT_EXCLUSION,
+            rule_id=f"EXCL-CONTRACT-{clause['code'].upper().replace(' ', '')}" if clause and clause["code"] else "EXCL-CONTRACT-001",
+            condition=match["term"].upper(),
+            status=RuleStatus.FAILED,
+            reason_code=ReasonCode.PERMANENT_EXCLUSION,
+            description=f"{reason} - {wording}",
+            evidence=RuleEvidence(
+                source_document=policy_data.get("sourceDocument") or "Policy_Document.pdf",
+                section=clause_ref,
+                clause_id=clause["code"] if clause else "",
+                text_snippet=clause["wording"] if clause else match["entry"],
+                authority_level="CONTRACTUAL_POLICY_WORDING",
+            ),
+            metadata={
+                "excludedEntry": match["entry"],
+                "matchedTerm": match["term"],
+                "originalText": claimed,
+                "scheduleRow": schedule_row,
+            },
+        )

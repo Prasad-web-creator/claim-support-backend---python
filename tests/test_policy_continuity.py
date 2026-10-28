@@ -11,6 +11,7 @@ from app.services.coverage.policy_continuity import (
     STATUS_UNKNOWN,
     STATUS_VERIFIED,
     evaluate_policy_continuity,
+    declared_policy_continuity,
     parse_policy_date,
     resolve_claim_date,
 )
@@ -271,3 +272,171 @@ def test_continuity_extraction_marker():
     assert not needs_continuity_extraction(pj)
     # The continuity pass never overwrites the main extraction.
     assert pj["policyStartDate"] == "2025-01-01"
+
+
+# ─── Declared Policy Continuity (UI Spec Requirements) ───────────────────────
+
+def test_declared_policy_continuity_verified_no_gaps():
+    pj = {
+        "declaredInceptionDate": "2022-04-01",
+        "policyStartDate": "2025-04-01",
+        "policyEndDate": "2026-03-31",
+        "continuousRenewal": True,
+        "insuranceCompany": "Star Health",
+        "policyNumber": "STAR-12345",
+    }
+    rx = {"admissionDate": "2025-08-15"}
+    result = declared_policy_continuity(pj, rx)
+
+    assert result is not None
+    assert result["status"] == STATUS_VERIFIED
+    # 1. Original Policy Start Date is manually entered inception date
+    assert result["originalPolicyStartDate"] == "2022-04-01"
+    assert result["originalPolicyStartSource"] == "Entered by you"
+    # 2. Current Policy Period is retrieved from uploaded policy document
+    assert result["currentPolicy"]["startDate"] == "2025-04-01"
+    assert result["currentPolicy"]["endDate"] == "2026-03-31"
+    assert result["currentPolicy"]["label"] == "Star Health (STAR-12345)"
+    # 3. Continuity Status is verified with no gaps
+    assert result["coverageGaps"] == []
+    # 4. Claim date retrieved from admission date
+    assert result["claimDate"] == "2025-08-15"
+    assert result["claimDateSource"] == "Admission date"
+    # 5. Policies Evaluated and Continuity Evidence removed
+    assert result["policiesEvaluated"] == []
+    assert result["continuityEvidence"] == []
+
+
+def test_declared_policy_continuity_gap_when_renewal_had_break():
+    pj = {
+        "declaredInceptionDate": "2020-01-01",
+        "policyStartDate": "2025-01-01",
+        "policyEndDate": "2025-12-31",
+        "continuousRenewal": False,
+        "coverRestartDate": "2024-01-01",
+    }
+    rx = {"consultationDate": "2025-05-10"}
+    result = declared_policy_continuity(pj, rx)
+
+    assert result is not None
+    # Gaps detected -> not verified
+    assert result["status"] == STATUS_GAP
+    assert len(result["coverageGaps"]) == 1
+    assert result["claimDate"] == "2025-05-10"
+    assert result["claimDateSource"] == "Consultation date"
+
+
+def test_declared_policy_continuity_gap_when_claim_after_end_date():
+    pj = {
+        "declaredInceptionDate": "2022-01-01",
+        "policyStartDate": "2024-01-01",
+        "policyEndDate": "2024-12-31",
+        "continuousRenewal": True,
+    }
+    rx = {"admissionDate": "2025-02-15"}
+    result = declared_policy_continuity(pj, rx)
+
+    assert result is not None
+    # Claim date after policy end date -> GAP
+    assert result["status"] == STATUS_GAP
+    assert len(result["coverageGaps"]) == 1
+    assert result["coverageGaps"][0]["from"] == "2025-01-01"
+    assert result["coverageGaps"][0]["to"] == "2025-02-15"
+
+
+def test_declared_policy_continuity_fallback_to_consultation_date():
+    pj = {
+        "declaredInceptionDate": "2023-01-01",
+        "policyStartDate": "2025-01-01",
+        "policyEndDate": "2025-12-31",
+        "continuousRenewal": True,
+    }
+    # No admissionDate, only consultationDate
+    rx = {"consultationDate": "2025-06-20", "diagnosis": "Fever"}
+    result = declared_policy_continuity(pj, rx)
+
+    assert result is not None
+    assert result["status"] == STATUS_VERIFIED
+    assert result["claimDate"] == "2025-06-20"
+    assert result["claimDateSource"] == "Consultation date"
+
+
+def test_evaluate_policy_continuity_uses_manual_inputs_not_document_extraction():
+    """
+    Even when the policy document PDF mentions previous policies and continuous cover
+    from 2024-04-01, the user's manual inputs (inception 2023-04-01, renewed without break: No,
+    restart: 2025-04-01) MUST be used as the original start date and continuity basis.
+    """
+    pj = {
+        # Manually entered on upload
+        "inceptionDate": "2023-04-01",
+        "continuousRenewal": False,
+        "coverRestartDate": "2025-04-01",
+        # Extracted from policy PDF
+        "policyStartDate": "2026-04-01",
+        "policyEndDate": "2027-03-31",
+        "insuranceCompany": "Prakriti Insurance",
+        "policyNumber": "PGI-HL-26-4410287",
+        # Text/clauses from policy PDF that previously caused false verification
+        "continuousCoverageSince": "2024-04-01",
+        "previousPolicyNumber": "PGI/HL/24/3307419",
+        "previousPolicyStartDate": "2024-04-01",
+        "previousPolicyEndDate": "2026-03-31",
+        "isRenewal": True,
+    }
+    # Prescription document
+    rx = {
+        "admissionDate": "2026-10-12",
+        "diagnosis": "Hernia",
+    }
+
+    result = evaluate_policy_continuity([{"policyId": "P1", "policyJson": pj}], rx, current_policy_id="P1")
+
+    assert result is not None
+    # 1. Original Policy Start Date MUST be from manual inputs (2023-04-01), NOT document (2024-04-01)
+    assert result["originalPolicyStartDate"] == "2023-04-01"
+    assert result["originalPolicyStartSource"] == "Entered by you"
+
+    # 2. Current Policy Period MUST be from the policy PDF
+    assert result["currentPolicy"]["startDate"] == "2026-04-01"
+    assert result["currentPolicy"]["endDate"] == "2027-03-31"
+
+    # 3. Claim Date MUST be from prescription document
+    assert result["claimDate"] == "2026-10-12"
+    assert result["claimDateSource"] == "Admission date"
+
+    # 4. Status MUST NOT be verified because renewal had a break
+    assert result["status"] == STATUS_GAP
+    assert len(result["coverageGaps"]) == 1
+    assert "Break in renewal before 01 Apr 2025" in result["coverageGaps"][0]["description"]
+    assert "You entered that the renewals had a break" in result["summary"]
+
+
+def test_evaluate_policy_continuity_verified_when_renewed_without_break():
+    """
+    When renewal was without a break, status is verified from the manual inception date.
+    """
+    pj = {
+        "declaredInceptionDate": "2023-04-01",
+        "continuousRenewal": True,
+        "policyStartDate": "2026-04-01",
+        "policyEndDate": "2027-03-31",
+        "insuranceCompany": "Care Health",
+        "policyNumber": "CARE-1234",
+    }
+    rx = {
+        "admissionDate": "2026-10-12",
+        "diagnosis": "Fever",
+    }
+
+    result = evaluate_policy_continuity([{"policyId": "P1", "policyJson": pj}], rx, current_policy_id="P1")
+
+    assert result is not None
+    assert result["status"] == STATUS_VERIFIED
+    assert result["originalPolicyStartDate"] == "2023-04-01"
+    assert result["currentPolicy"]["startDate"] == "2026-04-01"
+    assert result["currentPolicy"]["endDate"] == "2027-03-31"
+    assert result["claimDate"] == "2026-10-12"
+    assert result["coverageGaps"] == []
+    assert "Cover has continued without interruption from 01 Apr 2023" in result["summary"]
+

@@ -54,6 +54,8 @@ class AnalysisReport(Document):
     reference_comparison: Optional[dict] = Field(default_factory=dict, alias="referenceComparison")
     # Deterministic Policy Continuity Check (see app/services/coverage/policy_continuity.py).
     policy_continuity: Optional[dict] = Field(default_factory=dict, alias="policyContinuity")
+    # Policy terms (exact wording) that make the analysis Not Covered, across all items.
+    major_terms: Optional[List[dict]] = Field(default_factory=list, alias="majorTerms")
 
     # ─── Snapshot Caches ──────────────────────────────────────────────────────
     policy_json: Optional[dict] = Field(default_factory=dict, alias="policyJson")
@@ -136,6 +138,7 @@ class AnalysisReport(Document):
         "policy_clauses_used",
         "prescription_evidence",
         "clarification_answers_used",
+        "major_terms",
         mode="before",
     )
     @classmethod

@@ -416,15 +416,8 @@ async def run_analysis_pipeline(
         prescription_json = validation["validatedPrescriptionJson"]
 
         if is_manual_rx:
-            from datetime import datetime
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            prescription_json["isManual"] = True
-            prescription_json["prescriptionSource"] = "Self-entered Prescription"
-            prescription_json["manualText"] = rx_text
-            if not prescription_json.get("visitDate"):
-                prescription_json["visitDate"] = today_str
-            if not prescription_json.get("consultationDate"):
-                prescription_json["consultationDate"] = today_str
+            from app.services.analysis_interactive_orchestrator import _apply_manual_prescription_defaults
+            _apply_manual_prescription_defaults(prescription_json, rx_text)
             if rx_doc:
                 rx_doc.extracted_prescription_text = rx_text
                 rx_doc.extracted_prescription_json = prescription_json
@@ -493,7 +486,8 @@ async def run_analysis_pipeline(
         logger.info("[Rule Engine] Evaluating policy rules, waiting periods, and exclusions...")
         br_results = enforce_business_rules(
             report.policy_json,
-            report.prescription_json
+            report.prescription_json,
+            policy_text=report.policy_text,
         )
         report.business_rules = br_results
         det_res = br_results.get("deterministicResult") or {}
@@ -562,6 +556,7 @@ async def run_analysis_pipeline(
         report.summary = final_report.get("summary")
         report.comparison = final_report.get("comparison")
         report.reference_comparison = final_report.get("referenceComparison") or {}
+        report.major_terms = final_report.get("majorTerms") or []
         report.processing_time_ms = processing_time
         
         await report.save()

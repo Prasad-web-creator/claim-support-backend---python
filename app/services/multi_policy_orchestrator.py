@@ -27,7 +27,7 @@ from app.models.analysis_session import AnalysisSession
 from app.models.multi_policy_session import MultiPolicyAnalysisSession, PolicyAnalysisEntry
 from app.models.policy import Policy
 from app.services.coverage.policy_comparison import build_comparison_summary
-from app.services.coverage.policy_continuity import evaluate_policy_continuity
+from app.services.coverage.policy_continuity import evaluate_policy_continuity, declared_policy_continuity
 from app.services.extraction.json_validation import validate_extracted_json
 from app.services.extraction.policy_extraction import extract_policy_details
 from app.services.extraction.prescription_extraction import extract_prescription_details
@@ -265,26 +265,40 @@ async def evaluate_session_continuity(parent: MultiPolicyAnalysisSession) -> tup
         policy_json = (report.policy_json if report and report.policy_json else None) or (
             policy.extracted_policy_json if policy else None
         ) or {}
+        policy_json = dict(policy_json)
+        if policy:
+            from app.services.coverage.policy_continuity import declared_policy_inputs
+            policy_json.update(declared_policy_inputs(policy))
+            if getattr(policy, "policy_start_date", None) and "policyStartDate" not in policy_json:
+                policy_json["policyStartDate"] = policy.policy_start_date.isoformat() if hasattr(policy.policy_start_date, "isoformat") else str(policy.policy_start_date)
+            if getattr(policy, "policy_end_date", None) and "policyEndDate" not in policy_json:
+                policy_json["policyEndDate"] = policy.policy_end_date.isoformat() if hasattr(policy.policy_end_date, "isoformat") else str(policy.policy_end_date)
+
         label = "" if is_placeholder_policy_name(entry.policy_name) else (entry.policy_name or "")
         inputs.append({
             "policyId": entry.policy_id,
             "label": label,
             "policyJson": policy_json,
             "fallbackStartDate": policy.policy_start_date if policy else None,
+            "declaredInceptionDate": policy_json.get("declaredInceptionDate"),
+            "continuousRenewal": policy_json.get("continuousRenewal"),
+            "coverRestartDate": policy_json.get("coverRestartDate"),
         })
         if report is not None:
             reports[entry.policy_id] = report
             # A clarification answer may have corrected this policy's treatment date.
             claim_rx[entry.policy_id] = report.prescription_json or None
 
-    results = {
-        entry.policy_id: evaluate_policy_continuity(
+    results = {}
+    for entry in parent.policy_analyses:
+        inp = next((i for i in inputs if i["policyId"] == entry.policy_id), None)
+        pj = (inp.get("policyJson") if inp else None) or {}
+        rx = claim_rx.get(entry.policy_id) or parent.prescription_json or {}
+        results[entry.policy_id] = declared_policy_continuity(pj, rx) or evaluate_policy_continuity(
             inputs,
-            claim_rx.get(entry.policy_id) or parent.prescription_json or {},
+            rx,
             current_policy_id=entry.policy_id,
         )
-        for entry in parent.policy_analyses
-    }
     return results, reports
 
 

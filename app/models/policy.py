@@ -22,6 +22,15 @@ class Policy(Document):
     policy_type: Optional[str] = Field(default="", alias="policyType", max_length=255)
     policy_start_date: Optional[Union[datetime, str]] = Field(default=None, alias="policyStartDate")
     policy_end_date: Optional[Union[datetime, str]] = Field(default=None, alias="policyEndDate")
+    # Continuity declared by the user. Waiting periods run from the inception date
+    # (first start, before any renewals), or from the restart date after a break.
+    inception_date: Optional[Union[datetime, str]] = Field(default=None, alias="inceptionDate")
+    # False for a new (first-year) policy, True for a renewed one.
+    is_renewal: Optional[bool] = Field(default=None, alias="isRenewal")
+    continuous_renewal: Optional[bool] = Field(default=None, alias="continuousRenewal")
+    # The one break in renewals: cover lapsed on break_start_date and began again on cover_restart_date.
+    break_start_date: Optional[Union[datetime, str]] = Field(default=None, alias="breakStartDate")
+    cover_restart_date: Optional[Union[datetime, str]] = Field(default=None, alias="coverRestartDate")
     coverage_amount: Optional[float] = Field(default=0.0, alias="coverageAmount", ge=0)
     status: str = Field(default="Active", max_length=50)
     grid_fs_file_id: Optional[str] = Field(default="", alias="gridFsFileId")

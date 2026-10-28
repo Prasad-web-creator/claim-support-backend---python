@@ -5,7 +5,7 @@ waiting periods, and pre-existing disease (PED) waiting periods using
 exact calendar month arithmetic.
 """
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict, Any, List, Optional
 
 from app.services.rule_engine.models import (
@@ -20,7 +20,15 @@ from app.services.rule_engine.date_utils import (
     first_parsed_date,
     completed_calendar_months,
     days_between,
+    add_calendar_months,
 )
+
+# Words that mark an accidental injury, which is covered from day 1.
+ACCIDENT_TERMS = ("accident", "injury", "injured", "trauma", "fracture", "fall from", "road traffic", "burn")
+
+
+def _fmt(d: date) -> str:
+    return d.strftime("%d-%b-%Y")
 
 
 class WaitingPeriodEvaluator:
@@ -103,7 +111,10 @@ class WaitingPeriodEvaluator:
     ) -> List[RuleCheckResult]:
         results: List[RuleCheckResult] = []
 
+        # Waiting periods run from the declared start of continuous cover (inception
+        # before renewals); without it, from the current policy period start.
         start_date = first_parsed_date(
+            policy_data.get("waitingPeriodStartDate"),
             policy_data.get("policyStartDate"),
             policy_data.get("policyEffectiveDate"),
             policy_data.get("effectiveFrom"),
@@ -121,6 +132,8 @@ class WaitingPeriodEvaluator:
 
         completed_months = completed_calendar_months(start_date, treatment_date)
         elapsed_days = days_between(start_date, treatment_date)
+        basis = policy_data.get("waitingPeriodBasis") or f"Cover started on {_fmt(start_date)}"
+        served = f"{basis}: {completed_months} months of continuous cover on {_fmt(treatment_date)}."
 
         # 1. Pre-Existing Disease (PED) Check
         is_ped = prescription_data.get("isPreExisting") is True
@@ -146,11 +159,10 @@ class WaitingPeriodEvaluator:
                     status=RuleStatus.PASSED if passed else RuleStatus.FAILED,
                     reason_code=ReasonCode.WAITING_PERIOD_COMPLETED if passed else ReasonCode.WAITING_PERIOD_ACTIVE,
                     description=(
-                        f"Pre-Existing Disease (PED) waiting period satisfied: Policy active for {completed_months} full months "
-                        f"(Required: {ped_months} months)."
+                        f"Pre-existing disease waiting period of {ped_months} months completed. {served}"
                         if passed
-                        else f"Pre-Existing Disease (PED) waiting period ACTIVE: Policy active for {completed_months} full months "
-                        f"(Required: {ped_months} months). Claim is not currently payable."
+                        else f"Pre-existing disease has a {ped_months}-month waiting period. {served} "
+                        f"Covered from {_fmt(add_calendar_months(start_date, ped_months))}."
                     ),
                     evidence=RuleEvidence(
                         source_document=policy_data.get("sourceDocument") or "Policy_Document.pdf",
@@ -181,11 +193,10 @@ class WaitingPeriodEvaluator:
                         status=RuleStatus.PASSED if passed else RuleStatus.FAILED,
                         reason_code=ReasonCode.WAITING_PERIOD_COMPLETED if passed else ReasonCode.WAITING_PERIOD_ACTIVE,
                         description=(
-                            f"Specific waiting period satisfied for {meta['title']}: Policy active for {completed_months} full months "
-                            f"(Required: {req_months} months)."
+                            f"{meta['title']}: {req_months}-month waiting period completed. {served}"
                             if passed
-                            else f"Specific waiting period ACTIVE for {meta['title']}: Policy active for {completed_months} full months "
-                            f"(Required: {req_months} months). Condition is NOT currently covered."
+                            else f"{meta['title']} has a {req_months}-month waiting period. {served} "
+                            f"Covered from {_fmt(add_calendar_months(start_date, req_months))}."
                         ),
                         evidence=RuleEvidence(
                             source_document=meta["sourceDocument"],
@@ -205,10 +216,11 @@ class WaitingPeriodEvaluator:
                 )
 
         # 3. Initial 30-Day Waiting Period (for non-accidental illnesses during first month)
-        is_accident = (
-            "accident" in (prescription_data.get("diagnosis") or "").lower()
-            or prescription_data.get("isAccidental") is True
-        )
+        clinical_text = " ".join(
+            [str(prescription_data.get("diagnosis") or "")]
+            + [str(s) for s in (prescription_data.get("symptoms") or [])]
+        ).lower()
+        is_accident = prescription_data.get("isAccidental") is True or any(t in clinical_text for t in ACCIDENT_TERMS)
         if not is_accident and elapsed_days < 30:
             results.append(
                 RuleCheckResult(
@@ -219,7 +231,11 @@ class WaitingPeriodEvaluator:
                     completed_months=0,
                     status=RuleStatus.FAILED,
                     reason_code=ReasonCode.WAITING_PERIOD_ACTIVE,
-                    description=f"Initial 30-day waiting period active: Claim occurred {elapsed_days} days after inception (Required: 30 days).",
+                    description=(
+                        f"Initial 30-day waiting period: illnesses are not covered in the first 30 days. {basis}: "
+                        f"only {elapsed_days} days of cover on {_fmt(treatment_date)}. "
+                        f"Covered from {_fmt(start_date + timedelta(days=30))}."
+                    ),
                     evidence=RuleEvidence(
                         source_document="Standard_Terms.pdf",
                         page=1,

@@ -395,20 +395,40 @@ async def get_analysis(
         except Exception:
             pass
 
-    # Policy Continuity: evaluated across the whole session for multi-policy
-    # reports; computed on read for reports saved before the check existed.
+    # Policy Continuity: manual inputs are checked first (original start date and renewal break).
+    # If not declared, evaluated across the session for multi-policy or computed on read.
     try:
         from app.services.multi_policy_orchestrator import continuity_for_report
-        from app.services.coverage.policy_continuity import evaluate_policy_continuity
-        session_continuity = await continuity_for_report(report)
-        if session_continuity:
-            d["policyContinuity"] = session_continuity
-        elif not d.get("policyContinuity") and not str(d.get("overallStatus") or "").startswith("Invalid"):
-            d["policyContinuity"] = evaluate_policy_continuity(
-                [{"policyId": report.policy_id, "policyJson": d.get("policyJson") or {}}],
-                d.get("prescriptionJson"),
-                current_policy_id=report.policy_id,
-            )
+        from app.services.coverage.policy_continuity import evaluate_policy_continuity, declared_policy_continuity
+
+        pj = dict(d.get("policyJson") or {})
+        rx = d.get("prescriptionJson") or {}
+
+        # Ensure manual inputs from Policy database record are present in pj
+        if report.policy_id:
+            try:
+                from app.models.policy import Policy
+                from bson import ObjectId
+                pol = await Policy.get(ObjectId(report.policy_id))
+                if pol:
+                    from app.services.coverage.policy_continuity import declared_policy_inputs
+                    pj.update(declared_policy_inputs(pol))
+            except Exception:
+                pass
+
+        declared = declared_policy_continuity(pj, rx)
+        if declared:
+            d["policyContinuity"] = declared
+        else:
+            session_continuity = await continuity_for_report(report)
+            if session_continuity:
+                d["policyContinuity"] = session_continuity
+            elif not d.get("policyContinuity") and not str(d.get("overallStatus") or "").startswith("Invalid"):
+                d["policyContinuity"] = evaluate_policy_continuity(
+                    [{"policyId": report.policy_id, "policyJson": pj}],
+                    rx,
+                    current_policy_id=report.policy_id,
+                )
     except Exception:
         pass
 

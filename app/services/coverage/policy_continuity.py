@@ -520,6 +520,135 @@ def _period_row(p: _Period, role: str, reason: str = "") -> dict:
     return row
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Continuity declared by the user
+# ──────────────────────────────────────────────────────────────────────────────
+
+def declared_policy_inputs(policy) -> dict:
+    """The continuity answers the user gave for a Policy record, keyed as policy_json expects them."""
+    def iso(v):
+        return v.isoformat() if hasattr(v, "isoformat") else str(v)
+
+    out: dict = {}
+    if getattr(policy, "inception_date", None):
+        out["declaredInceptionDate"] = out["inceptionDate"] = iso(policy.inception_date)
+    if getattr(policy, "is_renewal", None) is not None:
+        out["isRenewal"] = policy.is_renewal
+    if getattr(policy, "continuous_renewal", None) is not None:
+        out["continuousRenewal"] = policy.continuous_renewal
+    if getattr(policy, "break_start_date", None):
+        out["breakStartDate"] = iso(policy.break_start_date)
+    if getattr(policy, "cover_restart_date", None):
+        out["coverRestartDate"] = out["restartDate"] = iso(policy.cover_restart_date)
+    return out
+
+
+def declared_policy_continuity(policy_json: Optional[dict], prescription_json: Optional[dict]) -> Optional[dict]:
+    """
+    Continuity from the user's own inputs: the inception date they entered and whether
+    renewals had a break, checked against the current period printed in the policy
+    document and the admission / consultation date on the prescription.
+    Verified only when there is no gap. None when the user declared no inception date.
+    """
+    pj = policy_json or {}
+    inception_val = (
+        pj.get("declaredInceptionDate")
+        or pj.get("inceptionDate")
+        or pj.get("policyInceptionDate")
+        or pj.get("userEnteredInceptionDate")
+    )
+    inception = parse_policy_date(inception_val)
+    if not inception:
+        return None
+    start = parse_policy_date(pj.get("policyStartDate") or pj.get("startDate"))
+    end = parse_policy_date(pj.get("policyEndDate") or pj.get("endDate"))
+    if not start or not end:
+        curr = pj.get("currentPolicy")
+        if isinstance(curr, dict):
+            start = start or parse_policy_date(curr.get("startDate"))
+            end = end or parse_policy_date(curr.get("endDate"))
+
+    restart_val = pj.get("coverRestartDate") or pj.get("restartDate")
+    restart = parse_policy_date(restart_val)
+    break_start = parse_policy_date(pj.get("breakStartDate"))
+
+    # A new (first-year) policy has no renewals, so it cannot have a break.
+    is_new = pj.get("isRenewal") is not None and not _bool(pj.get("isRenewal"))
+    continuous_val = pj.get("continuousRenewal")
+    if continuous_val is None:
+        continuous_val = pj.get("renewedWithoutBreak")
+    continuous = True if is_new else (_bool(continuous_val) if continuous_val is not None else True)
+
+    claim, claim_source = resolve_claim_date(prescription_json)
+
+    insurer = _text(pj.get("insuranceCompany"))
+    number = _text(pj.get("policyNumber"))
+    label = f"{insurer} ({number})" if insurer and number else (insurer or number or "Current policy")
+
+    gaps: List[dict] = []
+    if not claim:
+        status = STATUS_UNKNOWN
+        summary = "The admission or consultation date is not available, so continuity up to the claim date cannot be checked."
+    elif not start or not end:
+        status = STATUS_UNKNOWN
+        summary = "The current policy period could not be read from the uploaded policy document."
+    elif claim < inception:
+        status = STATUS_UNKNOWN
+        summary = (f"The claim date {_fmt(claim)} is before the policy inception date you entered "
+                   f"({_fmt(inception)}), so it is not covered by this policy.")
+    elif claim > end:
+        status = STATUS_GAP
+        summary = f"The current policy ended on {_fmt(end)}, before the claim date {_fmt(claim)}."
+        gaps.append({"from": _iso(end + timedelta(days=1)), "to": _iso(claim), "days": (claim - end).days,
+                     "description": "No active policy on the claim date."})
+    elif not continuous:
+        status = STATUS_GAP
+        break_text = f" Cover lapsed on {_fmt(break_start)}." if break_start else ""
+        restart_text = f" Cover restarted on {_fmt(restart)}; waiting periods count from that date." if restart else ""
+        summary = (f"You entered that the renewals had a break since the policy was first taken on "
+                   f"{_fmt(inception)}.{break_text}{restart_text}")
+        gap_to = restart - timedelta(days=1) if restart else None
+        if break_start and restart:
+            description = f"No cover from {_fmt(break_start)} until cover restarted on {_fmt(restart)}."
+        elif restart:
+            description = f"Break in renewal before {_fmt(restart)}."
+        else:
+            description = "Break in renewal."
+        gaps.append({
+            "from": _iso(break_start) if break_start else None,
+            "to": _iso(gap_to) if gap_to else None,
+            "days": (restart - break_start).days if break_start and restart else None,
+            "description": description,
+        })
+    elif is_new:
+        status = STATUS_VERIFIED
+        summary = (f"This is a new policy, first taken on {_fmt(inception)}. Cover has been active from that date "
+                   f"to the claim date {_fmt(claim)}.")
+    else:
+        status = STATUS_VERIFIED
+        summary = f"Cover has continued without interruption from {_fmt(inception)} to the claim date {_fmt(claim)}."
+
+    return {
+        "status": status,
+        "statusCode": STATUS_CODES[status],
+        "summary": summary,
+        "declared": True,
+        "originalPolicyStartDate": _iso(inception),
+        "originalPolicyStartSource": "Entered by you",
+        "coverRestartDate": _iso(restart) if not continuous and restart else None,
+        "breakStartDate": _iso(break_start) if not continuous and break_start else None,
+        "isRenewal": None if pj.get("isRenewal") is None else _bool(pj.get("isRenewal")),
+        "currentPolicy": {"label": label, "startDate": _iso(start), "endDate": _iso(end)},
+        "claimDate": _iso(claim),
+        "claimDateSource": claim_source,
+        "coverageGaps": gaps,
+        "continuityConflicts": [],
+        "missingInformation": [],
+        "policiesEvaluated": [],
+        "continuityEvidence": [],
+    }
+
+
 def evaluate_policy_continuity(
     policies: List[dict],
     prescription_json: Optional[dict],
@@ -532,6 +661,35 @@ def evaluate_policy_continuity(
     — every policy document available for this claim. `current_policy_id` is the
     policy the report is about; when omitted the first policy is used.
     """
+    # ── Check manual inputs first (declared inception / continuity) ─────────
+    target_entry = None
+    if current_policy_id:
+        target_entry = next((p for p in policies if str(p.get("policyId")) == str(current_policy_id)), None)
+    if not target_entry and policies:
+        target_entry = policies[0]
+
+    if target_entry:
+        target_pj = target_entry.get("policyJson") if isinstance(target_entry.get("policyJson"), dict) else target_entry
+        target_pj_copy = dict(target_pj)
+        for key in (
+            "declaredInceptionDate",
+            "inceptionDate",
+            "policyInceptionDate",
+            "userEnteredInceptionDate",
+            "isRenewal",
+            "continuousRenewal",
+            "renewedWithoutBreak",
+            "breakStartDate",
+            "coverRestartDate",
+            "restartDate",
+        ):
+            if key not in target_pj_copy and key in target_entry:
+                target_pj_copy[key] = target_entry[key]
+
+        declared = declared_policy_continuity(target_pj_copy, prescription_json)
+        if declared is not None:
+            return declared
+
     ev = _build(policies)
     claim_date, claim_source = resolve_claim_date(prescription_json)
 
@@ -856,3 +1014,5 @@ def _summary(status, original_start, claim_date, gaps, conflicts, missing) -> st
         return "The policy documents disagree about the coverage history: " + conflicts[0]
     reason = missing[0] if missing else "The documents do not contain enough information."
     return "Continuity cannot be established from the documents provided. " + reason
+
+

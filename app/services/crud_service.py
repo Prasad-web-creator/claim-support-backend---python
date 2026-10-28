@@ -78,21 +78,28 @@ class CrudService:
         except Exception:
             return None
             
+        # A raw $set must use the key Mongo stores, which is the field's alias
+        # (e.g. "inceptionDate"), never the Python name ("inception_date"): a value
+        # written under the Python name is ignored when the document is read back.
+        fields_dict = type(doc).model_fields
+        by_alias = {(info.alias or name): name for name, info in fields_dict.items()}
         update_data = {}
-        fields_dict = getattr(doc, "model_fields", getattr(doc, "__fields__", {}))
+        stray_keys = {}
         for k, v in data.items():
-            if hasattr(doc, k):
-                update_data[k] = v
-            else:
-                for field_name, field_info in fields_dict.items():
-                    alias = getattr(field_info, "alias", None)
-                    if alias == k:
-                        update_data[field_name] = v
-                        break
-        if hasattr(doc, "updated_by"):
-            update_data["updated_by"] = user_id
-        
-        await doc.update({"$set": update_data})
+            field_name = k if k in fields_dict else by_alias.get(k)
+            if not field_name:
+                continue
+            mongo_key = fields_dict[field_name].alias or field_name
+            update_data[mongo_key] = v
+            if mongo_key != field_name:
+                stray_keys[field_name] = ""
+        if "updated_by" in fields_dict:
+            update_data[fields_dict["updated_by"].alias or "updated_by"] = user_id
+
+        update_ops = {"$set": update_data}
+        if stray_keys:
+            update_ops["$unset"] = stray_keys
+        await doc.update(update_ops)
         
         await ActivityLog(
             user_id=user_id,

@@ -6,9 +6,10 @@ Executes deterministic business rules on extracted JSON data.
 from datetime import datetime
 
 
-def enforce_business_rules(policy: dict, prescription: dict) -> dict:
+def enforce_business_rules(policy: dict, prescription: dict, policy_text: str | None = None) -> dict:
     """
     Executes a suite of deterministic business rules against the extracted data.
+    `policy_text`, when given, lets exclusions be cited with the policy's own clause wording.
 
     Returns:
         {
@@ -373,7 +374,7 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
                     evaluate_rule(
                         "consultationDateValid",
                         False,
-                        f"[Pre-Effective Policy Window] Consultation date ({c_date_raw}) is on policy issuance date ({policy.get('policyIssuedDate') or '04-feb-2026'}) prior to risk inception ({policy.get('policyStartDate')}). Coverage has not commenced.",
+                        f"[Pre-Effective Policy Window] Consultation date ({c_date_raw}) is on policy issuance date ({policy.get('policyIssuedDate') or 'the issue date'}) prior to risk inception ({policy.get('policyStartDate')}). Coverage has not commenced.",
                         blocker=True,
                     )
                 else:
@@ -445,10 +446,13 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
         waiting_days = policy.get("waitingPeriodDays")
         ped_waiting_days = policy.get("pedWaitingPeriodDays") or waiting_days
 
-        is_ped = prescription.get("isPreExisting") is True or (diag_date and p_start and diag_date < p_start)
+        # Waiting periods run from the declared start of continuous cover (inception
+        # before renewals); validity above still uses the current period.
+        wp_start = _parse_date(policy.get("waitingPeriodStartDate")) or p_start
+        is_ped = prescription.get("isPreExisting") is True or (diag_date and wp_start and diag_date < wp_start)
 
-        if p_start and visit_date:
-            days_active = (visit_date - p_start).days
+        if wp_start and visit_date:
+            days_active = (visit_date - wp_start).days
             months_active = max(0, days_active // 30)
 
             # Pre-Existing Disease Check
@@ -527,15 +531,20 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
     # STAGE 3 — DIAGNOSIS, CARE SETTING & EXCLUSIONS
     # ===========================================================
 
-    # 10. Diagnosis Excluded Check
-    diagnosis = (prescription.get("diagnosis") or "").lower()
-    excluded_diseases = [d.lower() for d in (policy.get("excludedDiseases") or []) if d]
-    if diagnosis and excluded_diseases:
-        failed = any(d in diagnosis or diagnosis in d for d in excluded_diseases)
-        if failed:
-            evaluate_rule("diagnosisExcluded", False, f"[Explicit Diagnosis Exclusion] Diagnosis '{prescription.get('diagnosis')}' is explicitly excluded under policy terms.", blocker=True)
-        else:
-            evaluate_rule("diagnosisExcluded", True, "Diagnosis is not in the excluded list")
+    # 10. Diagnosis / Treatment Excluded Check (excludedDiseases, excludedTreatments, exclusions)
+    from app.services.rule_engine.policy_exclusions import claim_texts, match_policy_exclusion, policy_exclusion_entries
+    exclusion_entries = policy_exclusion_entries(policy)
+    claimed_texts = claim_texts(prescription)
+    excl_match = match_policy_exclusion(claimed_texts, exclusion_entries) if claimed_texts else None
+    excl_reason = None
+    if excl_match:
+        excl_reason = (
+            f"[Explicit Policy Exclusion] '{excl_match['claimText']}' is excluded under policy terms "
+            f"(listed exclusion: \"{excl_match['entry']}\")."
+        )
+        evaluate_rule("diagnosisExcluded", False, excl_reason, blocker=True)
+    elif claimed_texts and exclusion_entries:
+        evaluate_rule("diagnosisExcluded", True, "Diagnosis is not in the excluded list")
     else:
         evaluate_rule("diagnosisExcluded", True, "No excluded diseases list to check against")
 
@@ -568,13 +577,33 @@ def enforce_business_rules(policy: dict, prescription: dict) -> dict:
             True,
             "Day Care Procedure recognized under Clause 1.6 & 2.1(a) (less than 24 hours stay allowed for advanced surgical procedures).",
         )
+    elif hosp_req_val is False:
+        # The user confirmed an out-patient consultation only (no admission, no day care).
+        policy_cover_text = " ".join(
+            str(policy.get(k) or "") for k in ("coveredTreatments", "coverages", "medicinesCoverage", "specialConditions", "riders")
+        ).lower()
+        has_opd_cover = any(k in policy_cover_text for k in ("opd cover", "opd benefit", "out-patient cover", "outpatient cover", "outpatient benefit", "befit"))
+        evaluate_rule(
+            "outpatientCovered",
+            has_opd_cover,
+            "Out-patient treatment without hospital admission is not covered under this policy. It is covered only when "
+            "admitted to hospital (24 hours or more) or for a listed day care procedure.",
+            blocker=not has_opd_cover,
+        )
 
     # ===========================================================
     # STAGE 4 — DETERMINISTIC COVERAGE RULE ENGINE & AGGREGATION
     # ===========================================================
     try:
         from app.services.rule_engine import CoverageRuleEngine
-        decision = CoverageRuleEngine.evaluate(policy, prescription)
+        from app.services.rule_engine.models import RuleStatus, RuleType
+        decision = CoverageRuleEngine.evaluate({**policy, "policyText": policy_text} if policy_text else policy, prescription)
+        # The engine reports the same policy exclusion with the clause wording; keep only that one.
+        if excl_reason and any(
+            r.rule_type == RuleType.PERMANENT_EXCLUSION and r.status == RuleStatus.FAILED and (r.rule_id or "").startswith("EXCL-CONTRACT")
+            for r in decision.rule_results
+        ):
+            results["blockers"] = [b for b in results["blockers"] if b != excl_reason]
         results["deterministicResult"] = decision.model_dump(mode="json", by_alias=True)
         results["decision"] = decision.status.value
         results["reasonCode"] = decision.reason_code.value

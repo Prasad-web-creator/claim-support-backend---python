@@ -165,6 +165,7 @@ CRITICAL RULES:
 5. Preserve dates exactly.
 6. Preserve medicine names, hospital names, and doctor names exactly.
 7. patientName must be the FULL name exactly as written on the prescription (including any title like Mr./Mrs./Dr.).
+8. Short or free-text inputs (e.g. a user typing a single term) that name a medical condition, medical specialty, type of care, or treatment area — such as "Obstetrics", "Maternity", "Pregnancy", "Gynaecology", "Dialysis", "Chemotherapy", "Physiotherapy", "Cardiology", "Orthopaedics" — MUST be recorded in diagnosis, preserving the user's wording exactly. Do not leave diagnosis null when the text contains such a medical term.
 
 Return ONLY a valid JSON object with the following fields:
 - patientName (string) — full name exactly as on the prescription

@@ -107,6 +107,15 @@ async def connect_to_mongodb() -> None:
         ],
     )
 
+    # Values the CRUD update once wrote under Python field names are moved to the
+    # keys Beanie reads (see app/models/legacy_keys.py). Idempotent.
+    from app.models.legacy_keys import repair_field_name_keys
+    for model in (Policy, Prescription):
+        try:
+            await repair_field_name_keys(model)
+        except Exception as e:
+            logger.warning(f"[Data Repair] {model.__name__} key repair skipped: {e}")
+
     # Initialize GridFS bucket
     _gridfs_bucket = AsyncIOMotorGridFSBucket(db, bucket_name="fs")
 

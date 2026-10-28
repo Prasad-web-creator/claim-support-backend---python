@@ -5,6 +5,7 @@ import time
 import asyncio
 from beanie import PydanticObjectId as ObjectId
 import json
+import re
 from app.core.logging import logger, log_section
 from app.models.analysis_report import AnalysisReport
 from app.models.analysis_session import AnalysisSession, ClarificationQuestion, ClarificationAnswer
@@ -18,6 +19,7 @@ from app.services.extraction.json_validation import validate_extracted_json
 from app.services.extraction.policy_continuity_extraction import CONTINUITY_KEY, ensure_continuity_fields
 from app.services.coverage.business_rules import enforce_business_rules
 from app.services.coverage.coverage_analysis import analyze_coverage
+from app.services.coverage.policy_continuity import declared_policy_inputs
 from app.services.coverage.report_generator import generate_report
 from app.services.rule_engine.date_utils import parse_flexible_date
 from app.services.llm.ai_client import AnalysisCostTracker, set_current_cost_tracker, get_current_cost_tracker
@@ -128,6 +130,76 @@ def _parse_and_format_date(date_val):
     return None, None
 
 
+def _as_date(value):
+    parsed, _ = _parse_and_format_date(value)
+    return parsed.date() if parsed else None
+
+
+def _apply_declared_inception(policy_json: dict, policy_doc):
+    """
+    Put the waiting-period start the user declared for this policy into policy_json:
+    the first inception date (before any renewals), or the date cover restarted after a
+    break. Policy validity still uses the
+    current period from the document. Returns the start date, or None when not declared.
+    """
+    if not policy_doc or not getattr(policy_doc, "inception_date", None):
+        return None
+    inception = _as_date(policy_doc.inception_date)
+    if not inception:
+        return None
+    current_start = _as_date(policy_json.get("policyStartDate"))
+
+    if getattr(policy_doc, "is_renewal", None) is False:
+        start = inception
+        basis = f"Based on your inputs, this is a new policy first taken on {inception:%d-%b-%Y}"
+    elif getattr(policy_doc, "continuous_renewal", None) is False:
+        restart = _as_date(getattr(policy_doc, "cover_restart_date", None))
+        start = restart or current_start or inception
+        basis = (f"Based on your inputs, cover restarted after a break on {start:%d-%b-%Y}"
+                 if restart else f"Based on your inputs, the renewals had a break, so cover counts from {start:%d-%b-%Y}")
+    else:
+        start = inception
+        basis = f"Based on your inputs, this policy was first taken on {inception:%d-%b-%Y} and renewed every year without a break"
+
+    if current_start and start > current_start:
+        # Cover cannot have started after the current period began.
+        start = current_start
+        basis = (f"The date you entered is after the current policy period starts, so waiting periods count "
+                 f"from {current_start:%d-%b-%Y}")
+
+    policy_json["waitingPeriodStartDate"] = start.isoformat()
+    policy_json["waitingPeriodBasis"] = basis
+    policy_json.update(declared_policy_inputs(policy_doc))
+    policy_json["declaredInceptionDate"] = policy_json["inceptionDate"] = inception.isoformat()
+    policy_json["continuousRenewal"] = getattr(policy_doc, "continuous_renewal", None)
+    # Dates as plain YYYY-MM-DD, like the inception date.
+    for key in ("coverRestartDate", "restartDate", "breakStartDate"):
+        parsed = _as_date(policy_json.get(key)) if policy_json.get(key) else None
+        if parsed:
+            policy_json[key] = parsed.isoformat()
+    return start
+
+
+def _inception_conflict_question(policy_json: dict, declared_start) -> Optional[dict]:
+    """Ask only when the policy document itself states a different continuous-cover start."""
+    block = policy_json.get(CONTINUITY_KEY) if isinstance(policy_json.get(CONTINUITY_KEY), dict) else {}
+    stated = _as_date(policy_json.get("continuousCoverageSince") or block.get("continuousCoverageSince"))
+    if not stated or stated == declared_start:
+        return None
+    mine, theirs = f"{declared_start:%d-%m-%Y}", f"{stated:%d-%m-%Y}"
+    return {
+        "id": "policy_inception_date_conflict",
+        "category": "eligibility",
+        "title": "Policy Inception Date",
+        "question": (f"The policy document states continuous cover since {theirs}, but you entered {mine}. "
+                     f"Which date should be used for waiting periods?"),
+        "type": "single_choice",
+        "required": True,
+        "options": [f"Use my entered date ({mine})", f"Use policy document date ({theirs})"],
+        "reason": "Waiting periods are counted from the date cover first started without a break.",
+    }
+
+
 def _date_from_answer(answer) -> Optional[datetime]:
     """A date from a clarification answer: a picked date ("14-Oct-2026"), an option containing one, or today/yesterday."""
     text = str(answer or "").strip()
@@ -208,6 +280,13 @@ async def _resolve_prescription_context(user_id: str, prescription_id: str) -> P
             rx_doc = None
 
     ctx = PrescriptionContext(prescription_id=prescription_id, target_file_id=prescription_id)
+    if not rx_doc and prescription_id and not re.fullmatch(r"[0-9a-fA-F]{24}", str(prescription_id).strip()):
+        # Not a record or file id: the app passed the typed prescription itself
+        # (e.g. "hernia" when saving the record failed). Treat it as manual text.
+        ctx.is_manual = True
+        ctx.manual_text = str(prescription_id).strip()
+        ctx.target_file_id = None
+        return ctx
     if rx_doc:
         ctx.rx_doc = rx_doc
         if rx_doc.is_manual:
@@ -257,16 +336,26 @@ async def _resolve_policy_context(
     return PolicyContext(policy_file_id=policy_file_id)
 
 
+OUTPATIENT_TERMS = ("opd", "outpatient", "out-patient", "out patient", "clinic visit", "no admission")
+
+
 def _apply_manual_prescription_defaults(prescription_json: dict, rx_text: str) -> dict:
-    """Tag self-entered prescriptions and default the visit/consultation dates to today."""
+    """
+    Tag self-entered prescriptions. They are a check before treatment ("if I go to hospital
+    for this today, is it covered?"), so the treatment date is always today and the case is
+    evaluated as a hospital admission unless the text says out-patient.
+    """
     today_str = datetime.now().strftime("%Y-%m-%d")
     prescription_json["isManual"] = True
     prescription_json["prescriptionSource"] = "Self-entered Prescription"
     prescription_json["manualText"] = rx_text
-    if not prescription_json.get("visitDate"):
-        prescription_json["visitDate"] = today_str
-    if not prescription_json.get("consultationDate"):
-        prescription_json["consultationDate"] = today_str
+    prescription_json["visitDate"] = today_str
+    prescription_json["consultationDate"] = today_str
+    if any(t in (rx_text or "").lower() for t in OUTPATIENT_TERMS):
+        prescription_json["hospitalizationRequired"] = False
+    else:
+        prescription_json["hospitalizationRequired"] = True
+        prescription_json["admissionAssumed"] = True
     return prescription_json
 
 
@@ -458,9 +547,20 @@ async def run_single_policy_analysis(
         policy_doc.extracted_policy_json = stored
         await policy_doc.save()
 
-    # Check for policy start date conflict between user manual input and document extraction
+    # Waiting periods run from the inception date the user declared (first start,
+    # before any renewals). The user's manual inputs are authoritative and not overridden by the document.
+    declared_start = _apply_declared_inception(policy_json, policy_doc)
+
+    # Policies saved before the inception question existed: the start date the user
+    # entered is checked against the document's current period start.
     user_entered_start_date = None
-    if policy_doc and policy_doc.policy_start_date:
+    if declared_start and getattr(policy_doc, "is_renewal", None) is False:
+        # A new policy starts on the date printed on it, so a different entered date is asked
+        # about. A renewed policy's first start is naturally earlier, so it is not.
+        user_entered_start_date = policy_doc.inception_date
+    elif declared_start:
+        pass
+    elif policy_doc and policy_doc.policy_start_date:
         user_entered_start_date = policy_doc.policy_start_date
     elif policy_ctx.policy_file_id:
         try:
@@ -520,7 +620,7 @@ async def run_single_policy_analysis(
     log_section("Rule Engine & Eligibility")
     logger.info("[Rule Engine] Evaluating policy rules, waiting periods, and exclusions...")
     await _report_stage(on_stage, "rule_engine")
-    br_results = enforce_business_rules(policy_json, prescription_json)
+    br_results = enforce_business_rules(policy_json, prescription_json, policy_text=policy_text)
     session.business_rules = br_results
     det_res = br_results.get("deterministicResult") or {}
     det_status = det_res.get("status") or ("ELIGIBLE" if br_results.get("overallEligible") else "NOT_ELIGIBLE")
@@ -637,6 +737,20 @@ async def start_analysis_session(
         await session.save()
         raise e
 
+def _manual_review_result(policy_json: dict, prescription_json: dict, br_results: dict, reason: str) -> dict:
+    """A complete Coverage Summary for an undecided case, so the app never opens an empty screen."""
+    report = generate_report(
+        policy_json=policy_json or {},
+        prescription_json=prescription_json or {},
+        business_rule_results=br_results or {},
+        coverage_analysis={"comparison": [], "summary": reason},
+        processing_time_ms=0,
+    )
+    report["status"] = "manual_review_required"
+    report["reason"] = reason
+    return report
+
+
 async def _run_llm_analysis(
     session: AnalysisSession,
     policy_json: dict,
@@ -655,7 +769,10 @@ async def _run_llm_analysis(
         logger.warning(f"[Claim Analysis] Session {session.id} exceeded max rounds. Forcing manual review.")
         session.status = "manual_review_required"
         await session.save()
-        return {"status": "manual_review_required", "reason": "Maximum clarification rounds exceeded."}
+        return _manual_review_result(
+            policy_json, prescription_json, br_results,
+            "The information provided was not enough to decide automatically. This case needs manual review.",
+        )
 
     # Format clarification history — match by both field name and alias
     clarification_history = []
@@ -747,7 +864,10 @@ async def _run_llm_analysis(
             logger.warning("[Claim Analysis] LLM returned duplicate or invalid questions. Forcing manual review.")
             session.status = "manual_review_required"
             await session.save()
-            return {"status": "manual_review_required", "reason": "AI generated duplicate or invalid questions."}
+            return _manual_review_result(
+                policy_json, prescription_json, br_results,
+                "Coverage could not be decided automatically from the information provided. This case needs manual review.",
+            )
 
         session.status = "waiting_for_user"
         tracker = get_current_cost_tracker()
@@ -810,7 +930,8 @@ async def _run_llm_analysis(
         processing_time_ms=total_processing_time,
         reference_comparison=final_report.get("referenceComparison") or {},
         policy_continuity=final_report.get("policyContinuity") or {},
-        
+        major_terms=final_report.get("majorTerms") or [],
+
         decision_type="Automatic" if next_action == "generate_report" else "Manual Review",
         confidence_score=confidence,
         policy_clauses_used=analysis_data.get("policyClausesUsed", []),
@@ -903,6 +1024,15 @@ async def resume_analysis_session(
                 session.policy_json = {}
             session.policy_json["policyStartDate"] = chosen_iso_date
             logger.info(f"[Clarification] Resolved policy start date from user answer: {chosen_iso_date}")
+            # A new policy was first taken on its start date, so waiting periods count from it too.
+            is_new_policy = session.policy_json.get("isRenewal") is False
+            if is_new_policy:
+                session.policy_json["declaredInceptionDate"] = chosen_iso_date
+                session.policy_json["inceptionDate"] = chosen_iso_date
+                session.policy_json["waitingPeriodStartDate"] = chosen_iso_date
+                session.policy_json["waitingPeriodBasis"] = (
+                    f"Based on your answer, this is a new policy first taken on {chosen_parsed:%d-%b-%Y}"
+                )
 
             # Persist chosen start date in Policy MongoDB record
             if session.policy_id:
@@ -911,12 +1041,34 @@ async def resume_analysis_session(
                         pol_record = await Policy.get(ObjectId(session.policy_id))
                         if pol_record:
                             pol_record.policy_start_date = chosen_parsed
+                            if is_new_policy:
+                                pol_record.inception_date = chosen_parsed
                             if pol_record.extracted_policy_json:
                                 pol_record.extracted_policy_json["policyStartDate"] = chosen_iso_date
                             await pol_record.save()
                             logger.debug(f"[Clarification] Saved resolved policy start date {chosen_parsed} to Policy {pol_record.id}")
                 except Exception as pe:
                     logger.error(f"[Clarification] Error updating policy start date in DB: {pe}")
+
+    # Check if the inception date conflict was answered
+    inception_ans = answers.get("policy_inception_date_conflict")
+    if inception_ans:
+        chosen = _date_from_answer(inception_ans)
+        if chosen:
+            if not session.policy_json:
+                session.policy_json = {}
+            session.policy_json["waitingPeriodStartDate"] = chosen.strftime("%Y-%m-%d")
+            session.policy_json["waitingPeriodBasis"] = (
+                f"Based on your answer, cover has been continuous since {chosen:%d-%b-%Y}"
+            )
+            if session.policy_id and len(str(session.policy_id)) == 24:
+                try:
+                    pol_record = await Policy.get(ObjectId(session.policy_id))
+                    if pol_record:
+                        pol_record.inception_date = chosen
+                        await pol_record.save()
+                except Exception as pe:
+                    logger.error(f"[Clarification] Error saving inception date: {pe}")
 
     # Check if treatment date was answered (a picked date such as "14-Oct-2026", or today/yesterday)
     treatment_date_ans = answers.get("prescription_treatment_date")
@@ -933,10 +1085,16 @@ async def resume_analysis_session(
     if hosp_ans:
         if not session.prescription_json:
             session.prescription_json = {}
-        if "yes" in hosp_ans or "admitted" in hosp_ans or "planned" in hosp_ans or "inpatient" in hosp_ans or "daycare" in hosp_ans:
+        # Order matters: "Not decided yet" contains "no", and "Outpatient" contains "patient".
+        if any(k in hosp_ans for k in ("not decided", "not sure", "don't know", "dont know")):
+            # Purpose of the check is "if I go to hospital": evaluate as an admission, and say so.
             session.prescription_json["hospitalizationRequired"] = True
-        elif "no" in hosp_ans or "opd" in hosp_ans or "clinic" in hosp_ans or "not admitted" in hosp_ans:
+            session.prescription_json["admissionAssumed"] = True
+        elif any(k in hosp_ans for k in ("opd", "outpatient", "out-patient", "clinic", "not required", "not admitted")) \
+                or hosp_ans.strip() == "no":
             session.prescription_json["hospitalizationRequired"] = False
+        elif any(k in hosp_ans for k in ("yes", "admitted", "admission", "planned", "inpatient", "in-patient", "daycare", "day care")):
+            session.prescription_json["hospitalizationRequired"] = True
 
     # Check if pre-existing status was answered
     ped_ans = str(answers.get("pre_existing_status", "")).lower()
@@ -994,7 +1152,7 @@ async def resume_analysis_session(
     policy_json = session.policy_json if hasattr(session, "policy_json") and session.policy_json else {}
     prescription_json = session.prescription_json or {}
     await _report_stage(on_stage, "rule_engine")
-    br_results = enforce_business_rules(policy_json, prescription_json)
+    br_results = enforce_business_rules(policy_json, prescription_json, policy_text=session.policy_text)
     session.business_rules = br_results
     session.status = "reanalyzing"
     await session.save()

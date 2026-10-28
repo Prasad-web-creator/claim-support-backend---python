@@ -45,6 +45,19 @@ async def analyze_coverage(
         else "Uploaded Prescription (PDF / Image / OCR — standard extracted document)"
     )
 
+    # AI search of the ENTIRE policy text for the items being checked; runs while
+    # the evidence below is retrieved.
+    import asyncio
+    from app.services.coverage.policy_clause_search import (
+        attach_policy_clauses,
+        comparison_from_search,
+        format_for_prompt,
+        search_policy_clauses,
+    )
+    clause_search_task = asyncio.create_task(
+        search_policy_clauses(policy_text, prescription_json or {}, policy_json or {}, is_manual_prescription)
+    )
+
     # ──────────────────────────────────────────────────────────────────────────
     # RAG: Retrieve Relevant Policy Context (Policy-Aware Retrieval)
     # ──────────────────────────────────────────────────────────────────────────
@@ -129,6 +142,11 @@ NEAR-MATCH CLARIFICATIONS REQUIRED
             pol_summary_lines.append(f"• Policy Start: {policy_json.get('policyStartDate')}")
         if policy_json.get("policyEndDate"):
             pol_summary_lines.append(f"• Policy Expiry: {policy_json.get('policyEndDate')}")
+        if policy_json.get("waitingPeriodStartDate"):
+            pol_summary_lines.append(
+                f"• Waiting periods count from: {policy_json.get('waitingPeriodStartDate')} "
+                f"({policy_json.get('waitingPeriodBasis') or 'declared start of continuous cover'})"
+            )
     applicable_policy_str = "\n".join(pol_summary_lines) if pol_summary_lines else "Standard Active Policy Document"
 
     # Retrieve similar approved expert cases for advisory context
@@ -146,11 +164,21 @@ NEAR-MATCH CLARIFICATIONS REQUIRED
     except Exception as exp_err:
         logger.warning(f"[Coverage Analysis] Error retrieving similar expert cases: {exp_err}")
 
+    clause_search_items = await clause_search_task
+
+    manual_note = ""
+    if is_manual_prescription:
+        manual_note = """
+• SELF-ENTERED CHECK: The person typed this text to check, before going to hospital, whether it would be covered
+  if treated TODAY. Use today's date as the treatment date. There is no patient name, admission date, doctor or
+  hospital — do not validate them and do not ask for them. Do NOT ask questions: next_action MUST be
+  "generate_report" (or "manual_review" only if the policy text cannot support any decision)."""
+
     # Build the prompt
     user_prompt = f"""
 CURRENT CLAIM
 • Evaluation Date: {today_str}
-• Prescription Source: {source_label}
+• Prescription Source: {source_label}{manual_note}
 • Diagnosis: {prescription_json.get('diagnosis', 'Not specified')}
 • Symptoms: {', '.join(str(s) for s in (prescription_json.get('symptoms') or [])) or 'None reported'}
 • Procedures: {', '.join(str(p) for p in (prescription_json.get('procedures') or [])) or 'None reported'}
@@ -168,6 +196,16 @@ RETRIEVED POLICY EVIDENCE (POLICY-AWARE RAG)
  You MUST base your explanation and decision strictly on this evidence; do not invent coverage or mix variants):
 
 {retrieved_evidence_block}
+
+==================================================
+
+POLICY CLAUSE SEARCH (ENTIRE POLICY TEXT, EXACT QUOTES)
+(Every passage of the policy that mentions each item or a related term, plus the general clauses that govern it.
+ Every quote has been verified to appear in the policy. Base each item's coverageStatusReason and policyEvidence on
+ these clauses and quote them exactly. When an item is not named in the policy, explain the decision from the
+ governing clauses listed here.)
+
+{format_for_prompt(clause_search_items)}
 
 ==================================================
 
@@ -213,6 +251,21 @@ PREVIOUS CLARIFICATION HISTORY
         )
         
         extracted = result["extractedJson"]
+
+        # Self-entered checks are answered from the text, today's date and the policy alone.
+        if is_manual_prescription and extracted.get("next_action") == "ask_questions":
+            logger.info("[AI Analysis] Self-entered check returned questions; requesting the report directly.")
+            result = await extract_json_with_retry(
+                system_prompt=COVERAGE_ANALYSIS_SYSTEM_PROMPT,
+                user_content=user_prompt + (
+                    "\n\nSELF-ENTERED CHECK: questions are not allowed. Return next_action \"generate_report\" "
+                    "with the full analysis now, evaluated for treatment today."
+                ),
+                max_tokens=8192,
+                operation_name="Coverage Analysis",
+            )
+            extracted = result["extractedJson"]
+
         timing = result.get("timing", {})
         tokens = result.get("tokens", {})
         
@@ -243,10 +296,14 @@ PREVIOUS CLARIFICATION HISTORY
         analysis_data = extracted.get("analysis", extracted)
         analysis_data["retrieved_evidence"] = retrieved_chunks
         analysis_data["similar_expert_cases"] = similar_expert_cases
-        
+        analysis_data["policyClauseSearch"] = clause_search_items
+
         # 1. Fallback item population if LLM returned empty comparison
         if not analysis_data.get("comparison") or len(analysis_data["comparison"]) == 0:
-            analysis_data["comparison"] = _generate_fallback_comparison(prescription_json)
+            analysis_data["comparison"] = (
+                comparison_from_search(clause_search_items) or _generate_fallback_comparison(prescription_json)
+            )
+        attach_policy_clauses(analysis_data["comparison"], clause_search_items)
             
         # 2. Status normalization for backward compatibility
         for item in analysis_data.get("comparison", []):
@@ -279,7 +336,7 @@ PREVIOUS CLARIFICATION HISTORY
             biz_rules = business_rule_results if isinstance(business_rule_results, dict) else {}
             if policy_json and not biz_rules.get("rules"):
                 from app.services.coverage.business_rules import enforce_business_rules
-                biz_rules = enforce_business_rules(policy_json, prescription_json)
+                biz_rules = enforce_business_rules(policy_json, prescription_json, policy_text=policy_text)
 
             det_res = biz_rules.get("deterministicResult")
             if det_res:
@@ -431,6 +488,22 @@ def _format_date_compact(date_str: str | None) -> str:
     return str(date_str).strip()
 
 
+def _is_policy_exclusion_blocker(blocker: str) -> bool:
+    text = blocker.split(" - ", 1)[0].lower()
+    return "permanently excluded" in text or "[explicit policy exclusion]" in text
+
+
+def decisive_blockers(blockers: list[str]) -> list[str]:
+    """
+    The blockers that decide the outcome. A permanent policy exclusion comes first, and a
+    waiting period is dropped beside it: it is moot for a treatment the policy never covers.
+    """
+    exclusions = [b for b in blockers if _is_policy_exclusion_blocker(b)]
+    if not exclusions:
+        return list(blockers)
+    return exclusions + [b for b in blockers if b not in exclusions and "waiting period" not in b.lower()]
+
+
 def _format_item_card(
     item: dict,
     policy_json: dict | None = None,
@@ -518,16 +591,21 @@ def _format_item_card(
     # Case 0: All Blockers Aggregation
     elif final_status == "Not Covered" and blockers and len(blockers) > 0:
         is_covered = False
-        reasons_list = "\n".join(f"• {b}" for b in blockers)
+        shown = decisive_blockers(blockers)
+        exclusion_blockers = [b for b in shown if _is_policy_exclusion_blocker(b)]
+        # Blockers may read "<reason> - <policy wording>": the reason explains, the wording is the evidence.
+        reasons_list = "\n".join(f"• {b.split(' - ', 1)[0]}" for b in shown)
         status_reason = (
             f"Treatment for {item_name} is not covered due to the following policy criteria and restrictions:\n{reasons_list}"
         )
         policy_evidence = (
             f"Period of Insurance : {period_str}. Mandatory Policy Exclusions & Terms: "
-            + "; ".join(b.split(" - ")[0] if " - " in b else b for b in blockers[:3])
+            + "; ".join(b.split(" - ", 1)[1] if " - " in b else b for b in shown[:3])
         )
         financial_status = (
-            "0% coverage. 100% patient financial responsibility because the claim violates one or more mandatory policy eligibility, waiting period, or coverage terms."
+            f"0% coverage. 100% patient financial responsibility because {item_name} is permanently excluded under the policy."
+            if exclusion_blockers
+            else "0% coverage. 100% patient financial responsibility because the claim violates one or more mandatory policy eligibility, waiting period, or coverage terms."
         )
 
     # Case 1: Policy Expired

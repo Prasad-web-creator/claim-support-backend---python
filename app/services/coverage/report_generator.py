@@ -1,6 +1,6 @@
 from datetime import datetime
 from app.services.coverage.reference_benchmark_service import generate_reference_comparison
-from app.services.coverage.policy_continuity import evaluate_policy_continuity
+from app.services.coverage.policy_continuity import evaluate_policy_continuity, declared_policy_continuity
 
 
 def _is_meaningful(val) -> bool:
@@ -15,6 +15,46 @@ def _is_meaningful(val) -> bool:
     if isinstance(val, (list, dict)):
         return len(val) > 0
     return True
+
+
+def build_major_terms(comparison: list[dict], blockers: list[str]) -> list[dict]:
+    """
+    The policy terms that make the analysis Not Covered, across all items: the decisive
+    clauses the policy search found for each Not Covered item (deduplicated, naming every
+    item they apply to), or else the decisive rule-engine blockers.
+    """
+    from app.services.coverage.coverage_analysis import decisive_blockers
+    from app.services.coverage.policy_clause_search import NOT_COVERED_EFFECTS
+
+    not_covered = [c for c in comparison if c.get("coverageStatus") == "Not Covered"]
+    terms: list[dict] = []
+    by_quote: dict[str, dict] = {}
+    for card in not_covered:
+        for cl in card.get("policyClauses") or []:
+            if not cl.get("decisive") or cl.get("effect") not in NOT_COVERED_EFFECTS:
+                continue
+            key = " ".join(cl["quote"].lower().split())
+            if key in by_quote:
+                if card.get("item") not in by_quote[key]["items"]:
+                    by_quote[key]["items"].append(card.get("item"))
+                continue
+            term = {
+                "title": cl.get("section") or cl.get("effect"),
+                "effect": cl.get("effect"),
+                "quote": cl["quote"],
+                "explanation": cl.get("explanation") or "",
+                "items": [card.get("item")],
+            }
+            by_quote[key] = term
+            terms.append(term)
+    if terms or not not_covered:
+        return terms
+
+    items = [c.get("item") for c in not_covered]
+    for b in decisive_blockers(blockers):
+        reason, _, wording = b.partition(" - ")
+        terms.append({"title": reason.strip(), "effect": "", "quote": wording.strip(), "explanation": "", "items": items})
+    return terms
 
 
 def generate_report(
@@ -395,7 +435,10 @@ def generate_report(
     # re-evaluates it across every policy in the session.
     policy_continuity = (
         {} if is_doc_invalid
-        else evaluate_policy_continuity([{"policyJson": policy_json}], prescription_json)
+        else (
+            declared_policy_continuity(policy_json, prescription_json)
+            or evaluate_policy_continuity([{"policyJson": policy_json}], prescription_json)
+        )
     )
 
     combined_blocked = list(coverage_analysis.get("blockedPolicyClauses", []))
@@ -403,12 +446,21 @@ def generate_report(
         if b not in combined_blocked:
             combined_blocked.append(b)
 
+    final_summary = summary_text if (is_doc_invalid or is_blocked) else coverage_analysis.get("summary", summary_text)
+    if prescription_json.get("admissionAssumed") and not is_doc_invalid:
+        admission_note = (
+            "This result assumes you are admitted to hospital (in-patient or day care). "
+            "An out-patient consultation alone is not covered under this policy."
+        )
+        final_summary = f"{final_summary} {admission_note}".strip()
+        summary_text = f"{summary_text} {admission_note}".strip()
+
     return {
         "documentValidity": final_doc_validity,
         "overallStatus": overall_status,
         "dominanceScore": dominance_score,
         "coverageBreakdown": coverage_breakdown,
-        "summary": summary_text if (is_doc_invalid or is_blocked) else coverage_analysis.get("summary", summary_text),
+        "summary": final_summary,
         "coverageStatus": overall_status,
         "policySummary": policy_summary,
         "prescriptionSummary": prescription_summary,
@@ -431,4 +483,5 @@ def generate_report(
         "policyJson": policy_json,
         "referenceComparison": reference_comparison,
         "policyContinuity": policy_continuity,
+        "majorTerms": [] if is_doc_invalid else build_major_terms(comparison, all_blockers),
     }

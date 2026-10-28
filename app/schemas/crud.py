@@ -22,6 +22,11 @@ class PolicyCreate(BaseModel):
     policyType: Optional[str] = ""
     policyStartDate: Optional[Union[datetime, str]] = None
     policyEndDate: Optional[Union[datetime, str]] = None
+    inceptionDate: Optional[Union[datetime, str]] = None
+    isRenewal: Optional[bool] = None
+    continuousRenewal: Optional[bool] = None
+    breakStartDate: Optional[Union[datetime, str]] = None
+    coverRestartDate: Optional[Union[datetime, str]] = None
     coverageAmount: Optional[float] = 0.0
     status: Optional[str] = "Active"
     gridFsFileId: Optional[str] = ""
