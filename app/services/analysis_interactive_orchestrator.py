@@ -153,10 +153,10 @@ def _apply_declared_inception(policy_json: dict, policy_doc):
         start = inception
         basis = f"Based on your inputs, this is a new policy first taken on {inception:%d-%b-%Y}"
     elif getattr(policy_doc, "continuous_renewal", None) is False:
-        restart = _as_date(getattr(policy_doc, "cover_restart_date", None))
-        start = restart or current_start or inception
-        basis = (f"Based on your inputs, cover restarted after a break on {start:%d-%b-%Y}"
-                 if restart else f"Based on your inputs, the renewals had a break, so cover counts from {start:%d-%b-%Y}")
+        # A break in renewals: cover is counted from the uploaded policy document's start date.
+        start = current_start or inception
+        basis = (f"You have a coverage gap in your policy continuity, so waiting periods count from the "
+                 f"uploaded policy's start date ({start:%d-%b-%Y})")
     else:
         start = inception
         basis = f"Based on your inputs, this policy was first taken on {inception:%d-%b-%Y} and renewed every year without a break"

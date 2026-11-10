@@ -568,10 +568,6 @@ def declared_policy_continuity(policy_json: Optional[dict], prescription_json: O
             start = start or parse_policy_date(curr.get("startDate"))
             end = end or parse_policy_date(curr.get("endDate"))
 
-    restart_val = pj.get("coverRestartDate") or pj.get("restartDate")
-    restart = parse_policy_date(restart_val)
-    break_start = parse_policy_date(pj.get("breakStartDate"))
-
     # A new (first-year) policy has no renewals, so it cannot have a break.
     is_new = pj.get("isRenewal") is not None and not _bool(pj.get("isRenewal"))
     continuous_val = pj.get("continuousRenewal")
@@ -603,23 +599,11 @@ def declared_policy_continuity(policy_json: Optional[dict], prescription_json: O
                      "description": "No active policy on the claim date."})
     elif not continuous:
         status = STATUS_GAP
-        break_text = f" Cover lapsed on {_fmt(break_start)}." if break_start else ""
-        restart_text = f" Cover restarted on {_fmt(restart)}; waiting periods count from that date." if restart else ""
-        summary = (f"You entered that the renewals had a break since the policy was first taken on "
-                   f"{_fmt(inception)}.{break_text}{restart_text}")
-        gap_to = restart - timedelta(days=1) if restart else None
-        if break_start and restart:
-            description = f"No cover from {_fmt(break_start)} until cover restarted on {_fmt(restart)}."
-        elif restart:
-            description = f"Break in renewal before {_fmt(restart)}."
-        else:
-            description = "Break in renewal."
-        gaps.append({
-            "from": _iso(break_start) if break_start else None,
-            "to": _iso(gap_to) if gap_to else None,
-            "days": (restart - break_start).days if break_start and restart else None,
-            "description": description,
-        })
+        # The break dates are not asked: cover is counted from the uploaded policy's start date.
+        summary = (f"You have a coverage gap in your policy continuity since it was first taken on "
+                   f"{_fmt(inception)}. So your prescription is analysed against this policy from the "
+                   f"uploaded policy's start date ({_fmt(start)}); waiting periods count from that date.")
+        # The break's dates are not known, so no gap row is listed; the summary explains it.
     elif is_new:
         status = STATUS_VERIFIED
         summary = (f"This is a new policy, first taken on {_fmt(inception)}. Cover has been active from that date "
@@ -635,8 +619,9 @@ def declared_policy_continuity(policy_json: Optional[dict], prescription_json: O
         "declared": True,
         "originalPolicyStartDate": _iso(inception),
         "originalPolicyStartSource": "Entered by you",
-        "coverRestartDate": _iso(restart) if not continuous and restart else None,
-        "breakStartDate": _iso(break_start) if not continuous and break_start else None,
+        # Break dates are no longer collected; any stored by older app versions are not shown.
+        "coverRestartDate": None,
+        "breakStartDate": None,
         "isRenewal": None if pj.get("isRenewal") is None else _bool(pj.get("isRenewal")),
         "currentPolicy": {"label": label, "startDate": _iso(start), "endDate": _iso(end)},
         "claimDate": _iso(claim),

@@ -321,7 +321,8 @@ def test_declared_policy_continuity_gap_when_renewal_had_break():
     assert result is not None
     # Gaps detected -> not verified
     assert result["status"] == STATUS_GAP
-    assert len(result["coverageGaps"]) == 1
+    # The break's dates are unknown, so no gap row is listed; the summary explains it.
+    assert result["coverageGaps"] == []
     assert result["claimDate"] == "2025-05-10"
     assert result["claimDateSource"] == "Consultation date"
 
@@ -407,9 +408,9 @@ def test_evaluate_policy_continuity_uses_manual_inputs_not_document_extraction()
 
     # 4. Status MUST NOT be verified because renewal had a break
     assert result["status"] == STATUS_GAP
-    assert len(result["coverageGaps"]) == 1
-    assert "Break in renewal before 01 Apr 2025" in result["coverageGaps"][0]["description"]
-    assert "You entered that the renewals had a break" in result["summary"]
+    assert result["coverageGaps"] == []
+    assert "You have a coverage gap in your policy continuity" in result["summary"]
+    assert result["coverRestartDate"] is None
 
 
 def test_evaluate_policy_continuity_verified_when_renewed_without_break():

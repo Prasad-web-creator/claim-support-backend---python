@@ -1,6 +1,6 @@
 """
 The upload step asks: start date → new or renewed → (renewed) renewed every year without
-a break → (break) date the break started → date cover restarted. These answers decide
+a break. After a break, cover is counted from the uploaded policy's start date. These answers decide
 where waiting periods count from and what the Policy Continuity card shows.
 """
 
@@ -48,20 +48,28 @@ def test_renewed_without_break_counts_from_first_start():
     assert result["isRenewal"] is True
 
 
-def test_break_shows_the_gap_from_break_start_to_restart():
+def test_break_counts_from_the_uploaded_policy_start():
+    policy = current_policy()
+    start = _apply_declared_inception(policy, declared("2020-01-01", is_renewal=True, continuous=False))
+    assert start.isoformat() == "2026-10-01"
+    assert "coverage gap in your policy continuity" in policy["waitingPeriodBasis"]
+
+    result = declared_policy_continuity(policy, RX)
+    assert result["status"] == "Coverage Gap Detected"
+    assert "You have a coverage gap in your policy continuity" in result["summary"]
+    assert result["breakStartDate"] is None
+    assert result["coverRestartDate"] is None
+    assert result["coverageGaps"] == []
+
+
+def test_break_ignores_stale_break_dates_from_older_app_versions():
     policy = current_policy()
     start = _apply_declared_inception(
         policy, declared("2020-01-01", is_renewal=True, continuous=False, break_start="2023-01-01", restart="2023-03-01")
     )
-    assert start.isoformat() == "2023-03-01"
-    assert policy["breakStartDate"] == "2023-01-01"
-
+    assert start.isoformat() == "2026-10-01"
     result = declared_policy_continuity(policy, RX)
-    assert result["status"] == "Coverage Gap Detected"
-    assert result["breakStartDate"] == "2023-01-01"
-    assert result["coverRestartDate"] == "2023-03-01"
-    gap = result["coverageGaps"][0]
-    assert (gap["from"], gap["to"], gap["days"]) == ("2023-01-01", "2023-02-28", 59)
+    assert result["coverRestartDate"] is None
 
 
 def test_new_policy_ignores_stale_break_answers():

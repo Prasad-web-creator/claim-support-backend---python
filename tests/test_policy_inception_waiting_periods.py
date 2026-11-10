@@ -68,11 +68,11 @@ def test_new_policy_from_2026_is_not_covered():
     assert "Covered from 01-Jan-2028" in reasons
 
 
-def test_break_in_renewal_counts_from_restart():
+def test_break_in_renewal_counts_from_current_policy_start():
     policy = current_policy()
-    start = _apply_declared_inception(policy, declared("2022-01-01", continuous=False, restart="2025-06-01"))
-    assert start.isoformat() == "2025-06-01"
-    assert "restarted after a break" in policy["waitingPeriodBasis"]
+    start = _apply_declared_inception(policy, declared("2022-01-01", continuous=False))
+    assert start.isoformat() == "2026-01-01"
+    assert "coverage gap in your policy continuity" in policy["waitingPeriodBasis"]
 
 
 def test_declared_date_after_current_period_is_not_used():
