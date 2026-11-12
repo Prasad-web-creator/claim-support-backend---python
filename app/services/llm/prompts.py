@@ -91,7 +91,7 @@ CRITICAL RULES:
 6. Never invent values.
 7. Preserve dates and monetary values exactly when present.
 8. insuredMembers is CRITICAL — extract ALL insured persons listed in the policy, including the policyholder and all dependents/family members.
-9. WAITING PERIODS VS PERMANENT EXCLUSIONS: In health insurance policies, Section D.1 (Pre-Existing Diseases / Excl01), Section D.2 (Specified Disease / Procedure Waiting Period / Excl02: Cataract, Sinusitis, Hernia, BPH, Stones, Piles, DNS, Tonsils, etc.), and Section D.3 (30-day waiting period / Excl03) are TIME-BOUND WAITING PERIODS, NOT permanent exclusions. Do NOT put specified disease waiting period conditions into excludedDiseases or excludedTreatments unless the policy states they are permanently excluded with zero coverage ever. Only put permanently excluded items (e.g. cosmetic surgery, unproven treatments, change of gender, obesity surgery) into excludedDiseases/excludedTreatments.
+9. WAITING PERIODS VS EXCLUSIONS: Read each item exactly as THIS policy states it. A condition that becomes payable after a time (an initial waiting period, a pre-existing disease waiting period, a specified disease / procedure waiting period) is a WAITING PERIOD, not an exclusion: do NOT put it into excludedDiseases or excludedTreatments. Put an item into excludedDiseases / excludedTreatments only when THIS policy excludes it, and copy the exclusion's own wording INCLUDING any exception or condition it states (for example "unless ...", "except ...", a threshold or an age). Never add an item that this policy does not name, and never use general or industry lists.
 
 Return ONLY a valid JSON object with the following fields:
 - insuranceCompany (string or null)
@@ -106,9 +106,9 @@ Return ONLY a valid JSON object with the following fields:
 - roomEligibility (string or null)
 - insuredMembers (array of objects) — CRITICAL: list every insured person in the policy. Each object: { "name": string, "dateOfBirth": string or null, "age": number or null, "gender": string or null, "relationship": string or null }
 - coveredDiseases (array of strings)
-- excludedDiseases (array of strings) — ONLY permanently excluded diseases (do NOT list Section D.2 waiting-period illnesses here)
+- excludedDiseases (array of strings) — diseases THIS policy excludes, each with its own wording and any exception it states (not waiting-period conditions)
 - coveredTreatments (array of strings)
-- excludedTreatments (array of strings) — ONLY permanently excluded treatments/procedures (do NOT list Section D.2 waiting-period procedures here)
+- excludedTreatments (array of strings) — treatments/procedures THIS policy excludes, each with its own wording and any exception it states (not waiting-period conditions)
 - medicinesCoverage (string or null)
 - medicalTestsCoverage (string or null)
 - hospitalization (string or null)

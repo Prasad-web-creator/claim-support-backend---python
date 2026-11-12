@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from fastapi import BackgroundTasks
 import time
 import asyncio
+import copy
 from beanie import PydanticObjectId as ObjectId
 import json
 import re
@@ -21,6 +22,12 @@ from app.services.coverage.business_rules import enforce_business_rules
 from app.services.coverage.coverage_analysis import analyze_coverage
 from app.services.coverage.policy_continuity import declared_policy_inputs
 from app.services.coverage.report_generator import generate_report
+from app.services.coverage.verification import (
+    NEEDS_VERIFICATION,
+    apply_decisive_answers,
+    client_question,
+    pending_decisive_questions,
+)
 from app.services.rule_engine.date_utils import parse_flexible_date
 from app.services.llm.ai_client import AnalysisCostTracker, set_current_cost_tracker, get_current_cost_tracker
 from app.services.analysis_orchestrator import _fetch_file_bytes_by_gridfs_id, _background_post_processing
@@ -180,23 +187,140 @@ def _apply_declared_inception(policy_json: dict, policy_doc):
     return start
 
 
+# Wording a policy document uses for the date cover FIRST started (before any
+# renewals), as opposed to the issue date or start date of the current renewal.
+FIRST_START_WORDS = (
+    "since", "inception", "first", "enrol", "enroll", "continuous", "member", "insured with us",
+)
+
+
+def _continuity_block(policy_json: dict) -> dict:
+    block = (policy_json or {}).get(CONTINUITY_KEY)
+    return block if isinstance(block, dict) else {}
+
+
+def _document_first_start_date(policy_json: dict):
+    """
+    The date the policy document states cover FIRST started (e.g. "Continuous
+    coverage since", "First inception date", "Member since"), or None.
+
+    Read with care so the issue date or start date of the current renewal is
+    never taken for it:
+      • only the dedicated continuity field is used, which the extraction fills
+        only for explicitly labelled first-start dates;
+      • the document's own wording must support it (a quote naming a first start);
+      • it must be BEFORE the current policy period starts, and not in the future.
+    """
+    block = _continuity_block(policy_json)
+    stated = _as_date(block.get("continuousCoverageSince"))
+    if not stated:
+        return None
+    current_start = _as_date(block.get("policyStartDate") or policy_json.get("policyStartDate"))
+    if current_start and stated >= current_start:
+        return None
+    if stated > datetime.now().date():
+        return None
+    evidence = block.get("continuityEvidence") or []
+    if not any(
+        isinstance(quote, str) and any(word in quote.lower() for word in FIRST_START_WORDS)
+        for quote in evidence
+    ):
+        return None
+    return stated
+
+
 def _inception_conflict_question(policy_json: dict, declared_start) -> Optional[dict]:
-    """Ask only when the policy document itself states a different continuous-cover start."""
-    block = policy_json.get(CONTINUITY_KEY) if isinstance(policy_json.get(CONTINUITY_KEY), dict) else {}
-    stated = _as_date(policy_json.get("continuousCoverageSince") or block.get("continuousCoverageSince"))
-    if not stated or stated == declared_start:
+    """
+    For a renewed policy: ask only when the policy document itself states a
+    different FIRST start date than the one the user entered.
+    """
+    stated = _document_first_start_date(policy_json)
+    if not stated or not declared_start or stated == declared_start:
         return None
     mine, theirs = f"{declared_start:%d-%m-%Y}", f"{stated:%d-%m-%Y}"
     return {
         "id": "policy_inception_date_conflict",
         "category": "eligibility",
-        "title": "Policy Inception Date",
-        "question": (f"The policy document states continuous cover since {theirs}, but you entered {mine}. "
-                     f"Which date should be used for waiting periods?"),
+        "title": "Policy First Start Date",
+        "question": (f"You entered that this policy was first taken on {mine}, but the policy document says "
+                     f"it was first taken (continuous cover) on {theirs}. Which date should I use?"),
         "type": "single_choice",
         "required": True,
         "options": [f"Use my entered date ({mine})", f"Use policy document date ({theirs})"],
         "reason": "Waiting periods are counted from the date cover first started without a break.",
+    }
+
+
+def _start_date_conflict_question(user_disp: str, doc_disp: str) -> dict:
+    """For a new policy: the start date entered differs from the one on the document."""
+    return {
+        "id": "policy_start_date_conflict",
+        "category": "eligibility",
+        "title": "Policy Start Date Conflict",
+        "question": f"Policy mentioned start date is {doc_disp}, but you mentioned {user_disp}. Can I proceed with your option?",
+        "type": "single_choice",
+        "required": True,
+        "options": [
+            f"Use my entered date ({user_disp})",
+            f"Use policy document date ({doc_disp})"
+        ],
+        "reason": "A conflict was found between the start date you entered and the start date extracted from the uploaded policy document."
+    }
+
+
+NEW_OR_RENEWED_QUESTION_ID = "policy_new_or_renewed_conflict"
+NEW_POLICY_OPTION = "New policy (first year)"
+RENEWED_POLICY_OPTION = "Renewed policy"
+
+
+def _new_or_renewed_conflict_question(policy_json: dict) -> Optional[dict]:
+    """
+    The user said the policy is new, but the document explicitly says it is a
+    renewal (renewal wording, or a previous / expiring policy number).
+    """
+    block = _continuity_block(policy_json)
+    previous_number = _meaningful(block.get("previousPolicyNumber"))
+    if block.get("isRenewal") is not True and not previous_number:
+        return None
+    renewal_text = _meaningful(block.get("renewalInformation"))
+    if renewal_text:
+        shown = f'"{renewal_text[:80]}"'
+    elif previous_number:
+        shown = f"previous policy number {previous_number[:60]}"
+    else:
+        shown = "it is a renewal"
+    return {
+        "id": NEW_OR_RENEWED_QUESTION_ID,
+        "category": "eligibility",
+        "title": "New or Renewed Policy",
+        "question": (f"You selected New policy, but the policy document shows it is a renewal ({shown}). "
+                     f"Is this policy new or renewed?"),
+        "type": "single_choice",
+        "required": True,
+        "options": [NEW_POLICY_OPTION, RENEWED_POLICY_OPTION],
+        "reason": "Waiting periods depend on whether this is the first year of cover or a renewal.",
+    }
+
+
+async def _ask_clarification(session: AnalysisSession, questions: list) -> dict:
+    """Store the questions on the session and pause it for the user's answers."""
+    for q in questions:
+        session.questions.append(ClarificationQuestion(
+            id=q["id"],
+            title=q["title"],
+            question=q["question"],
+            type=q["type"],
+            category=q["category"],
+            required=q["required"],
+            options=q["options"],
+            reason=q["reason"],
+        ))
+    session.status = "waiting_for_user"
+    await session.save()
+    return {
+        "status": "needs_clarification",
+        "sessionId": str(session.id),
+        "questions": questions,
     }
 
 
@@ -550,6 +674,23 @@ async def run_single_policy_analysis(
     # Waiting periods run from the inception date the user declared (first start,
     # before any renewals). The user's manual inputs are authoritative and not overridden by the document.
     declared_start = _apply_declared_inception(policy_json, policy_doc)
+    declared_renewal = getattr(policy_doc, "is_renewal", None)
+
+    # The user said New, but the document says it is a renewal: confirm that first,
+    # because it decides which date the waiting periods count from.
+    if declared_start and declared_renewal is False:
+        type_question = _new_or_renewed_conflict_question(policy_json)
+        if type_question:
+            logger.info("[Claim Analysis] Policy declared new, but the document says renewal; asking the user.")
+            return await _ask_clarification(session, [type_question])
+
+    # Renewed every year without a break: the first start date the user entered is
+    # checked against a first start date the document itself states (if it states one).
+    if declared_start and declared_renewal is True and getattr(policy_doc, "continuous_renewal", None) is not False:
+        first_start_question = _inception_conflict_question(policy_json, _as_date(policy_doc.inception_date))
+        if first_start_question:
+            logger.info("[Claim Analysis] Entered first start date differs from the document's; asking the user.")
+            return await _ask_clarification(session, [first_start_question])
 
     # Policies saved before the inception question existed: the start date the user
     # entered is checked against the document's current period start.
@@ -578,40 +719,7 @@ async def run_single_policy_analysis(
 
     if user_dt and doc_dt and user_dt.date() != doc_dt.date():
         logger.info(f"[Claim Analysis] Policy start date conflict: user entered {user_disp}, doc extracted {doc_disp}")
-
-        question_data = {
-            "id": "policy_start_date_conflict",
-            "category": "eligibility",
-            "title": "Policy Start Date Conflict",
-            "question": f"Policy mentioned start date is {doc_disp}, but you mentioned {user_disp}. Can I proceed with your option?",
-            "type": "single_choice",
-            "required": True,
-            "options": [
-                f"Use my entered date ({user_disp})",
-                f"Use policy document date ({doc_disp})"
-            ],
-            "reason": "A conflict was found between the start date you entered and the start date extracted from the uploaded policy document."
-        }
-
-        session.questions.append(ClarificationQuestion(
-            id=question_data["id"],
-            title=question_data["title"],
-            question=question_data["question"],
-            type=question_data["type"],
-            category=question_data["category"],
-            required=question_data["required"],
-            options=question_data["options"],
-            reason=question_data["reason"]
-        ))
-
-        session.status = "waiting_for_user"
-        await session.save()
-
-        return {
-            "status": "needs_clarification",
-            "sessionId": str(session.id),
-            "questions": [question_data]
-        }
+        return await _ask_clarification(session, [_start_date_conflict_question(user_disp, doc_disp)])
     elif user_dt and not doc_dt:
         policy_json["policyStartDate"] = user_dt.strftime("%Y-%m-%d")
     elif user_dt and doc_dt and user_dt.date() == doc_dt.date():
@@ -737,6 +845,25 @@ async def start_analysis_session(
         await session.save()
         raise e
 
+def _clarification_history(session: AnalysisSession) -> list:
+    """Answered questions of a session, in the shape the coverage prompt and the report use."""
+    history = []
+    for q in session.questions:
+        # Support both `question_id` and `questionId` field name due to Pydantic alias
+        answer_obj = next(
+            (a for a in session.answers if getattr(a, 'question_id', None) == q.id or getattr(a, 'questionId', None) == q.id),
+            None
+        )
+        if answer_obj:
+            history.append({
+                "Question_ID": q.id,
+                "Title": q.title,
+                "Question": q.question,
+                "User_Answer": answer_obj.answer
+            })
+    return history
+
+
 def _manual_review_result(policy_json: dict, prescription_json: dict, br_results: dict, reason: str) -> dict:
     """A complete Coverage Summary for an undecided case, so the app never opens an empty screen."""
     report = generate_report(
@@ -765,7 +892,8 @@ async def _run_llm_analysis(
     session.round_count += 1
     await session.save()
 
-    if session.round_count > 3:
+    # Rounds: the first analysis plus follow-up rounds of clarification answers.
+    if session.round_count > 5:
         logger.warning(f"[Claim Analysis] Session {session.id} exceeded max rounds. Forcing manual review.")
         session.status = "manual_review_required"
         await session.save()
@@ -774,22 +902,8 @@ async def _run_llm_analysis(
             "The information provided was not enough to decide automatically. This case needs manual review.",
         )
 
-    # Format clarification history — match by both field name and alias
-    clarification_history = []
-    for q in session.questions:
-        # Support both `question_id` and `questionId` field name due to Pydantic alias
-        answer_obj = next(
-            (a for a in session.answers if getattr(a, 'question_id', None) == q.id or getattr(a, 'questionId', None) == q.id),
-            None
-        )
-        if answer_obj:
-            clarification_history.append({
-                "Question_ID": q.id,
-                "Title": q.title,
-                "Question": q.question,
-                "User_Answer": answer_obj.answer
-            })
-    
+    clarification_history = _clarification_history(session)
+
     log_section("AI Analysis")
     if clarification_history:
         logger.info(f"[AI Analysis] Evaluating with {len(clarification_history)} clarification answers (Round {session.round_count})...")
@@ -882,15 +996,215 @@ async def _run_llm_analysis(
         }
 
     # Otherwise complete (generate_report or manual_review)
+    analysis_data = coverage_analysis.get("analysis", coverage_analysis)
+
+    # Items whose coverage depends on one fact the documents do not give are
+    # held back until the user answers the decisive question for that fact.
+    if next_action == "generate_report":
+        paused = await _pause_for_decisive_questions(
+            session,
+            policy_json=policy_json,
+            prescription_json=prescription_json,
+            br_results=br_results,
+            analysis_data=analysis_data,
+            confidence=confidence,
+            total_processing_time=total_processing_time,
+            audit_log=audit_log,
+        )
+        if paused is not None:
+            return paused
+
+    return await _complete_with_report(
+        session,
+        policy_json=policy_json,
+        prescription_json=prescription_json,
+        br_results=br_results,
+        analysis_data=analysis_data,
+        next_action=next_action,
+        confidence=confidence,
+        total_processing_time=total_processing_time,
+        clarification_history=clarification_history,
+        audit_log=audit_log,
+        error_reason=coverage_analysis.get("reason") if next_action == "manual_review" else None,
+        background_tasks=background_tasks,
+        on_stage=on_stage,
+    )
+
+
+async def _pause_for_decisive_questions(
+    session: AnalysisSession,
+    *,
+    policy_json: dict,
+    prescription_json: dict,
+    br_results: dict,
+    analysis_data: dict,
+    confidence,
+    total_processing_time: int,
+    audit_log,
+) -> Optional[dict]:
+    """
+    Ask the decisive questions of the analysis's "Needs Verification" items, if any.
+
+    The finished analysis is kept on the session; the answers are applied to it
+    from the outcomes returned with each question, without another AI call.
+    Returns the needs_clarification payload, or None to finish normally.
+    """
+    try:
+        # The report as it would be issued, so items the rule engine has already
+        # decided (expired policy, waiting period, ...) never trigger a question.
+        preview = generate_report(
+            policy_json=copy.deepcopy(policy_json),
+            prescription_json=copy.deepcopy(prescription_json),
+            business_rule_results=copy.deepcopy(br_results),
+            coverage_analysis=copy.deepcopy(analysis_data),
+            processing_time_ms=0,
+        )
+        # Ask only when the issued report would actually be "Needs Verification";
+        # a rejection or manual review by the rule engine makes the answer moot.
+        if preview.get("overallStatus") != NEEDS_VERIFICATION:
+            return None
+
+        room = max(0, 10 - len(session.questions))
+        questions = pending_decisive_questions(
+            preview.get("comparison") or [],
+            asked_ids={q.id for q in session.questions},
+        )[:room]
+        if not questions:
+            return None
+
+        stored_analysis = json.loads(json.dumps(analysis_data, default=str))
+    except Exception as e:
+        logger.warning(f"[Claim Analysis] Could not prepare verification questions: {e}")
+        return None
+
+    client_questions = [client_question(dq) for dq in questions]
+    for q_data in client_questions:
+        session.questions.append(ClarificationQuestion(
+            id=q_data["id"],
+            title=q_data.get("title", ""),
+            question=q_data.get("question", ""),
+            type=q_data.get("type", "single_choice"),
+            category=q_data.get("category"),
+            required=q_data.get("required", True),
+            options=q_data.get("options", []),
+            reason=q_data.get("reason", ""),
+        ))
+
+    session.pending_analysis = {
+        "analysis": stored_analysis,
+        "confidence": confidence,
+        "questionIds": [q["id"] for q in client_questions],
+    }
+    session.accumulated_processing_time_ms = total_processing_time
+    session.status = "waiting_for_user"
+    tracker = get_current_cost_tracker()
+    if tracker:
+        session.cost_steps = tracker.to_dict_list()
+    await session.save()
+
+    audit_log.generated_questions = client_questions
+    await audit_log.insert()
+
+    logger.info(
+        f"[Claim Analysis] {len(client_questions)} item detail(s) need verification; asking the user before the report."
+    )
+    return {
+        "status": "needs_clarification",
+        "sessionId": str(session.id),
+        "questions": client_questions,
+    }
+
+
+async def _complete_from_decisive_answers(
+    session: AnalysisSession,
+    *,
+    policy_json: dict,
+    prescription_json: dict,
+    br_results: dict,
+    answers: dict,
+    background_tasks: Optional[BackgroundTasks],
+    on_stage: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> Optional[dict]:
+    """
+    Finish a session held back for decisive questions by applying the answers to
+    the stored analysis. Returns None when an answer has no usable outcome, so the
+    caller re-runs the AI analysis with the answers instead.
+    """
+    from app.models.analysis_audit_log import AnalysisAuditLog
+
+    start = time.time()
+    pending = session.pending_analysis or {}
+    question_ids = pending.get("questionIds") or []
+    analysis_data = copy.deepcopy(pending.get("analysis") or {})
+    session.pending_analysis = {}
+
+    resolved, unresolved = apply_decisive_answers(
+        analysis_data.get("comparison") or [],
+        {qid: answers[qid] for qid in question_ids if qid in answers},
+    )
+    if unresolved:
+        logger.info(f"[Clarification] No stored outcome for {unresolved}; re-running the AI analysis with the answers.")
+        await session.save()
+        return None
+    analysis_data["comparison"] = resolved
+
+    clarification_history = _clarification_history(session)
+    confidence = pending.get("confidence", 0)
+    total_processing_time = (session.accumulated_processing_time_ms or 0) + int((time.time() - start) * 1000)
+    audit_log = AnalysisAuditLog(
+        session_id=str(session.id),
+        analysis_round=session.round_count,
+        prompt_version="2.1.0",
+        prescription_id=session.prescription_id,
+        policy_id=session.policy_id,
+        clarification_context={"history": clarification_history},
+        llm_response={"next_action": "generate_report", "resolvedFromDecisiveAnswers": question_ids},
+        confidence_score=confidence,
+        final_decision="generate_report",
+    )
+    logger.info(f"[Clarification] Applied {len(question_ids)} verification answer(s) without another AI call.")
+
+    return await _complete_with_report(
+        session,
+        policy_json=policy_json,
+        prescription_json=prescription_json,
+        br_results=br_results,
+        analysis_data=analysis_data,
+        next_action="generate_report",
+        confidence=confidence,
+        total_processing_time=total_processing_time,
+        clarification_history=clarification_history,
+        audit_log=audit_log,
+        error_reason=None,
+        background_tasks=background_tasks,
+        on_stage=on_stage,
+    )
+
+
+async def _complete_with_report(
+    session: AnalysisSession,
+    *,
+    policy_json: dict,
+    prescription_json: dict,
+    br_results: dict,
+    analysis_data: dict,
+    next_action: str,
+    confidence,
+    total_processing_time: int,
+    clarification_history: list,
+    audit_log,
+    error_reason: Optional[str],
+    background_tasks: Optional[BackgroundTasks],
+    on_stage: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> dict:
+    """Generate, persist and return the final report of a session."""
     await _report_stage(on_stage, "report")
     session.accumulated_processing_time_ms = total_processing_time
     session.status = "completed" if next_action == "generate_report" else "manual_review_required"
     await session.save()
-    
+
     await audit_log.insert()
-    
-    analysis_data = coverage_analysis.get("analysis", coverage_analysis)
-    
+
     final_report = generate_report(
         policy_json=policy_json,
         prescription_json=prescription_json,
@@ -939,7 +1253,7 @@ async def _run_llm_analysis(
         clarification_answers_used=clarification_history,
         session_id=str(session.id),
         parent_session_id=session.parent_session_id or "",
-        error_message=coverage_analysis.get("reason") if next_action == "manual_review" else None
+        error_message=error_reason
     )
     await report.insert()
     log_section("Claim Decision Summary")
@@ -985,6 +1299,59 @@ async def _run_llm_analysis(
     result["status"] = "complete" if next_action == "generate_report" else "manual_review_required"
     return result
 
+def _new_policy_start_date_question(session: AnalysisSession) -> Optional[dict]:
+    """
+    After the user confirms the policy is new: the start-date check that a new
+    policy normally gets (entered date vs the document's start date).
+    """
+    pj = session.policy_json or {}
+    if any(q.id == "policy_start_date_conflict" for q in session.questions):
+        return None
+    user_dt, user_disp = _parse_and_format_date(pj.get("declaredInceptionDate"))
+    doc_dt, doc_disp = _parse_and_format_date(pj.get("policyStartDate"))
+    if user_dt and doc_dt and user_dt.date() != doc_dt.date():
+        return _start_date_conflict_question(user_disp, doc_disp)
+    if user_dt and not doc_dt:
+        pj["policyStartDate"] = user_dt.strftime("%Y-%m-%d")
+    return None
+
+
+async def _apply_confirmed_renewal(session: AnalysisSession) -> None:
+    """
+    The user confirmed the policy is renewed (they had selected New). Waiting
+    periods count from the first start date the document states, or, when it
+    states none, from this policy's own start date (the earliest date known for
+    certain). The answer is saved on the policy for later analyses.
+    """
+    pj = session.policy_json
+    pj["isRenewal"] = True
+    stated = _document_first_start_date(pj)
+    start = stated or _as_date(pj.get("policyStartDate"))
+    if start:
+        pj["waitingPeriodStartDate"] = start.isoformat()
+        pj["declaredInceptionDate"] = pj["inceptionDate"] = start.isoformat()
+        pj["waitingPeriodBasis"] = (
+            f"Based on your answer, this is a renewed policy, and the policy document shows continuous cover "
+            f"since {start:%d-%b-%Y}"
+            if stated else
+            f"Based on your answer, this is a renewed policy. Its first start date is not known, so waiting "
+            f"periods count from this policy's start date ({start:%d-%b-%Y}). To count them from an earlier "
+            f"date, upload the policy again with its first start date"
+        )
+    logger.info(f"[Clarification] Renewed policy confirmed; waiting periods count from {start}.")
+
+    if session.policy_id and len(str(session.policy_id)) == 24:
+        try:
+            pol_record = await Policy.get(ObjectId(session.policy_id))
+            if pol_record:
+                pol_record.is_renewal = True
+                if start:
+                    pol_record.inception_date = datetime(start.year, start.month, start.day)
+                await pol_record.save()
+        except Exception as pe:
+            logger.error(f"[Clarification] Error saving renewed policy answer: {pe}")
+
+
 async def resume_analysis_session(
     session_id: str,
     user_id: str,
@@ -1014,6 +1381,20 @@ async def resume_analysis_session(
             answer=answer_val
         ))
     
+    # New or renewed: asked when the user said New but the document says renewal.
+    type_ans = str(answers.get(NEW_OR_RENEWED_QUESTION_ID, "") or "").lower()
+    if type_ans:
+        if not session.policy_json:
+            session.policy_json = {}
+        if "renew" in type_ans:
+            await _apply_confirmed_renewal(session)
+        else:
+            # Confirmed new: the entered start date is still checked against the document's.
+            follow_up = _new_policy_start_date_question(session)
+            if follow_up:
+                logger.info("[Clarification] New policy confirmed; start dates differ, asking which to use.")
+                return await _ask_clarification(session, [follow_up])
+
     # Check if policy start date conflict was answered
     date_ans = answers.get("policy_start_date_conflict")
     if date_ans:
@@ -1061,6 +1442,9 @@ async def resume_analysis_session(
             session.policy_json["waitingPeriodBasis"] = (
                 f"Based on your answer, cover has been continuous since {chosen:%d-%b-%Y}"
             )
+            # The continuity card reports the same first start date.
+            session.policy_json["declaredInceptionDate"] = chosen.strftime("%Y-%m-%d")
+            session.policy_json["inceptionDate"] = chosen.strftime("%Y-%m-%d")
             if session.policy_id and len(str(session.policy_id)) == 24:
                 try:
                     pol_record = await Policy.get(ObjectId(session.policy_id))
@@ -1156,6 +1540,27 @@ async def resume_analysis_session(
     session.business_rules = br_results
     session.status = "reanalyzing"
     await session.save()
+
+    # Answers to the decisive questions of a held-back analysis are applied
+    # from the outcomes stored with it: no further AI call is needed.
+    pending = session.pending_analysis or {}
+    if pending:
+        pending_ids = pending.get("questionIds") or []
+        if pending.get("analysis") and pending_ids and all(qid in answers for qid in pending_ids):
+            completed = await _complete_from_decisive_answers(
+                session,
+                policy_json=policy_json,
+                prescription_json=prescription_json,
+                br_results=br_results,
+                answers=answers,
+                background_tasks=background_tasks,
+                on_stage=on_stage,
+            )
+            if completed is not None:
+                return completed
+        else:
+            session.pending_analysis = {}
+            await session.save()
 
     logger.info(f"[Claim Analysis] Re-running AI analysis for session {session_id}")
     return await _run_llm_analysis(

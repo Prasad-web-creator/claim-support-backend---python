@@ -376,24 +376,10 @@ async def get_analysis(
     if not d.get("updatedAt") and d.get("createdAt"):
         d["updatedAt"] = d["createdAt"]
 
-    # Ensure referenceComparison is populated even for legacy/pre-existing reports
-    if not d.get("referenceComparison") or (isinstance(d.get("referenceComparison"), dict) and len(d["referenceComparison"]) == 0):
-        try:
-            from app.services.coverage.reference_benchmark_service import generate_reference_comparison
-            ref_comp = generate_reference_comparison(
-                policy_json=d.get("policyJson"),
-                prescription_json=d.get("prescriptionJson"),
-                coverage_analysis=d.get("coverageAnalysis")
-            )
-            d["referenceComparison"] = ref_comp
-            # Persist to database so subsequent queries have it
-            try:
-                report.reference_comparison = ref_comp
-                await report.save()
-            except Exception:
-                pass
-        except Exception:
-            pass
+    # No built-in benchmark comparison is returned, also for reports stored before it
+    # was removed (their stored data is left untouched in the database).
+    from app.services.coverage.report_generator import REFERENCE_COMPARISON_DISABLED
+    d["referenceComparison"] = dict(REFERENCE_COMPARISON_DISABLED)
 
     # Policy Continuity: manual inputs are checked first (original start date and renewal break).
     # If not declared, evaluated across the session for multi-policy or computed on read.

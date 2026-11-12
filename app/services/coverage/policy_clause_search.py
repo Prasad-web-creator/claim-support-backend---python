@@ -53,6 +53,11 @@ When the item is NOT excluded by a passage from STEP 3, add EVERY one of these t
   c) the definition the item falls under (for example illness, injury)
   d) each waiting period that could apply (initial 30 days, specified diseases / procedures, pre-existing diseases)
   e) the out-patient / OPD exclusion, and any other exclusion that could apply to it
+  f) every exclusion or condition that applies depending on the CAUSE, PURPOSE or PERSON, even when it does not
+     name the item: alcohol / substance abuse (for example for liver cirrhosis or pancreatitis), accident-only
+     rules and accident exceptions (for example for a fracture or dental treatment), self-inflicted injury,
+     hazardous sports, cosmetic purpose, and member-specific terms (a pre-existing disease declared for one insured
+     member, member-specific waiting-period end dates, age-based co-payment)
 When the item IS excluded by a STEP 3 passage, add only the governing clauses that matter to the decision.
 When the policy does not name the item, these clauses are the whole basis of the decision, and the reason MUST
 state the conditions they set (for example "covered only when admitted to hospital for at least 24 hours;
@@ -66,9 +71,14 @@ paraphrase, never shorten with "...", never join passages from different places.
 that matters (at most about 600 characters). If you cannot quote it exactly, leave it out.
 
 STEP 6 - DECISION FOR EACH ITEM
-Use the dates in CLAIM DETAILS.
-  - A permanent exclusion that names the item -> "Not Covered", however long the cover has run, unless the item
-    is a stated exception to that exclusion (for example ectopic pregnancy under a maternity exclusion).
+Decide ONLY from this policy's text. Never apply a general or "statutory" exclusion, waiting period, benefit or limit
+that this policy does not state. Use the dates and the COVER DURATION in CLAIM DETAILS.
+  - An exclusion that names the item -> "Not Covered", however long the cover has run, unless the item is a stated
+    exception to that exclusion (for example ectopic pregnancy under a maternity exclusion). When the exclusion's
+    exception depends on a fact not given (for example "unless BMI is 40 or more", "unless due to an Accident"),
+    see the "Needs Verification" rule below.
+  - A waiting period applies only to what THIS policy lists for it, and not when the policy's own exception applies
+    (for example "unless arising due to an Accident").
   - A schedule row saying the item is not covered under the plan -> "Not Covered".
   - Otherwise decide from the governing benefit and its conditions, and check every applicable waiting period
     against the EVALUATION DATE counted from the WAITING PERIOD START. A waiting period that is not complete ->
@@ -76,7 +86,15 @@ Use the dates in CLAIM DETAILS.
     reported as satisfied, never as a reason for refusal.
   - When cover depends on a condition (for example admission for 24 hours or more), state that condition in the
     reason.
-  decision is exactly one of "Covered", "Not Covered", "Partially Covered".
+  - When an exclusion or benefit decides the item from ONE specific fact that CLAIM DETAILS do not state (for
+    example "refractive error less than 7.5 dioptres", a BMI threshold, accident vs illness, alcohol vs another
+    cause, cosmetic vs reconstructive, or which insured member is the patient) and that fact changes the result ->
+    "Needs Verification", and state the condition and the outcomes in the reason. Read thresholds exactly: "less
+    than 7.5 dioptres" excludes only values below 7.5.
+  - Never assume the deciding fact from the item's name ("jaw fracture" does not prove an accident; "liver
+    cirrhosis" neither proves nor rules out alcohol) and never assume who the patient is when CLAIM DETAILS do not
+    name them. A benefit limited to a cause (for example "Dental (Accident only)") is a condition too.
+  decision is exactly one of "Covered", "Not Covered", "Partially Covered", "Needs Verification".
   reason is plain, friendly English that names the clauses relied on.
 
 For each clause:
@@ -157,6 +175,14 @@ def _claim_details(prescription_json: dict, policy_json: dict, is_manual: bool) 
         f"WAITING PERIOD START: {pol.get('waitingPeriodStartDate') or pol.get('policyStartDate') or 'not stated'}"
         + (f" ({pol['waitingPeriodBasis']})" if pol.get("waitingPeriodBasis") else ""),
     ]
+    try:
+        from app.services.coverage.cover_duration import cover_duration
+        facts = cover_duration(pol, rx)
+    except Exception:
+        facts = None
+    if facts:
+        lines.append(f"COVER DURATION (exact, do not recalculate): {facts['summary']} "
+                     f"Completed months: {facts['completedMonths']}.")
     return "\n".join(lines)
 
 
@@ -219,6 +245,11 @@ async def search_policy_clauses(
     """Returns one entry per checked item with its decision and verified policy clauses. Never raises."""
     if not policy_text or not prescription_json:
         return []
+    if len(policy_text) > MAX_POLICY_CHARS:
+        logger.warning(
+            f"[Policy Clause Search] Policy text is {len(policy_text)} characters; only the first "
+            f"{MAX_POLICY_CHARS} are searched."
+        )
     user_content = (
         f"CLAIM DETAILS\n{_claim_details(prescription_json, policy_json, is_manual)}\n\n"
         f"==================================================\n\n"
@@ -280,6 +311,8 @@ def attach_policy_clauses(comparison: List[dict], items: List[dict]) -> List[dic
             card["policyClauses"] = found["clauses"]
             card["relatedTerms"] = found["relatedTerms"]
             card["directPolicyMention"] = found["directMention"]
+            # The search's own decision, used by the report's consistency checks.
+            card["policyClauseDecision"] = found.get("decision") or ""
     return comparison
 
 
@@ -287,9 +320,9 @@ def comparison_from_search(items: List[dict]) -> List[dict]:
     """Cards built from the search when the main analysis returned none."""
     cards = []
     for it in items:
-        if it["decision"] not in ("Covered", "Not Covered", "Partially Covered"):
+        if it["decision"] not in ("Covered", "Not Covered", "Partially Covered", "Needs Verification"):
             continue
-        cards.append({
+        card = {
             "item": it["item"],
             "itemType": "Diagnosis",
             "coverageStatus": it["decision"],
@@ -301,5 +334,13 @@ def comparison_from_search(items: List[dict]) -> List[dict]:
             "policyClauses": it["clauses"],
             "relatedTerms": it["relatedTerms"],
             "directPolicyMention": it["directMention"],
-        })
+            "policyClauseDecision": it["decision"],
+        }
+        if it["decision"] == "Needs Verification":
+            # No decisive question here; the reason states the condition.
+            card["verificationCondition"] = it["reason"]
+            decisive = next((c for c in it["clauses"] if c["decisive"]), None)
+            if decisive and decisive.get("section"):
+                card["verificationClause"] = decisive["section"]
+        cards.append(card)
     return cards

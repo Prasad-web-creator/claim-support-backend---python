@@ -1,6 +1,14 @@
 from datetime import datetime
-from app.services.coverage.reference_benchmark_service import generate_reference_comparison
 from app.services.coverage.policy_continuity import evaluate_policy_continuity, declared_policy_continuity
+from app.services.coverage.verification import NEEDS_VERIFICATION, apply_consistency_checks
+
+
+# Stored in place of the old benchmark comparison. It is non-empty on purpose:
+# the app re-fetches a report whose referenceComparison is empty.
+REFERENCE_COMPARISON_DISABLED = {
+    "available": False,
+    "note": "Coverage is decided only from this policy's own wording; no built-in benchmark is used.",
+}
 
 
 def _is_meaningful(val) -> bool:
@@ -132,13 +140,20 @@ def generate_report(
     comparison = []
     for item in raw_comparison:
         comparison.append(_format_item_card(item, policy_json, prescription_json))
-    
+
+    # A result that contradicts its own evidence is never shown as Covered.
+    comparison = [
+        _format_item_card(item, policy_json, prescription_json)
+        for item in apply_consistency_checks(comparison)
+    ]
+
     # Calculate Coverage Breakdown
     total_items = len(comparison)
     covered_count = 0
     partially_covered_count = 0
     not_covered_count = 0
-    
+    needs_verification_count = 0
+
     for item in comparison:
         status = item.get("coverageStatus", "")
         if status == "Covered":
@@ -147,6 +162,8 @@ def generate_report(
             partially_covered_count += 1
         elif status == "Not Covered":
             not_covered_count += 1
+        elif status == NEEDS_VERIFICATION:
+            needs_verification_count += 1
 
     overall_status = coverage_analysis.get("overallStatus") or "Unknown"
     dominance_score = 0.0
@@ -157,9 +174,13 @@ def generate_report(
         overall_status = "Invalid Policy"
     elif not rx_valid:
         overall_status = "Invalid Prescription"
-    elif total_items > 0 and covered_count + partially_covered_count + not_covered_count == 0:
+    elif total_items > 0 and covered_count + partially_covered_count + not_covered_count + needs_verification_count == 0:
         # Only "Manual Review" items: nothing was decided automatically.
         overall_status = "Manual Review Required"
+    elif needs_verification_count > 0:
+        # The result cannot be stated until the detail is verified.
+        overall_status = NEEDS_VERIFICATION
+        dominance_score = (needs_verification_count / total_items) * 100
     elif total_items > 0:
         if not_covered_count >= partially_covered_count and not_covered_count >= covered_count:
             overall_status = "Not Covered"
@@ -217,11 +238,12 @@ def generate_report(
         covered_count = 0
         partially_covered_count = 0
         not_covered_count = len(comparison)
+        needs_verification_count = 0
         dominance_score = 100.0
     elif det_res and not is_doc_invalid:
         det_status = det_res.get("status")
         if det_status == "PARTIALLY_COVERED":
-            overall_status = "Partially Covered"
+            overall_status = NEEDS_VERIFICATION if needs_verification_count else "Partially Covered"
             comparison = [
                 _format_item_card(
                     c,
@@ -269,6 +291,7 @@ def generate_report(
             "covered": covered_count,
             "partiallyCovered": partially_covered_count,
             "notCovered": not_covered_count,
+            "needsVerification": needs_verification_count,
             "total": total_items
         }
 
@@ -375,16 +398,24 @@ def generate_report(
             )
     else:
         matched_items = coverage_analysis.get("coveredTreatments", [c["item"] for c in comparison if c.get("isCovered")]) if not is_doc_invalid else []
-        excluded_items = coverage_analysis.get("excludedTreatments", [c["item"] for c in comparison if not c.get("isCovered")]) if not is_doc_invalid else []
+        excluded_items = coverage_analysis.get("excludedTreatments", [
+            c["item"] for c in comparison
+            if not c.get("isCovered") and c.get("coverageStatus") != NEEDS_VERIFICATION
+        ]) if not is_doc_invalid else []
 
         if not is_doc_invalid:
             patient_clause = f"Patient {p_name}" if p_name else "Member"
             diag_clause = f"diagnosed with {extracted_diag}" if extracted_diag else "requesting medical coverage"
+            verify_clause = (
+                f" {needs_verification_count} item{'s' if needs_verification_count != 1 else ''} need verification before coverage can be confirmed."
+                if needs_verification_count else ""
+            )
 
             summary_text = (
                 f"Analysis complete with status: {overall_status}. "
                 f"{patient_clause} {diag_clause}. "
-                f"{len(matched_items)} items are covered, while {len(excluded_items)} items are not covered or excluded. "
+                f"{len(matched_items)} items are covered, while {len(excluded_items)} items are not covered or excluded."
+                f"{verify_clause} "
                 f"Dominance Score: {dominance_score}."
             )
 
@@ -425,11 +456,9 @@ def generate_report(
         "detectedDocumentTypeIfInvalid": doc_validity.get("detectedDocumentTypeIfInvalid", "")
     }
 
-    reference_comparison = generate_reference_comparison(
-        policy_json=policy_json,
-        prescription_json=prescription_json,
-        coverage_analysis=coverage_analysis,
-    )
+    # No built-in benchmark (other products, generic exclusion lists) is compared
+    # against: coverage comes from this policy's own wording only.
+    reference_comparison = dict(REFERENCE_COMPARISON_DISABLED)
 
     # Continuity from this policy's own document. A multi-policy session later
     # re-evaluates it across every policy in the session.

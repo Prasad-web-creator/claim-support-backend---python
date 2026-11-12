@@ -261,55 +261,8 @@ def enforce_business_rules(policy: dict, prescription: dict, policy_text: str | 
                     blocker=True,
                 )
 
-    # 4. Relationship & Dependent Eligibility Check
-    rx_rel = (
-        prescription.get("relationship")
-        or prescription.get("patientRelationship")
-        or prescription.get("relation")
-        or ""
-    ).strip()
-
-    if not rx_rel and prescription.get("manualText"):
-        import re as _rel_re
-        m_rel = _rel_re.search(r"\b(brother|sister|son|daughter|father|mother|parent|in-law|cousin|uncle|aunt|friend|dependent|spouse|self)\b", prescription.get("manualText", ""), _rel_re.IGNORECASE)
-        if m_rel:
-            rx_rel = m_rel.group(1)
-
-    if rx_rel:
-        rel_clean = rx_rel.lower()
-        ineligible_keywords = ("brother", "sister", "in-law", "father-in-law", "mother-in-law", "parent-in-law", "uncle", "aunt", "cousin", "friend", "extended")
-        if any(ik in rel_clean for ik in ineligible_keywords):
-            evaluate_rule(
-                "relationshipEligible",
-                False,
-                f"[Relationship Ineligible] Patient relationship '{rx_rel}' is not covered under this family floater policy (covered: Self, Spouse).",
-                blocker=True,
-            )
-        elif any(ck in rel_clean for ck in ("son", "daughter", "child")):
-            if presc_age is not None and presc_age > 25:
-                evaluate_rule(
-                    "childAgeCeiling",
-                    False,
-                    f"[Dependent Child Age Limit] Dependent child age ({presc_age} Yrs) exceeds maximum dependency ceiling (25 Yrs).",
-                    blocker=True,
-                )
-            has_child_in_policy = any("son" in (m.get("relationship") or "").lower() or "daughter" in (m.get("relationship") or "").lower() or "child" in (m.get("relationship") or "").lower() for m in members)
-            if not has_child_in_policy and len(members) == 2 and all("self" in (m.get("relationship") or "").lower() or "spouse" in (m.get("relationship") or "").lower() for m in members):
-                evaluate_rule(
-                    "relationshipEligible",
-                    False,
-                    f"[Unenrolled Dependent] Dependent child is not enrolled on this policy schedule (policy enrolled members: Self & Spouse only).",
-                    blocker=True,
-                )
-        elif any(pk in rel_clean for pk in ("father", "mother", "parent")):
-            has_parent_in_policy = any("father" in (m.get("relationship") or "").lower() or "mother" in (m.get("relationship") or "").lower() or "parent" in (m.get("relationship") or "").lower() for m in members)
-            if not has_parent_in_policy:
-                evaluate_rule(
-                    "relationshipEligible",
-                    False,
-                    f"[Unenrolled Parent] Parent ({rx_rel}) is not enrolled on this policy schedule.",
-                    blocker=True,
-                )
+    # 4. Relationship / dependent eligibility is decided by the AI coverage analysis
+    #    from the policy's own member and eligibility wording (no built-in rules).
 
     # 5. Member ID Match Check
     rx_member_id = (prescription.get("memberId") or prescription.get("memberNumber") or prescription.get("policyMemberNumber") or "").strip()
@@ -440,201 +393,26 @@ def enforce_business_rules(policy: dict, prescription: dict, policy_text: str | 
     except Exception as e:
         evaluate_rule("policyActive", True, f"Date parse note: {e}", blocker=False)
 
-    # 9. Waiting Period & Pre-Existing Disease (PED) Check
-    try:
-        diag_date = _parse_date(prescription.get("diagnosisDate") or prescription.get("diseaseOnsetDate") or prescription.get("symptomOnsetDate"))
-        waiting_days = policy.get("waitingPeriodDays")
-        ped_waiting_days = policy.get("pedWaitingPeriodDays") or waiting_days
-
-        # Waiting periods run from the declared start of continuous cover (inception
-        # before renewals); validity above still uses the current period.
-        wp_start = _parse_date(policy.get("waitingPeriodStartDate")) or p_start
-        is_ped = prescription.get("isPreExisting") is True or (diag_date and wp_start and diag_date < wp_start)
-
-        if wp_start and visit_date:
-            days_active = (visit_date - wp_start).days
-            months_active = max(0, days_active // 30)
-
-            # Pre-Existing Disease Check
-            if is_ped:
-                applicable_wait = int(ped_waiting_days) if ped_waiting_days is not None else 1095
-                passed = days_active >= applicable_wait
-                evaluate_rule(
-                    "waitingPeriodCompleted",
-                    passed,
-                    f"Pre-existing disease waiting period satisfied ({days_active} days active >= {applicable_wait} days)."
-                    if passed
-                    else f"[Pre-Existing Disease (PED) Waiting Period] Pre-existing disease declared with onset prior to policy inception. Subject to 36-month waiting period under Clause 3.3 (Excl01). Active coverage: {months_active} months ({days_active} days, Required: {applicable_wait} days).",
-                    blocker=not passed,
-                )
-            # Initial 30-Day Waiting Period Check
-            elif waiting_days is not None:
-                passed = days_active >= int(waiting_days)
-                evaluate_rule(
-                    "waitingPeriodCompleted",
-                    passed,
-                    f"Active for {days_active} days (Required: {waiting_days})"
-                    if passed
-                    else f"[Initial 30-Day Waiting Period] Treatment occurred {days_active} days after policy inception (Required: {waiting_days} days). Illness claims within the first 30 days are excluded under Clause 3.1 (Excl03).",
-                    blocker=not passed,
-                )
-
-            # Specific Illness 24-Month Waiting Period Check
-            diag_full = (
-                (prescription.get("diagnosis") or "")
-                + " " + " ".join(str(s) for s in (prescription.get("symptoms") or []))
-                + " " + str(prescription.get("orderTitle") or "")
-                + " " + str(prescription.get("procedure") or "")
-            ).lower()
-
-            specific_24m_conditions = [
-                ("spondylosis", "Lumbar Spondylosis and Intervertebral Disc Disorders"),
-                ("disc prolapse", "Intervertebral Disc Prolapse / Radiculopathy"),
-                ("disc herniation", "Intervertebral Disc Herniation"),
-                ("slip disc", "Intervertebral Disc Disorders"),
-                ("sciatica", "Intervertebral Disc Disorders / Sciatica"),
-                ("hernia", "Hernia of all types"),
-                ("hydrocele", "Hydrocele"),
-                ("varicocele", "Varicocele"),
-                ("cataract", "Cataract"),
-                ("cholelithiasis", "Stones in Biliary and Urinary Systems"),
-                ("gallbladder stone", "Gallbladder Stones"),
-                ("gall stone", "Gallbladder Stones"),
-                ("kidney stone", "Renal Calculi / Urinary Stones"),
-                ("renal calculi", "Renal Calculi / Urinary Stones"),
-                ("calculus", "Calculus Diseases of Gall Bladder / Urinary Tract"),
-                ("piles", "Piles, Fistula and Fissure in-ano"),
-                ("fistula", "Piles, Fistula and Fissure in-ano"),
-                ("fissure", "Piles, Fistula and Fissure in-ano"),
-                ("haemorrhoid", "Piles, Fistula and Fissure in-ano"),
-                ("hemorrhoid", "Piles, Fistula and Fissure in-ano"),
-                ("pilonidal", "Pilonidal Sinus"),
-                ("tonsil", "Tonsils and Adenoids"),
-                ("adenoid", "Tonsils and Adenoids"),
-                ("sinusitis", "Sinusitis and Deviated Nasal Septum"),
-                ("sinus", "Sinusitis and Deviated Nasal Septum"),
-                ("deviated nasal septum", "Sinusitis and Deviated Nasal Septum"),
-                ("dns", "Sinusitis and Deviated Nasal Septum"),
-                ("septoplasty", "Sinusitis and Deviated Nasal Septum"),
-                ("fess", "Sinusitis and Deviated Nasal Septum"),
-                ("bph", "Benign Prostatic Hypertrophy"),
-                ("prostate", "Benign Prostatic Hypertrophy"),
-                ("prostatomegaly", "Benign Prostatic Hypertrophy"),
-                ("turp", "Benign Prostatic Hypertrophy"),
-                ("varicose", "Varicose Veins"),
-                ("osteoarthritis", "Osteoarthritis and Joint Replacement"),
-                ("joint replacement", "Osteoarthritis and Joint Replacement"),
-                ("knee replacement", "Osteoarthritis and Joint Replacement"),
-                ("hip replacement", "Osteoarthritis and Joint Replacement"),
-                ("cyst", "Benign Lumps and Cysts"),
-                ("lipoma", "Benign Lumps and Cysts"),
-                ("fibroid", "Benign Gynaecological Conditions"),
-                ("hysterectomy", "Benign Gynaecological Conditions"),
-                ("endometriosis", "Benign Gynaecological Conditions"),
-            ]
-            matched_specific = None
-            for kw, title in specific_24m_conditions:
-                if kw in diag_full:
-                    matched_specific = title
-                    break
-
-            if matched_specific:
-                passed_spec = days_active >= 730
-                evaluate_rule(
-                    "specificIllnessWaitingPeriod",
-                    passed_spec,
-                    f"Specific illness waiting period satisfied ({days_active} days active >= 730 days)."
-                    if passed_spec
-                    else f"[Specific Illness 24-Month Waiting Period] Treatment for '{matched_specific}' is subject to a mandatory 24-month waiting period under Clause 3.2 (Excl02). Current active coverage is {months_active} months ({days_active} days).",
-                    blocker=not passed_spec,
-                )
-        else:
-            evaluate_rule(
-                "waitingPeriodCompleted",
-                False,
-                "Could not verify waiting period due to missing dates or waiting period value",
-                blocker=False,
-            )
-    except Exception as e:
-        evaluate_rule("waitingPeriodCompleted", False, f"Waiting period check error: {e}")
+    # 9. Waiting periods: which waiting period applies (initial, pre-existing, specified
+    #    illnesses, and any exceptions such as accidents) is decided by the AI coverage
+    #    analysis from the policy's own wording. Only the cover duration is computed here,
+    #    so the AI never has to do date arithmetic.
+    from app.services.coverage.cover_duration import cover_duration
+    results["coverDuration"] = cover_duration(policy, prescription)
 
     # ===========================================================
     # STAGE 3 — DIAGNOSIS, CARE SETTING & EXCLUSIONS
     # ===========================================================
 
-    # 10. Diagnosis / Treatment Excluded Check (excludedDiseases, excludedTreatments, exclusions)
-    from app.services.rule_engine.policy_exclusions import claim_texts, match_policy_exclusion, policy_exclusion_entries
-    exclusion_entries = policy_exclusion_entries(policy)
-    claimed_texts = claim_texts(prescription)
-    excl_match = match_policy_exclusion(claimed_texts, exclusion_entries) if claimed_texts else None
-    excl_reason = None
-    if excl_match:
-        excl_reason = (
-            f"[Explicit Policy Exclusion] '{excl_match['claimText']}' is excluded under policy terms "
-            f"(listed exclusion: \"{excl_match['entry']}\")."
-        )
-        evaluate_rule("diagnosisExcluded", False, excl_reason, blocker=True)
-    elif claimed_texts and exclusion_entries:
-        evaluate_rule("diagnosisExcluded", True, "Diagnosis is not in the excluded list")
-    else:
-        evaluate_rule("diagnosisExcluded", True, "No excluded diseases list to check against")
-
-    # 11. Care Setting & Standalone Outpatient (OPD) Diagnostic Check (Clause 2.1(b)/(c))
-    order_type_str = str(prescription.get("orderType") or "").lower()
-    order_title_str = str(prescription.get("orderTitle") or prescription.get("procedure") or "").lower()
-    rx_notes_str = str(prescription.get("directives") or prescription.get("historyNotes") or prescription.get("clinicalNotes") or prescription.get("manualText") or "").lower()
-    hosp_req_val = prescription.get("hospitalizationRequired")
-
-    is_daycare = "day care" in order_type_str or "day care" in order_title_str or "peld" in order_title_str or "day care" in rx_notes_str
-    is_standalone_opd = (
-        "standalone opd" in order_type_str
-        or "standalone opd" in order_title_str
-        or "standalone opd" in rx_notes_str
-        or "outpatient without hospitalization" in rx_notes_str
-        or "no hospital admission" in rx_notes_str
-        or (hosp_req_val is False and ("mri" in order_title_str or "ct" in order_title_str or "imaging" in order_title_str))
-    )
-
-    if is_standalone_opd and not is_daycare:
-        evaluate_rule(
-            "opdDiagnosticCovered",
-            False,
-            "[Standalone Outpatient Diagnostic Exclusion] Standalone outpatient diagnostic MRI prescribed without active hospital admission or approved day-care surgery is non-payable under Clause 2.1(c).",
-            blocker=True,
-        )
-    elif is_daycare:
-        evaluate_rule(
-            "daycareProcedureCovered",
-            True,
-            "Day Care Procedure recognized under Clause 1.6 & 2.1(a) (less than 24 hours stay allowed for advanced surgical procedures).",
-        )
-    elif hosp_req_val is False:
-        # The user confirmed an out-patient consultation only (no admission, no day care).
-        policy_cover_text = " ".join(
-            str(policy.get(k) or "") for k in ("coveredTreatments", "coverages", "medicinesCoverage", "specialConditions", "riders")
-        ).lower()
-        has_opd_cover = any(k in policy_cover_text for k in ("opd cover", "opd benefit", "out-patient cover", "outpatient cover", "outpatient benefit", "befit"))
-        evaluate_rule(
-            "outpatientCovered",
-            has_opd_cover,
-            "Out-patient treatment without hospital admission is not covered under this policy. It is covered only when "
-            "admitted to hospital (24 hours or more) or for a listed day care procedure.",
-            blocker=not has_opd_cover,
-        )
+    # 10-11. Exclusions, care setting (in-patient / day care / out-patient) and their
+    #        exceptions are decided by the AI coverage analysis from the policy wording.
 
     # ===========================================================
     # STAGE 4 — DETERMINISTIC COVERAGE RULE ENGINE & AGGREGATION
     # ===========================================================
     try:
         from app.services.rule_engine import CoverageRuleEngine
-        from app.services.rule_engine.models import RuleStatus, RuleType
         decision = CoverageRuleEngine.evaluate({**policy, "policyText": policy_text} if policy_text else policy, prescription)
-        # The engine reports the same policy exclusion with the clause wording; keep only that one.
-        if excl_reason and any(
-            r.rule_type == RuleType.PERMANENT_EXCLUSION and r.status == RuleStatus.FAILED and (r.rule_id or "").startswith("EXCL-CONTRACT")
-            for r in decision.rule_results
-        ):
-            results["blockers"] = [b for b in results["blockers"] if b != excl_reason]
         results["deterministicResult"] = decision.model_dump(mode="json", by_alias=True)
         results["decision"] = decision.status.value
         results["reasonCode"] = decision.reason_code.value

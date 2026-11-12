@@ -67,13 +67,15 @@ class LocalSemanticRetrievalProvider(BaseRetrievalProvider):
         # ──────────────────────────────────────────────────────────────────────
         # 1. Strict Policy-Aware Filtering
         # ──────────────────────────────────────────────────────────────────────
-        # A query MUST match requested policy_id OR be a universal "GLOBAL_REFERENCE"
+        # Only the requested policy's own clauses are returned. Built-in reference
+        # material ("GLOBAL_REFERENCE": benchmark leaflets, generic waiting-period and
+        # exclusion lists) is never mixed into a policy's evidence, because coverage
+        # must be decided from that policy's wording alone.
         db_query: Dict[str, Any] = {}
 
-        if requested_policy_id:
-            db_query["policyId"] = {"$in": [requested_policy_id, "GLOBAL_REFERENCE"]}
-        else:
-            db_query["policyId"] = "GLOBAL_REFERENCE"
+        if not requested_policy_id:
+            return []
+        db_query["policyId"] = requested_policy_id
 
         # Rule type filter
         if requested_rule_type:
@@ -92,8 +94,8 @@ class LocalSemanticRetrievalProvider(BaseRetrievalProvider):
         eligible_chunks: List[PolicyChunk] = []
 
         for chk in candidates:
-            # Policy ID Isolation: If not the exact requested policy and not GLOBAL_REFERENCE, exclude
-            if requested_policy_id and chk.policy_id not in (requested_policy_id, "GLOBAL_REFERENCE"):
+            # Policy ID Isolation: only the exact requested policy
+            if chk.policy_id != requested_policy_id:
                 continue
 
             # Temporal Validity: effective_from <= eval_date <= effective_to

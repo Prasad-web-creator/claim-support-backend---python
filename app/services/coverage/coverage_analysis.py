@@ -4,6 +4,7 @@ from app.core.logging import logger
 from app.services.llm.ai_client import extract_json_with_retry
 
 from app.services.coverage.coverage_prompt import COVERAGE_ANALYSIS_SYSTEM_PROMPT
+from app.services.coverage.verification import NEEDS_VERIFICATION
 
 async def analyze_coverage(
     policy_text: str,
@@ -100,11 +101,18 @@ async def analyze_coverage(
             )
         retrieved_evidence_block = "\n".join(evidence_lines)
     else:
-        # Fallback to direct excerpt if no chunks retrieved
-        retrieved_evidence_block = (
-            f"[Direct Policy Text Excerpt]\n{policy_text[:12000]}\n"
-            if policy_text else "No policy clauses available."
+        # The full policy text is always given below, so no excerpt is needed here.
+        retrieved_evidence_block = "No separate snippets retrieved. Use the FULL POLICY TEXT below."
+
+    # The complete policy wording, so nothing the policy says can be missed.
+    from app.services.coverage.policy_clause_search import MAX_POLICY_CHARS
+    full_policy_text = policy_text or ""
+    if len(full_policy_text) > MAX_POLICY_CHARS:
+        logger.warning(
+            f"[AI Analysis] Policy text is {len(full_policy_text)} characters; only the first "
+            f"{MAX_POLICY_CHARS} are sent to the AI."
         )
+        full_policy_text = full_policy_text[:MAX_POLICY_CHARS]
 
     # Build near-match clarification block for the prompt
     near_matches = business_rule_results.get("nearMatchClarifications", [])
@@ -149,20 +157,9 @@ NEAR-MATCH CLARIFICATIONS REQUIRED
             )
     applicable_policy_str = "\n".join(pol_summary_lines) if pol_summary_lines else "Standard Active Policy Document"
 
-    # Retrieve similar approved expert cases for advisory context
+    # Past cases (other claims, possibly other policies or versions) are not given to
+    # the AI: every decision is made from this policy's wording alone.
     similar_expert_cases = []
-    expert_cases_block = "• None available for this specific query."
-    try:
-        from app.services.expert_learning.case_retrieval_service import SimilarCaseRetrievalService
-        similar_expert_cases = await SimilarCaseRetrievalService.retrieve_similar_cases(
-            prescription_json=prescription_json,
-            policy_json=policy_json,
-            limit=3,
-            min_similarity=0.45
-        )
-        expert_cases_block = SimilarCaseRetrievalService.format_expert_cases_for_prompt(similar_expert_cases)
-    except Exception as exp_err:
-        logger.warning(f"[Coverage Analysis] Error retrieving similar expert cases: {exp_err}")
 
     clause_search_items = await clause_search_task
 
@@ -172,7 +169,12 @@ NEAR-MATCH CLARIFICATIONS REQUIRED
 • SELF-ENTERED CHECK: The person typed this text to check, before going to hospital, whether it would be covered
   if treated TODAY. Use today's date as the treatment date. There is no patient name, admission date, doctor or
   hospital — do not validate them and do not ask for them. Do NOT ask questions: next_action MUST be
-  "generate_report" (or "manual_review" only if the policy text cannot support any decision)."""
+  "generate_report" (or "manual_review" only if the policy text cannot support any decision).
+  When a policy clause makes an item's coverage depend on ONE fact this text does not give (for example eye power
+  in dioptres, BMI, accident vs illness, alcohol vs another cause, cosmetic vs reconstructive, or WHICH insured
+  member is the patient when the policy's terms differ between members), give that item the status
+  "Needs Verification" with its "verificationCondition", "verificationClause" and "decisiveQuestion", exactly as
+  described in the NEEDS VERIFICATION section. The app asks that question itself."""
 
     # Build the prompt
     user_prompt = f"""
@@ -190,10 +192,9 @@ APPLICABLE POLICY
 
 ==================================================
 
-RETRIEVED POLICY EVIDENCE (POLICY-AWARE RAG)
-(The following clauses have been retrieved as the most relevant to this specific policy, condition, and treatment.
- CONTRACTUAL POLICY WORDING is the highest authority and takes precedence over marketing reference benchmarks.
- You MUST base your explanation and decision strictly on this evidence; do not invent coverage or mix variants):
+RETRIEVED POLICY EVIDENCE (SNIPPETS OF THIS POLICY)
+(Passages of THIS policy that look most relevant to the claim. They are a shortcut only: the FULL POLICY TEXT
+ below is the complete wording and the authority. Do not invent coverage or mix variants):
 
 {retrieved_evidence_block}
 
@@ -209,28 +210,49 @@ POLICY CLAUSE SEARCH (ENTIRE POLICY TEXT, EXACT QUOTES)
 
 ==================================================
 
-DETERMINISTIC RULE ENGINE RESULT (MANDATORY GROUND TRUTH)
-(The deterministic rule engine is the SOLE authority for coverage eligibility, waiting periods,
-permanent exclusions, and sub-limits. You MUST explain why the decision was reached based on the
-retrieved evidence. You are STRICTLY FORBIDDEN from overriding a FAILED rule or changing
-NOT_COVERED / NOT_CURRENTLY_COVERED into Covered):
+APP CHECKS (POLICY PERIOD & INSURED MEMBER ONLY)
+(These checks cover ONLY whether the policy is active on the treatment date and whether the patient is an
+insured member of this policy. When one of them FAILED, every item is Not Covered for that reason.
+They do NOT decide exclusions, waiting periods, benefits, sub-limits, co-payment, room rent or hospitalisation
+requirements: YOU decide those, only from THIS policy's wording, including every exception it states.)
 
-{json.dumps(business_rule_results, indent=2, default=str)}
+{json.dumps(_app_checks_for_prompt(business_rule_results), indent=2, default=str)}
 
 ==================================================
 
-SIMILAR EXPERT CASES
-(Historical expert cases provide reference context only; they are NOT contractual policy wording):
-{expert_cases_block}
+COVER DURATION (computed by the app — use these numbers, do not recalculate)
+{_cover_duration_block(business_rule_results)}
+
+==================================================
+
+FULL POLICY TEXT (THE COMPLETE WORDING OF THIS POLICY — THE ONLY SOURCE FOR COVERAGE DECISIONS)
+(Read every section that can affect each item: schedule and table of benefits, definitions, benefits, waiting periods,
+ exclusions and their exceptions, sub-limits, co-payment, conditions and annexures.)
+
+{full_policy_text}
 
 ==================================================
 
 CRITICAL ADJUDICATION INSTRUCTIONS:
-1. Rely strictly on the RETRIEVED POLICY EVIDENCE above and the DETERMINISTIC RULE ENGINE RESULT.
-2. The Deterministic Rule Engine is authoritative. If a condition is WAITING_PERIOD_ACTIVE or PERMANENT_EXCLUSION, you MUST NOT mark it as Covered. Explain why it is not covered.
-3. Do not invent coverage terms or assume benefits not supported by retrieved text.
-4. If the retrieved evidence is insufficient to confirm coverage or exclusions, set "next_action": "manual_review".
-5. Uploaded contractual policy wording associated with the customer's policy is the highest authority.
+1. Decide every item ONLY from THIS policy's own wording: the FULL POLICY TEXT (the authority), helped by the
+   POLICY CLAUSE SEARCH and the RETRIEVED POLICY EVIDENCE.
+   Never apply a general or "statutory" exclusion, waiting period, benefit or limit that this policy does not state.
+2. A FAILED app check (policy not active on the treatment date, patient not an insured member) makes every item
+   Not Covered for that reason. Nothing else in the app checks decides coverage.
+3. Exclusions: read each exclusion with its exceptions ("unless", "except", "other than", thresholds). If an exception
+   may apply and the fact is not given, use "Needs Verification" with a decisive question.
+   Before marking an item Covered, also check the exclusions and conditions that depend on the CAUSE, PURPOSE or
+   PERSON even when they do not name the item (alcohol / substance use, accident-only benefits, self-injury,
+   sports, cosmetic purpose, a pre-existing disease declared for one insured member). Never assume the cause from
+   the diagnosis name, and never assume who the patient is.
+4. Waiting periods: use THIS policy's own waiting-period list, durations and exceptions (for example "unless arising
+   due to an Accident"), measured with the COVER DURATION numbers above.
+5. Co-payment, deductibles, sub-limits and room rent: apply them only as THIS policy states them, including their
+   conditions (for example a co-payment that applies only from a stated age at entry).
+6. Do not invent coverage terms or assume benefits not supported by the policy text.
+7. If the policy text is insufficient to decide an item, set "next_action": "manual_review".
+8. In reasons, never call anything "statutory", "permanently excluded by law" or "non-payable" in general terms:
+   always state what THIS policy says, quoting its clause.
 
 =================================================={near_match_block}
 
@@ -460,6 +482,37 @@ PREVIOUS CLARIFICATION HISTORY
         }
 
 
+def _app_checks_for_prompt(business_rule_results: dict) -> dict:
+    """
+    The app checks as the AI sees them: only whether the policy period and member
+    checks passed, and why not. The engine's internal outcome label (which reads
+    "COVERED" when nothing failed) is left out so it never suggests a coverage result.
+    """
+    br = business_rule_results if isinstance(business_rule_results, dict) else {}
+    det = br.get("deterministicResult") or {}
+    blockers = list(br.get("blockers") or [])
+    manual = det.get("status") == "MANUAL_REVIEW" or bool(br.get("manualReviewRequired"))
+    return {
+        "policyPeriodAndMemberChecks": "FAILED" if blockers else ("NEEDS_REVIEW" if manual else "PASSED"),
+        "failedChecks": blockers,
+        "notes": list(br.get("warnings") or []),
+        "checks": br.get("rules") or {},
+        "nearMatchClarifications": br.get("nearMatchClarifications") or [],
+    }
+
+
+def _cover_duration_block(business_rule_results: dict) -> str:
+    """The cover duration facts for the coverage prompt."""
+    facts = (business_rule_results or {}).get("coverDuration") if isinstance(business_rule_results, dict) else None
+    if not isinstance(facts, dict) or not facts.get("summary"):
+        return "• Not available (a date is missing). Decide waiting periods only if the policy and claim dates allow it."
+    return (
+        f"• {facts['summary']}\n"
+        f"• Cover counted from: {facts.get('coverStartDate')} ({facts.get('coverStartBasis')})\n"
+        f"• Completed months of cover: {facts.get('completedMonths')}; days of cover: {facts.get('daysActive')}"
+    )
+
+
 def _format_date_readable(date_str: str | None) -> str:
     """Formats date into e.g. '10 January 2024'."""
     if not date_str:
@@ -526,10 +579,13 @@ def _format_item_card(
     item_name = item.get("item") or item.get("name") or "Prescribed Diagnosis/Treatment"
     current_status = override_status or item.get("coverageStatus") or item.get("status") or "Not Covered"
     
-    # Normalize status to strictly one of 3 allowed values
+    # Normalize status to one of the allowed values
     status_lower = str(current_status).strip().lower()
     if "manual" in status_lower or "review" in status_lower:
         final_status = "Manual Review"
+        is_covered = False
+    elif "verif" in status_lower:
+        final_status = NEEDS_VERIFICATION
         is_covered = False
     elif "partially" in status_lower:
         final_status = "Partially Covered"
@@ -573,7 +629,6 @@ def _format_item_card(
 
     cov_amt = policy_json.get("coverageAmount")
     cov_str = f"₹{cov_amt:,}" if isinstance(cov_amt, (int, float)) and cov_amt > 0 else "the policy Sum Insured"
-    waiting_days = policy_json.get("waitingPeriodDays") or 30
 
     blockers_str = " ".join(blockers or []).lower()
     code_str = (reason_code or "").upper()
@@ -587,6 +642,31 @@ def _format_item_card(
         )
         policy_evidence = f"Period of Insurance : {period_str}. Decision pending manual review."
         financial_status = "Payable amount will be confirmed after manual review."
+
+    # Depends on one fact the documents do not give (e.g. dioptres, BMI, cause of injury)
+    elif final_status == NEEDS_VERIFICATION:
+        condition = str(item.get("verificationCondition") or "").strip()
+        clause_name = str(item.get("verificationClause") or "").strip()
+        existing_reason = item.get("coverageStatusReason") or item.get("explanation") or item.get("reason")
+        status_reason = (
+            existing_reason
+            if existing_reason and len(existing_reason) > 25
+            else (
+                f"Coverage for {item_name} depends on a detail that is not available yet. {condition}".strip()
+            )
+        )
+        existing_evidence = item.get("policyEvidence")
+        policy_evidence = (
+            existing_evidence
+            if existing_evidence and "No matching" not in existing_evidence and len(existing_evidence) > 15
+            else f"Period of Insurance : {period_str}. {clause_name or 'See the policy clauses considered for this item.'}"
+        )
+        existing_fin = item.get("financialDecision")
+        financial_status = (
+            existing_fin
+            if existing_fin and len(existing_fin) > 15
+            else "The payable amount depends on the detail that needs verification."
+        )
 
     # Case 0: All Blockers Aggregation
     elif final_status == "Not Covered" and blockers and len(blockers) > 0:
@@ -646,24 +726,8 @@ def _format_item_card(
             "0% coverage. 100% patient financial responsibility because medical treatment was received before policy inception."
         )
 
-    # Case 3: Waiting Period Active
-    elif "WAITING_PERIOD" in code_str or "waiting" in blockers_str:
-        final_status = "Not Covered"
-        is_covered = False
-        start_disp = p_start_read or "the policy start date"
-        visit_disp = v_date_read or "the consultation date"
-        status_reason = (
-            f"Your treatment for {item_name} is not covered due to the initial {waiting_days}-day waiting period clause. "
-            f"Your policy commenced on {start_disp}, and your consultation was on {visit_disp}. "
-            f"Under insurance regulations, no illness claims are payable during the initial {waiting_days} days of coverage."
-        )
-        policy_evidence = (
-            f"Period of Insurance : {period_str}. Policy Clause: Initial Waiting Period ({waiting_days} Days) - A mandatory waiting period of "
-            f"{waiting_days} days applies from the policy inception date. Illness claims during this period are excluded."
-        )
-        financial_status = (
-            f"0% coverage. 100% patient out-of-pocket responsibility because the treatment occurred within the policy's {waiting_days}-day initial waiting period."
-        )
+    # (Waiting periods are decided by the AI from the policy's own wording, so no
+    #  built-in waiting-period wording is produced here.)
 
     # Case 4: Member Not Found / Mismatch
     elif "MEMBER" in code_str or "name" in blockers_str:
@@ -687,14 +751,17 @@ def _format_item_card(
         final_status = "Not Covered"
         is_covered = False
         patient_age = prescription_json.get("age") or prescription_json.get("patientAge") or "specified age"
-        min_age = policy_json.get("minEligibleAge", 0)
-        max_age = policy_json.get("maxEligibleAge", 65)
+        min_age = policy_json.get("minEligibleAge")
+        max_age = policy_json.get("maxEligibleAge")
+        band = (
+            f" (eligible age band in the policy: {min_age} to {max_age} years)"
+            if min_age is not None and max_age is not None else ""
+        )
         status_reason = (
-            f"The patient's age ({patient_age} years) does not satisfy the policy age eligibility criteria (eligible age band: {min_age} to {max_age} years). "
-            f"Treatments for individuals outside the allowable age limit are excluded from coverage."
+            f"The patient's age ({patient_age} years) does not satisfy the age eligibility stated in the policy{band}."
         )
         policy_evidence = (
-            f"Policy Clause: Eligible Age Bracket ({min_age}-{max_age} years). Section: Member Eligibility & Plan Enrolment Guidelines."
+            f"Period of Insurance : {period_str}. Age eligibility as stated in the policy{band}."
         )
         financial_status = (
             "0% coverage. 100% patient financial responsibility due to age eligibility restrictions under policy terms."
@@ -707,21 +774,21 @@ def _format_item_card(
             existing_reason
             if existing_reason and len(existing_reason) > 25
             else (
-                f"Treatment for {item_name} is partially covered under your policy. A specific ailment sub-limit or co-payment clause "
-                f"applies to this diagnosis. The insurance company pays up to the designated limit, with the remaining balance being the patient's responsibility."
+                f"Treatment for {item_name} is partially covered under your policy. A limit or cost-sharing term of the policy "
+                f"applies, so part of the cost is the patient's responsibility."
             )
         )
         existing_evidence = item.get("policyEvidence")
         policy_evidence = (
             existing_evidence
             if existing_evidence and "No matching" not in existing_evidence and len(existing_evidence) > 15
-            else f"Period of Insurance : {period_str}. Policy Clause: Specific Disease Sub-Limits & Room Rent Capping - Reimbursable up to defined sub-limit per event."
+            else f"Period of Insurance : {period_str}. See the policy clauses considered for this item."
         )
         existing_fin = item.get("financialDecision")
         financial_status = (
             existing_fin
             if existing_fin and len(existing_fin) > 15
-            else "Partially covered up to the allowable policy sub-limit. Patient is responsible for any excess costs plus applicable co-payment."
+            else "Partially covered as per the policy's limits and cost-sharing terms."
         )
 
     # Case 7: Covered
@@ -731,22 +798,21 @@ def _format_item_card(
             existing_reason
             if existing_reason and len(existing_reason) > 25
             else (
-                f"Your treatment for {item_name} is covered under the Inpatient Hospitalization Benefit of your policy. "
-                f"Your medical visit was on {v_date_read or 'the treatment date'}, within your active Period of Insurance ({period_str}), "
-                f"and all applicable initial waiting periods have been satisfied."
+                f"Your treatment for {item_name} is covered under your policy. "
+                f"The treatment date ({v_date_read or 'the treatment date'}) is within your active Period of Insurance ({period_str})."
             )
         )
         existing_evidence = item.get("policyEvidence")
         policy_evidence = (
             existing_evidence
             if existing_evidence and "No matching" not in existing_evidence and len(existing_evidence) > 15
-            else f"Period of Insurance : {period_str}. Policy Clause: Inpatient Medical Care & Hospitalization - Covers medically necessary treatments up to Sum Insured of {cov_str}."
+            else f"Period of Insurance : {period_str}. See the policy clauses considered for this item."
         )
         existing_fin = item.get("financialDecision")
         financial_status = (
             existing_fin
             if existing_fin and len(existing_fin) > 15
-            else f"Covered 100% up to Policy Sum Insured of {cov_str}. No deductible or co-payment applicable under standard terms."
+            else f"Covered up to the policy Sum Insured of {cov_str}, subject to the policy's terms."
         )
 
     # Case 8: Other Not Covered
@@ -761,13 +827,13 @@ def _format_item_card(
         policy_evidence = (
             existing_evidence
             if existing_evidence and "No matching" not in existing_evidence and len(existing_evidence) > 15
-            else f"Period of Insurance : {period_str}. Policy Clause: General Exclusions & Eligibility Terms."
+            else f"Period of Insurance : {period_str}. See the policy clauses considered for this item."
         )
         existing_fin = item.get("financialDecision")
         financial_status = (
             existing_fin
             if existing_fin and len(existing_fin) > 15
-            else "0% covered. 100% patient financial responsibility under policy exclusion criteria."
+            else "0% covered. 100% patient financial responsibility under the policy's terms."
         )
 
     # Ensure all sync fields are assigned

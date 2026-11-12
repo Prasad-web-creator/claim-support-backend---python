@@ -58,6 +58,11 @@ class AnalysisSession(Document):
     extraction_time_ms: int = Field(default=0, alias="extractionTimeMs")
     accumulated_processing_time_ms: int = Field(default=0, alias="accumulatedProcessingTimeMs")
 
+    # A finished analysis held back while the user answers its decisive
+    # "Needs Verification" questions: {"analysis", "confidence", "questionIds"}.
+    # Empty for every other session (including historical ones).
+    pending_analysis: Optional[dict] = Field(default_factory=dict, alias="pendingAnalysis")
+
     cost_steps: List[dict] = Field(default_factory=list, alias="costSteps")
     report_id: Optional[str] = Field(default="", alias="reportId") # Once completed
     

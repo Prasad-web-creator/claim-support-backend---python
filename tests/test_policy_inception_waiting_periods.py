@@ -52,20 +52,22 @@ def test_policy_held_since_2024_covers_hernia():
     assert "first taken on 01-Jan-2024" in policy["waitingPeriodBasis"]
 
 
-def test_policy_held_since_2025_is_not_yet_covered_and_says_when():
+def test_policy_held_since_2025_gives_the_ai_the_exact_cover_duration():
+    """Whether hernia's waiting period is over is decided by the AI from the policy's own list."""
     policy = current_policy()
     _apply_declared_inception(policy, declared("2025-01-01"))
-    status, reasons = evaluate(policy)
-    assert status in ("NOT_COVERED", "NOT_CURRENTLY_COVERED")
-    assert "21 months" in reasons and "Covered from 01-Jan-2027" in reasons
+    result = enforce_business_rules(policy, dict(HERNIA_RX))
+    assert result["blockers"] == []
+    assert result["coverDuration"]["completedMonths"] == 21
+    assert "01-Jan-2025" in result["coverDuration"]["summary"]
 
 
-def test_new_policy_from_2026_is_not_covered():
+def test_new_policy_from_2026_gives_the_ai_the_exact_cover_duration():
     policy = current_policy()
     _apply_declared_inception(policy, declared("2026-01-01"))
-    status, reasons = evaluate(policy)
-    assert status in ("NOT_COVERED", "NOT_CURRENTLY_COVERED")
-    assert "Covered from 01-Jan-2028" in reasons
+    result = enforce_business_rules(policy, dict(HERNIA_RX))
+    assert result["blockers"] == []
+    assert result["coverDuration"]["completedMonths"] == 9
 
 
 def test_break_in_renewal_counts_from_current_policy_start():
@@ -97,24 +99,28 @@ def test_no_declared_date_keeps_previous_behaviour():
 
 def test_document_stating_another_start_asks_the_user():
     policy = current_policy()
-    policy["continuity"] = {"continuousCoverageSince": "2023-01-01"}
+    # The document's own wording names it as the first start ("continuous coverage since").
+    policy["continuity"] = {
+        "continuousCoverageSince": "2023-01-01",
+        "continuityEvidence": ["Continuous coverage since 01/01/2023"],
+    }
     start = _apply_declared_inception(policy, declared("2024-01-01"))
     question = _inception_conflict_question(policy, start)
     assert question and question["id"] == "policy_inception_date_conflict"
-    assert _inception_conflict_question({"continuity": {"continuousCoverageSince": "2024-01-01"}}, start) is None
+    assert _inception_conflict_question(
+        {"continuity": {"continuousCoverageSince": "2024-01-01", "continuityEvidence": ["Member since 01/01/2024"]}},
+        start,
+    ) is None
 
 
-def test_outpatient_only_is_not_covered_without_opd_benefit():
+def test_outpatient_is_decided_by_the_ai_from_the_policy():
+    """Out-patient cover depends on each policy's wording; the app checks do not decide it."""
     rx = {"visitDate": "2026-10-12", "diagnosis": "Viral fever", "hospitalizationRequired": False}
     policy = current_policy()
     _apply_declared_inception(policy, declared("2024-01-01"))
     status, reasons = evaluate(policy, rx)
-    assert status in ("NOT_COVERED", "NOT_CURRENTLY_COVERED")
-    assert "Out-patient treatment" in reasons
-
-    policy["coveredTreatments"] = ["In-patient hospitalisation", "OPD cover up to Rs. 5,000"]
-    status, _ = evaluate(policy, rx)
     assert status == "COVERED"
+    assert reasons == ""
 
 
 def test_short_typed_text_is_treated_as_manual_prescription():

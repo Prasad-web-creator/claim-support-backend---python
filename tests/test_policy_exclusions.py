@@ -1,16 +1,10 @@
 """
 A treatment the policy itself excludes (e.g. Maternity under D.18 / Excl18) is
-reported as a permanent policy exclusion, quoting the policy's own clause, rather
-than as the initial 30-day waiting period.
+decided by the AI from the policy's own wording, including its exceptions
+(ectopic pregnancy). The app checks never block it by matching words.
 """
 
 from app.services.coverage.business_rules import enforce_business_rules
-from app.services.coverage.coverage_analysis import _format_item_card
-from app.services.rule_engine.policy_exclusions import (
-    find_exclusion_clause,
-    find_schedule_not_covered,
-    match_policy_exclusion,
-)
 
 POLICY_TEXT = """Waiting Periods
 Initial waiting period (all illnesses except accidents) - Code Excl03
@@ -45,40 +39,14 @@ def manual_rx(text):
     }
 
 
-def test_matches_excluded_treatment_but_not_its_stated_exception():
-    entries = POLICY["excludedTreatments"]
-    assert match_policy_exclusion(["Maternity"], entries)["entry"] == "Maternity (except ectopic pregnancy)"
-    assert match_policy_exclusion(["Ectopic pregnancy"], entries) is None
-    assert match_policy_exclusion(["Fever"], entries) is None
+def test_maternity_is_decided_by_the_ai_not_the_app_checks():
+    """The policy's maternity exclusion (and its ectopic exception) is read by the AI, not matched by words."""
+    br = enforce_business_rules(POLICY, manual_rx("Maternity"), policy_text=POLICY_TEXT)
+    assert br["blockers"] == []
+    assert br["deterministicResult"]["status"] != "NOT_COVERED"
+    assert "permanently excluded" not in str(br).lower()
 
 
-def test_finds_clause_and_schedule_row():
-    clause = find_exclusion_clause(POLICY_TEXT, "maternity")
-    assert (clause["section"], clause["title"], clause["code"]) == ("D.18", "Maternity (Excl18)", "Excl18")
-    assert clause["wording"].startswith("Medical treatment expenses traceable to childbirth")
-    assert find_schedule_not_covered(POLICY_TEXT, "maternity") == "Maternity / Newborn: Not covered under this plan"
-
-
-def test_maternity_reason_cites_policy_exclusion_not_waiting_period():
-    rx = manual_rx("Maternity")
-    br = enforce_business_rules(POLICY, rx, policy_text=POLICY_TEXT)
-    assert br["deterministicResult"]["status"] == "NOT_COVERED"
-
-    card = _format_item_card(
-        {"item": "Maternity"}, POLICY, rx,
-        override_status="Not Covered",
-        reason_code=br["deterministicResult"]["reasonCode"],
-        blockers=br["blockers"],
-    )
-    reason = card["coverageStatusReason"]
-    assert "D.18 Maternity (Excl18)" in reason
-    assert "Maternity / Newborn: Not covered under this plan" in reason
-    assert "30-day" not in reason
-    assert "traceable to childbirth" in card["policyEvidence"]
-    assert "permanently excluded" in card["financialDecision"]
-
-
-def test_excluded_without_policy_text_names_the_listed_exclusion():
+def test_no_listed_exclusion_blocks_without_policy_text_either():
     br = enforce_business_rules(POLICY, manual_rx("Maternity"), policy_text=None)
-    assert any('"Maternity (except ectopic pregnancy)"' in b for b in br["blockers"])
-    assert len([b for b in br["blockers"] if "excluded" in b.lower() and "maternity" in b.lower()]) == 1
+    assert br["blockers"] == []

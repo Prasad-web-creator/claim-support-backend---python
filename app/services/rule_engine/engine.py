@@ -22,11 +22,6 @@ from app.services.rule_engine.models import (
 )
 from app.services.rule_engine.condition_normalizer import ConditionNormalizer
 from app.services.rule_engine.evaluators.policy_validity import PolicyValidityEvaluator
-from app.services.rule_engine.evaluators.exclusion_evaluator import ExclusionEvaluator
-from app.services.rule_engine.evaluators.waiting_period import WaitingPeriodEvaluator
-from app.services.rule_engine.evaluators.benefit_evaluator import BenefitEvaluator
-from app.services.rule_engine.evaluators.limits import LimitsEvaluator
-from app.services.rule_engine.evaluators.cost_sharing import CostSharingEvaluator
 from app.services.rule_engine.evaluators.network_geography import NetworkGeographyEvaluator
 from app.services.rule_engine.conflict_resolver import ConflictResolver
 
@@ -36,20 +31,13 @@ logger = logging.getLogger(__name__)
 class CoverageRuleEngine:
     """
     Main entrypoint for deterministic policy rule evaluation.
-    Executes rules in strict order:
-        1. Policy validity
-        2. Claim / treatment date
-        3. Condition normalization
-        4. Permanent exclusions
-        5. Waiting periods
-        6. Benefits inclusion
-        7. Limits & sub-limits
-        8. Co-pay & deductibles
-        9. Network / provider requirements
-        10. Geography / territorial jurisdiction
-        11. Hospitalization duration
-        12. Conflict detection & aggregation
-        13. Final decision generation
+    Checks only facts that need no interpretation of the policy wording:
+        1. Policy validity on the treatment date
+        2. Network-only policy vs a non-network hospital
+        3. Conflict detection & final decision
+
+    Exclusions, waiting periods, benefits, limits, co-payment and hospitalisation
+    requirements are decided by the AI coverage analysis from the policy's own wording.
     """
 
     ENGINE_VERSION = "2.0.0-deterministic"
@@ -83,30 +71,20 @@ class CoverageRuleEngine:
         # ──────────────────────────────────────────────────────────────────────
         # Stage 3: Normalize Diagnosis / Treatment
         # ──────────────────────────────────────────────────────────────────────
+        # Kept for the audit payload only; it decides nothing.
         normalized_conditions = ConditionNormalizer.normalize_claim(prescription_data)
 
-        # Check for Ambiguous Diagnosis
-        has_only_ambiguous = (
-            len(normalized_conditions) > 0
-            and all(c.category == "AMBIGUOUS" or c.confidence < 0.50 for c in normalized_conditions)
-        )
-        if has_only_ambiguous:
-            all_results.append(
-                RuleCheckResult(
-                    rule_type=RuleType.OTHER_POLICY_SPECIFIC,
-                    rule_id="AMB-DIAG-001",
-                    condition="AMBIGUOUS_CLINICAL_PRESENTATION",
-                    status=RuleStatus.MANUAL_REVIEW,
-                    reason_code=ReasonCode.AMBIGUOUS_DIAGNOSIS,
-                    description=(
-                        f"Ambiguous Diagnosis: Clinical presentation ('{normalized_conditions[0].original_text}') "
-                        f"is non-specific. Medical review required to determine definitive illness."
-                    ),
-                    metadata={"originalText": normalized_conditions[0].original_text},
-                )
-            )
+        # Coverage itself (exclusions, waiting periods, benefits, limits, co-payment,
+        # hospitalisation requirements, territory) is NOT decided here. It is decided
+        # by the AI coverage analysis from the customer's own policy wording, because
+        # built-in lists cannot know each policy's terms and exceptions
+        # (e.g. "excluded unless BMI is 40 or more").
+        #
+        # The engine only checks facts that need no interpretation of the policy:
+        #   • the policy is active on the treatment date (dates printed on the policy);
+        #   • a network-only policy and a non-network hospital (fields of the policy).
 
-        # Check for Ambiguous Policy Terms
+        # Check for Ambiguous Policy Terms (flag set by the policy extraction itself)
         if policy_data.get("isAmbiguous") is True or policy_data.get("ambiguousPolicyTerms") is True:
             all_results.append(
                 RuleCheckResult(
@@ -120,52 +98,8 @@ class CoverageRuleEngine:
                 )
             )
 
-        # ──────────────────────────────────────────────────────────────────────
-        # Stage 4: Permanent Exclusions
-        # ──────────────────────────────────────────────────────────────────────
-        excl_results = ExclusionEvaluator.evaluate(policy_data, prescription_data, normalized_conditions)
-        all_results.extend(excl_results)
-
-        # ──────────────────────────────────────────────────────────────────────
-        # Stage 5: Waiting Periods
-        # ──────────────────────────────────────────────────────────────────────
-        wp_results = WaitingPeriodEvaluator.evaluate(policy_data, prescription_data, normalized_conditions)
-        all_results.extend(wp_results)
-
-        # ──────────────────────────────────────────────────────────────────────
-        # Stage 6: Benefits
-        # ──────────────────────────────────────────────────────────────────────
-        ben_results = BenefitEvaluator.evaluate(policy_data, prescription_data, normalized_conditions)
-        all_results.extend(ben_results)
-
-        # ──────────────────────────────────────────────────────────────────────
-        # Stage 7: Limits / Sub-Limits
-        # ──────────────────────────────────────────────────────────────────────
-        lim_results = LimitsEvaluator.evaluate(policy_data, prescription_data, normalized_conditions)
-        all_results.extend(lim_results)
-
-        # Extract base eligible amount after sub-limits (if any applied)
-        base_eligible: Optional[float] = None
-        for lr in lim_results:
-            if lr.financial_impact and "eligibleAmount" in lr.financial_impact:
-                base_eligible = float(lr.financial_impact["eligibleAmount"])
-                break
-
-        # ──────────────────────────────────────────────────────────────────────
-        # Stage 8: Co-Pay / Deductible
-        # ──────────────────────────────────────────────────────────────────────
-        cost_results = CostSharingEvaluator.evaluate(
-            policy_data,
-            prescription_data,
-            base_eligible_amount=base_eligible,
-        )
-        all_results.extend(cost_results)
-
-        # ──────────────────────────────────────────────────────────────────────
-        # Stages 9, 10 & 11: Network, Geography & Hospitalization Requirements
-        # ──────────────────────────────────────────────────────────────────────
-        net_geo_results = NetworkGeographyEvaluator.evaluate(policy_data, prescription_data, normalized_conditions)
-        all_results.extend(net_geo_results)
+        # Network requirement read from the policy's own fields
+        all_results.extend(NetworkGeographyEvaluator.evaluate_network(policy_data, prescription_data))
 
         # ──────────────────────────────────────────────────────────────────────
         # Stage 12: Aggregate Results & Conflict Detection

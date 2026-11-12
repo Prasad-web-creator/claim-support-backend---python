@@ -20,6 +20,21 @@ class NetworkGeographyEvaluator:
     """Evaluates network compliance, territorial validity, and hospitalization duration."""
 
     @classmethod
+    def evaluate_network(
+        cls,
+        policy_data: Dict[str, Any],
+        prescription_data: Dict[str, Any],
+    ) -> List[RuleCheckResult]:
+        """
+        Only the network requirement, read from the policy's own fields. Territory
+        and hospitalisation duration are decided from the policy wording by the AI.
+        """
+        return [
+            r for r in cls.evaluate(policy_data, prescription_data, [])
+            if r.rule_type == RuleType.NETWORK
+        ]
+
+    @classmethod
     def evaluate(
         cls,
         policy_data: Dict[str, Any],
