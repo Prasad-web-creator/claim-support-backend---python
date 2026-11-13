@@ -1134,3 +1134,164 @@ async def test_continuity_is_written_to_each_report(harness, monkeypatch, db):
         live = await mpo.continuity_for_report(report)
         assert live["statusCode"] == "VERIFIED"
         assert live["currentPolicy"]["policyId"] == harness.id("2026")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Concurrent writers: answering one policy while the run is still busy with
+# others (the 3–4 policy case). Each writer must only change its own policy.
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _start_with_slow_policy(harness, monkeypatch, labels, slow_label):
+    """Start a run in the background; `slow_label` blocks until released."""
+    original = mpo.run_single_policy_analysis
+    reached, release = asyncio.Event(), asyncio.Event()
+
+    async def run_single(session, **kwargs):
+        if harness.label(str(session.policy_id)) == slow_label:
+            reached.set()
+            await release.wait()
+        return await original(session, **kwargs)
+
+    monkeypatch.setattr(mpo, "run_single_policy_analysis", run_single)
+    parent = await mpo.create_multi_policy_session(
+        USER, harness.rx_id, [harness.id(label) for label in labels]
+    )
+    run = asyncio.create_task(mpo.run_multi_policy_analysis(parent, USER))
+    await asyncio.wait_for(reached.wait(), timeout=5)
+    return str(parent.id), run, release
+
+
+async def test_answer_during_running_siblings_is_not_reverted(harness, monkeypatch):
+    for label in ("A", "B", "C", "D"):
+        await harness.add_policy(label)
+    await harness.add_prescription()
+    harness.behaviour["A"] = "clarify"
+    harness.behaviour["B"] = "clarify"
+
+    session_id, run, release = await _start_with_slow_policy(
+        harness, monkeypatch, ["A", "B", "C", "D"], slow_label="D"
+    )
+    # Wait until A and B are asking their questions while D is still running.
+    for _ in range(200):
+        snap = await mpo.get_multi_policy_session(session_id, USER)
+        if all(harness.entry(snap, x)["status"] == "waiting_for_user" for x in ("A", "B")):
+            break
+        await asyncio.sleep(0)
+
+    # Answer A and B while D is still being analysed.
+    await mpo.resume_policy_analysis(session_id, harness.id("A"), USER, {"q": "yes"})
+    await mpo.resume_policy_analysis(session_id, harness.id("B"), USER, {"q": "yes"})
+
+    release.set()
+    final = await asyncio.wait_for(run, timeout=5)
+    final = await mpo.get_multi_policy_session(session_id, USER)
+
+    # The run finishing D must not resurrect A/B's old questions.
+    for label in ("A", "B", "C", "D"):
+        entry = harness.entry(final, label)
+        assert entry["status"] == "completed", (label, entry["status"])
+        assert entry["questions"] == []
+    assert final["status"] == "completed"
+
+
+async def test_same_answers_cannot_be_submitted_twice(harness):
+    await harness.add_policy("A")
+    await harness.add_prescription()
+    harness.behaviour["A"] = "clarify"
+    started = await mpo.start_multi_policy_analysis(USER, harness.rx_id, [harness.id("A")])
+
+    gate = asyncio.Event()
+    original = mpo.resume_analysis_session
+
+    async def slow_resume(*args, **kwargs):
+        await gate.wait()
+        return await original(*args, **kwargs)
+
+    mpo.resume_analysis_session = slow_resume
+    try:
+        first = asyncio.create_task(
+            mpo.resume_policy_analysis(started["sessionId"], harness.id("A"), USER, {"q": "yes"})
+        )
+        await asyncio.sleep(0.01)
+        with pytest.raises(ValueError, match="not waiting for clarification"):
+            await mpo.resume_policy_analysis(started["sessionId"], harness.id("A"), USER, {"q": "yes"})
+        gate.set()
+        result = await asyncio.wait_for(first, timeout=5)
+    finally:
+        mpo.resume_analysis_session = original
+
+    assert harness.entry(result, "A")["status"] == "completed"
+    assert len([a for a in harness.analyses if a["resumed"]]) == 1
+
+
+async def test_background_answer_returns_at_once_and_completes(harness):
+    await harness.add_policy("A")
+    await harness.add_policy("B")
+    await harness.add_prescription()
+    harness.behaviour["A"] = "clarify"
+    started = await mpo.start_multi_policy_analysis(
+        USER, harness.rx_id, [harness.id("A"), harness.id("B")]
+    )
+
+    returned = await mpo.resume_policy_analysis(
+        started["sessionId"], harness.id("A"), USER, {"q": "yes"}, wait=False
+    )
+    assert harness.entry(returned, "A")["status"] == "reanalyzing"
+
+    for _ in range(200):
+        snap = await mpo.get_multi_policy_session(started["sessionId"], USER)
+        if harness.entry(snap, "A")["status"] == "completed":
+            break
+        await asyncio.sleep(0.01)
+    assert harness.entry(snap, "A")["status"] == "completed"
+    assert harness.entry(snap, "B")["status"] == "completed"
+
+
+async def test_queue_numbers_follow_selection_order(harness):
+    for label in ("A", "B", "C"):
+        await harness.add_policy(label)
+    await harness.add_prescription()
+    result = await mpo.start_multi_policy_analysis(
+        USER, harness.rx_id, [harness.id("C"), harness.id("A"), harness.id("B")]
+    )
+    assert harness.entry(result, "C")["queueNumber"] == 1
+    assert harness.entry(result, "A")["queueNumber"] == 2
+    assert harness.entry(result, "B")["queueNumber"] == 3
+
+
+async def test_fatal_prescription_error_fails_queued_policies(harness, monkeypatch):
+    await harness.add_policy("A")
+    await harness.add_policy("B")
+    await harness.add_prescription()
+
+    async def broken_rx(*_args, **_kwargs):
+        raise RuntimeError("could not read prescription")
+
+    monkeypatch.setattr(mpo, "_extract_shared_prescription", broken_rx)
+    parent = await mpo.create_multi_policy_session(
+        USER, harness.rx_id, [harness.id("A"), harness.id("B")]
+    )
+    with pytest.raises(RuntimeError):
+        await mpo.run_multi_policy_analysis(parent, USER)
+
+    snap = await mpo.get_multi_policy_session(str(parent.id), USER)
+    # Nothing is left "queued" for the app to wait on forever.
+    assert all(e["status"] == "failed" for e in snap["policyAnalyses"])
+
+
+async def test_interrupted_run_is_marked_failed_on_read(harness):
+    from datetime import datetime, timedelta, timezone
+    from app.models.multi_policy_session import MultiPolicyAnalysisSession
+
+    await harness.add_policy("A")
+    await harness.add_prescription()
+    parent = await mpo.create_multi_policy_session(USER, harness.rx_id, [harness.id("A")])
+    old = datetime.now(timezone.utc) - timedelta(seconds=mpo.STALE_RUN_SECONDS + 60)
+    await MultiPolicyAnalysisSession.get_motor_collection().update_one(
+        {"_id": parent.id}, {"$set": {"updatedAt": old}}
+    )
+
+    snap = await mpo.get_multi_policy_session(str(parent.id), USER)
+    entry = harness.entry(snap, "A")
+    assert entry["status"] == "failed"
+    assert entry["errorMessage"] == mpo.INTERRUPTED_MESSAGE

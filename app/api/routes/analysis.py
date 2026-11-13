@@ -152,7 +152,7 @@ async def get_multi_analysis(
 
 
 @router.post("/multi/{session_id}/{policy_id}/answer")
-@limiter.limit("5/minute")
+@limiter.limit("30/minute")
 async def answer_multi_clarification(
     request: Request,
     session_id: str,
@@ -168,7 +168,10 @@ async def answer_multi_clarification(
             policy_id=policy_id,
             user_id=current_user["id"],
             answers=body.answers,
-            background_tasks=background_tasks
+            background_tasks=background_tasks,
+            # Re-analysis runs in the background; the app follows it by polling,
+            # so a long AI step can never time out the request.
+            wait=False,
         )
         return {"success": True, **result}
     except PermissionError as e:
@@ -233,7 +236,7 @@ async def delete_grouped_analysis(
 
 
 @router.post("/multi/{session_id}/{policy_id}/retry")
-@limiter.limit("5/minute")
+@limiter.limit("30/minute")
 async def retry_multi_policy(
     request: Request,
     session_id: str,
@@ -247,7 +250,8 @@ async def retry_multi_policy(
             parent_session_id=session_id,
             policy_id=policy_id,
             user_id=current_user["id"],
-            background_tasks=background_tasks
+            background_tasks=background_tasks,
+            wait=False,
         )
         return {"success": True, **result}
     except PermissionError as e:

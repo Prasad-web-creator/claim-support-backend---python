@@ -864,6 +864,50 @@ def _clarification_history(session: AnalysisSession) -> list:
     return history
 
 
+def _question_key(text) -> str:
+    """Wording of a question reduced to letters/digits, to spot the same question re-asked."""
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).split())
+
+
+def _already_asked(session: AnalysisSession, q_data: dict, also: list = ()) -> bool:
+    """
+    True when this question was already asked in the session (or is in `also`) —
+    by id, or by the same wording under a different id. The AI sometimes
+    re-asks an answered question with a new id; the user must never see it twice.
+    """
+    q_id = q_data.get("id")
+    key = _question_key(q_data.get("question"))
+    for q in list(session.questions) + list(also):
+        other_id = q.id if hasattr(q, "id") else q.get("id")
+        other_text = q.question if hasattr(q, "question") else q.get("question")
+        if q_id and other_id == q_id:
+            return True
+        if key and key == _question_key(other_text):
+            return True
+    return False
+
+
+def _new_questions(session: AnalysisSession, questions: list) -> list:
+    """The valid questions in `questions` that the user has not been asked yet."""
+    fresh = []
+    for q_data in questions or []:
+        if not isinstance(q_data, dict):
+            continue
+        if not q_data.get("id") or not q_data.get("title") or not q_data.get("question"):
+            continue
+        if not _already_asked(session, q_data, fresh):
+            fresh.append(q_data)
+    return fresh
+
+
+DECIDE_WITH_ANSWERS_INSTRUCTION = (
+    "IMPORTANT — FINAL ROUND: every question needed has already been asked and answered in the "
+    "PREVIOUS CLARIFICATION HISTORY above. Do NOT ask any of them again, in any wording. Decide every "
+    "item using those answers and set \"next_action\" to \"generate_report\" (use \"manual_review\" only "
+    "if the policy text itself cannot decide)."
+)
+
+
 def _manual_review_result(policy_json: dict, prescription_json: dict, br_results: dict, reason: str) -> dict:
     """A complete Coverage Summary for an undecided case, so the app never opens an empty screen."""
     report = generate_report(
@@ -923,6 +967,29 @@ async def _run_llm_analysis(
         on_stage=lambda stage: _report_stage(on_stage, stage),
     )
 
+    # The AI only re-asked questions the user has already answered: run it once
+    # more, telling it to decide with those answers, instead of asking again.
+    if (
+        clarification_history
+        and coverage_analysis.get("next_action") == "ask_questions"
+        and not _new_questions(session, coverage_analysis.get("questions", []))
+    ):
+        logger.info(
+            f"[Claim Analysis] Session {session.id}: AI repeated already-answered questions; "
+            "re-running it to decide with the answers given."
+        )
+        coverage_analysis = await analyze_coverage(
+            policy_text=session.policy_text or "",
+            prescription_text=session.prescription_text or "",
+            business_rule_results=br_results,
+            prescription_json=prescription_json,
+            clarification_history=clarification_history,
+            policy_json=session.policy_json or {},
+            policy_id=session.policy_id or "",
+            on_stage=lambda stage: _report_stage(on_stage, stage),
+            extra_instruction=DECIDE_WITH_ANSWERS_INSTRUCTION,
+        )
+
     llm_round_duration_ms = int((time.time() - llm_start_time) * 1000)
     extraction_time = getattr(session, "extraction_time_ms", None) or session.accumulated_processing_time_ms or 0
     total_processing_time = extraction_time + llm_round_duration_ms
@@ -953,8 +1020,9 @@ async def _run_llm_analysis(
             if not q_id or not q_data.get("title") or not q_data.get("question"):
                 continue
             
-            # Deduplication
-            if not any(q.id == q_id for q in session.questions):
+            # Deduplication — by id and by wording, so a re-worded id never
+            # shows the user a question they have already answered.
+            if not _already_asked(session, q_data, filtered_questions):
                 if len(session.questions) + len(filtered_questions) >= 10:
                     logger.warning(f"[Claim Analysis] Session {session.id} reached max 10 questions.")
                     break
@@ -1068,7 +1136,9 @@ async def _pause_for_decisive_questions(
         questions = pending_decisive_questions(
             preview.get("comparison") or [],
             asked_ids={q.id for q in session.questions},
-        )[:room]
+        )
+        # Never re-ask an answered question under a different id.
+        questions = [dq for dq in questions if not _already_asked(session, client_question(dq))][:room]
         if not questions:
             return None
 

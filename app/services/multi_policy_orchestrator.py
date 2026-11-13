@@ -14,6 +14,7 @@ never affects the others.
 import asyncio
 import copy
 import time
+import weakref
 from datetime import datetime, timezone
 from typing import Optional, List
 
@@ -22,6 +23,7 @@ from beanie import PydanticObjectId as ObjectId
 
 from app.core.config import get_settings
 from app.core.logging import logger, log_section
+from app.core.sanitize import sanitize_nulls as _sanitize_nulls
 from app.models.analysis_report import AnalysisReport
 from app.models.analysis_session import AnalysisSession
 from app.models.multi_policy_session import MultiPolicyAnalysisSession, PolicyAnalysisEntry
@@ -80,6 +82,106 @@ def stage_label(stage: str) -> str:
     return STAGE_LABELS.get(stage or "", stage or "")
 
 
+# A running policy whose session has not been written to for this long is
+# treated as interrupted (e.g. the server restarted mid-analysis), so the app
+# can offer Retry instead of showing a spinner forever.
+STALE_RUN_SECONDS = 15 * 60
+INTERRUPTED_MESSAGE = "This analysis was interrupted. Tap Retry to run it again."
+
+RUNNING_STATUSES = ("queued", "extracting", "analyzing", "reanalyzing")
+
+
+# ─── Atomic persistence ──────────────────────────────────────────────────────
+#
+# Several writers touch one parent document at the same time: the initial run
+# (still analysing later policies), an answer resuming one policy, a retry of
+# another. Each holds its OWN in-memory copy of the parent, so saving the whole
+# document would overwrite the other writers' changes with stale data — e.g. a
+# policy already being re-analysed flipping back to "waiting for your answer",
+# which then fails when answered again. Every write below therefore changes
+# only the fields it owns, directly in MongoDB.
+
+def _entry_key(name: str) -> str:
+    field = PolicyAnalysisEntry.model_fields[name]
+    return field.alias or name
+
+
+def _parent_key(name: str) -> str:
+    field = MultiPolicyAnalysisSession.model_fields[name]
+    return field.alias or name
+
+
+def _collection():
+    return MultiPolicyAnalysisSession.get_motor_collection()
+
+
+def _clean(value):
+    return _sanitize_nulls(value) if isinstance(value, dict) else value
+
+
+async def _db_set_entry(
+    parent_id,
+    policy_id: str,
+    fields: dict,
+    *,
+    only_if_status: Optional[tuple] = None,
+) -> bool:
+    """
+    Set fields of one policy slot atomically. With `only_if_status`, the write
+    happens only while the slot is in one of those statuses (a compare-and-set),
+    and the return value says whether it did.
+    """
+    match = {"policyId": policy_id}
+    if only_if_status:
+        match["status"] = {"$in": list(only_if_status)}
+    update = {f"policyAnalyses.$.{_entry_key(k)}": _clean(v) for k, v in fields.items()}
+    update[_parent_key("updated_at")] = datetime.now(timezone.utc)
+    result = await _collection().update_one(
+        {"_id": parent_id, "policyAnalyses": {"$elemMatch": match}},
+        {"$set": update},
+    )
+    return result.matched_count == 1
+
+
+async def _write_entry(parent_id, entry: PolicyAnalysisEntry) -> None:
+    """Persist every field of one policy slot (owned by the caller) atomically."""
+    fields = {name: getattr(entry, name) for name in PolicyAnalysisEntry.model_fields}
+    fields.pop("policy_id", None)
+    await _db_set_entry(parent_id, entry.policy_id, fields)
+
+
+async def _set_parent(parent: MultiPolicyAnalysisSession, **fields) -> None:
+    """Set top-level parent fields atomically and mirror them in memory."""
+    update = {_parent_key(k): _clean(v) for k, v in fields.items()}
+    update[_parent_key("updated_at")] = datetime.now(timezone.utc)
+    await _collection().update_one({"_id": parent.id}, {"$set": update})
+    for key, value in fields.items():
+        setattr(parent, key, value)
+
+
+async def _reload(parent: MultiPolicyAnalysisSession) -> MultiPolicyAnalysisSession:
+    """The parent as it is in the database now (other writers included)."""
+    try:
+        fresh = await MultiPolicyAnalysisSession.get(parent.id)
+    except Exception:
+        fresh = None
+    return fresh or parent
+
+
+# One lock per parent session (per event loop) so recomputing the roll-up
+# status never interleaves with another recompute in this process.
+_PARENT_LOCKS: "weakref.WeakValueDictionary" = weakref.WeakValueDictionary()
+
+
+def _parent_lock(parent_id: str) -> asyncio.Lock:
+    key = (id(asyncio.get_running_loop()), str(parent_id))
+    lock = _PARENT_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PARENT_LOCKS[key] = lock
+    return lock
+
+
 async def _update_entry(
     parent: MultiPolicyAnalysisSession,
     policy_id: str,
@@ -89,19 +191,19 @@ async def _update_entry(
     """
     Apply changes to one policy slot and persist them immediately.
 
-    Every write goes through the shared lock and re-resolves the slot first:
-    policies run concurrently against ONE parent document, and Beanie rebuilds
-    nested sub-documents on save(), so a reference taken earlier is stale.
+    The database write touches only these fields of this policy, so concurrent
+    writers (other policies, an answer, a retry) are never overwritten. The
+    in-memory copy is updated too, for the caller's own later reads.
     Persisting here is what makes the progress readable by a polling client
     while the analysis is still running.
     """
     async with lock:
+        await _db_set_entry(parent.id, policy_id, fields)
         live = parent.get_entry(policy_id)
         if live is None:
             return
         for key, value in fields.items():
             setattr(live, key, value)
-        await parent.save()
 
 
 async def _set_stage(
@@ -333,13 +435,27 @@ async def continuity_for_report(report: AnalysisReport) -> Optional[dict]:
     return results.get(report.policy_id)
 
 
-async def _refresh_parent_status(parent: MultiPolicyAnalysisSession) -> MultiPolicyAnalysisSession:
-    """Recompute the parent status, comparison summary and continuity, and persist."""
-    parent.status = _derive_parent_status(parent.policy_analyses)
-    parent.comparison_summary = build_comparison_summary(parent.policy_analyses)
-    await _refresh_continuity(parent)
-    await parent.save()
-    return parent
+async def _refresh_parent_status(
+    parent: MultiPolicyAnalysisSession,
+    **extra_fields,
+) -> MultiPolicyAnalysisSession:
+    """
+    Recompute the parent status, comparison summary and continuity from the
+    database's current state (so every concurrent writer's results count), and
+    persist only those roll-up fields. Returns the fresh parent.
+    """
+    async with _parent_lock(str(parent.id)):
+        fresh = await _reload(parent)
+        fresh.comparison_summary = build_comparison_summary(fresh.policy_analyses)
+        await _refresh_continuity(fresh)
+        await _set_parent(
+            fresh,
+            status=_derive_parent_status(fresh.policy_analyses),
+            comparison_summary=fresh.comparison_summary,
+            policy_continuity=fresh.policy_continuity or {},
+            **extra_fields,
+        )
+        return fresh
 
 
 def _entry_from_result(entry: PolicyAnalysisEntry, result: dict) -> PolicyAnalysisEntry:
@@ -573,7 +689,7 @@ async def _analyze_one_policy(
                     else:
                         entry.stage = "done"
                         entry.completed_steps = entry.total_steps or POLICY_TOTAL_STEPS
-                await parent.save()
+                    await _write_entry(parent.id, entry)
 
             entry = parent.get_entry(policy_id)
             _log_stage(parent_id, policy_id, "finished", entry.status if entry else "")
@@ -589,7 +705,7 @@ async def _analyze_one_policy(
                     entry.stage = "failed"
                     entry.error_message = str(e)
                     entry.completed_at = datetime.now(timezone.utc)
-                await parent.save()
+                    await _write_entry(parent.id, entry)
             _log_stage(parent_id, policy_id, "failed", "failed", detail=type(e).__name__)
             logger.error(f"[MultiPolicy] session={parent_id} policy={policy_id} error: {e}", exc_info=True)
             if session is not None:
@@ -667,18 +783,21 @@ async def run_multi_policy_analysis(
     start_time = time.time()
     parent_id = str(parent.id)
 
+    _mark_active(parent_id, +1)
     try:
         # ─── Step 1: prescription extracted ONCE, reused by every policy ──────
-        parent.prescription_stage = "extracting"
-        await parent.save()
+        await _set_parent(parent, prescription_stage="extracting")
 
         rx_ctx, rx_text, prescription_json = await _extract_shared_prescription(parent, user_id)
-        parent.prescription_text = rx_text
-        parent.prescription_json = prescription_json
-        parent.is_manual_prescription = rx_ctx.is_manual
-        parent.prescription_stage = "ready"
-        parent.status = "analyzing"
-        await parent.save()
+        await _set_parent(
+            parent,
+            prescription_id=parent.prescription_id,
+            prescription_text=rx_text,
+            prescription_json=prescription_json,
+            is_manual_prescription=rx_ctx.is_manual,
+            prescription_stage="ready",
+            status="analyzing",
+        )
 
         # ─── Step 2: bounded concurrent per-policy analysis ───────────────────
         # One lock guards writes to the shared parent document: policies run
@@ -711,25 +830,48 @@ async def run_multi_policy_analysis(
                 entry.stage = "failed"
                 entry.error_message = str(res)
                 entry.failed_at_stage = "orchestration"
-                _attach_entry(parent, entry)
+                await _write_entry(parent.id, entry)
                 logger.error(f"[MultiPolicy] session={parent_id} unexpected error: {res}")
 
-        parent.total_processing_time_ms = int((time.time() - start_time) * 1000)
-        await _refresh_parent_status(parent)
+        fresh = await _refresh_parent_status(
+            parent,
+            total_processing_time_ms=int((time.time() - start_time) * 1000),
+        )
 
         logger.info(
-            f"[MultiPolicy] session={parent_id} finished status={parent.status} "
-            f"({parent.total_processing_time_ms}ms)"
+            f"[MultiPolicy] session={parent_id} finished status={fresh.status} "
+            f"({fresh.total_processing_time_ms}ms)"
         )
-        return serialize_multi_session(parent)
+        return serialize_multi_session(fresh)
 
     except Exception as e:
         logger.error(f"[MultiPolicy] session={parent_id} fatal error: {e}", exc_info=True)
-        parent.status = "failed"
-        parent.error_message = str(e)
-        parent.total_processing_time_ms = int((time.time() - start_time) * 1000)
-        await parent.save()
+        # Policies that never got to run would otherwise sit at "queued" and
+        # the app would keep waiting for them; mark them failed so Retry shows.
+        fresh = await _reload(parent)
+        for entry in fresh.policy_analyses:
+            if entry.status in RUNNING_STATUSES:
+                await _db_set_entry(
+                    parent.id,
+                    entry.policy_id,
+                    {
+                        "status": "failed",
+                        "stage": "failed",
+                        "failed_at_stage": entry.stage or "prescription_extraction",
+                        "error_message": str(e),
+                        "completed_at": datetime.now(timezone.utc),
+                    },
+                    only_if_status=RUNNING_STATUSES,
+                )
+        await _set_parent(
+            parent,
+            status="failed",
+            error_message=str(e),
+            total_processing_time_ms=int((time.time() - start_time) * 1000),
+        )
         raise
+    finally:
+        _mark_active(parent_id, -1)
 
 
 async def start_multi_policy_analysis(
@@ -752,6 +894,33 @@ async def start_multi_policy_analysis(
 # collect a task that is still doing work.
 _DETACHED_RUNS: set = set()
 
+# Parent sessions with work running in THIS process, so the stale-run check
+# never marks a policy as interrupted while it is genuinely still running here.
+_ACTIVE_PARENTS: dict = {}
+
+
+def _mark_active(parent_id: str, delta: int) -> None:
+    count = _ACTIVE_PARENTS.get(parent_id, 0) + delta
+    if count > 0:
+        _ACTIVE_PARENTS[parent_id] = count
+    else:
+        _ACTIVE_PARENTS.pop(parent_id, None)
+
+
+def _detach(coro, label: str) -> "asyncio.Task":
+    """Run a coroutine in the background, logging (never raising) its failure."""
+
+    async def _runner():
+        try:
+            await coro
+        except Exception as e:
+            logger.error(f"[MultiPolicy] {label} background run failed: {e}", exc_info=True)
+
+    task = asyncio.create_task(_runner())
+    _DETACHED_RUNS.add(task)
+    task.add_done_callback(_DETACHED_RUNS.discard)
+    return task
+
 
 def schedule_multi_policy_analysis(
     parent: MultiPolicyAnalysisSession,
@@ -766,17 +935,65 @@ def schedule_multi_policy_analysis(
     executed from here, and the pipeline already falls back to running its
     post-processing inline when none is supplied.
     """
+    return _detach(
+        run_multi_policy_analysis(parent, user_id, background_tasks=None),
+        f"session={parent.id}",
+    )
 
-    async def _runner():
+
+async def _run_claimed_resume(
+    parent: MultiPolicyAnalysisSession,
+    policy_id: str,
+    child_session_id: str,
+    user_id: str,
+    answers: dict,
+    background_tasks: Optional[BackgroundTasks],
+) -> MultiPolicyAnalysisSession:
+    """Re-analyse one policy whose slot this caller has already claimed."""
+    parent_id = str(parent.id)
+    lock = asyncio.Lock()
+    _mark_active(parent_id, +1)
+    try:
+        async def _on_stage(stage: str) -> None:
+            await _set_stage(parent, policy_id, stage, lock, status="reanalyzing")
+
         try:
-            await run_multi_policy_analysis(parent, user_id, background_tasks=None)
+            # Reuses the existing single-policy clarification flow verbatim,
+            # including its round limits and answer-handling rules.
+            result = await resume_analysis_session(
+                session_id=child_session_id,
+                user_id=user_id,
+                answers=answers,
+                background_tasks=background_tasks,
+                on_stage=_on_stage,
+            )
+            async with lock:
+                entry = parent.get_entry(policy_id)
+                if entry is not None:
+                    _entry_from_result(entry, result)
+                    if entry.status == "waiting_for_user":
+                        entry.stage = "waiting_for_user"
+                    else:
+                        entry.stage = "done"
+                        entry.completed_steps = entry.total_steps or POLICY_TOTAL_STEPS
+                    await _write_entry(parent.id, entry)
         except Exception as e:
-            logger.error(f"[MultiPolicy] session={parent.id} background run failed: {e}")
+            async with lock:
+                entry = parent.get_entry(policy_id)
+                if entry is not None:
+                    entry.status = "failed"
+                    entry.stage = "failed"
+                    entry.error_message = str(e)
+                    entry.failed_at_stage = "clarification_resume"
+                    entry.completed_at = datetime.now(timezone.utc)
+                    await _write_entry(parent.id, entry)
+            logger.error(f"[MultiPolicy] session={parent_id} policy={policy_id} resume error: {e}", exc_info=True)
 
-    task = asyncio.create_task(_runner())
-    _DETACHED_RUNS.add(task)
-    task.add_done_callback(_DETACHED_RUNS.discard)
-    return task
+        entry = parent.get_entry(policy_id)
+        _log_stage(parent_id, policy_id, "clarification_resume", entry.status if entry else "")
+        return await _refresh_parent_status(parent)
+    finally:
+        _mark_active(parent_id, -1)
 
 
 async def resume_policy_analysis(
@@ -785,11 +1002,16 @@ async def resume_policy_analysis(
     user_id: str,
     answers: dict,
     background_tasks: Optional[BackgroundTasks] = None,
+    wait: bool = True,
 ) -> dict:
     """
     Answer clarification questions for ONE policy inside a multi-policy session.
 
     Only the affected policy is resumed; every sibling policy keeps its result.
+    The policy is claimed atomically first, so the same questions can never be
+    answered twice (e.g. a double tap) and a stale read can never resubmit them.
+    With `wait=False` the re-analysis runs in the background and the call
+    returns at once; the client follows it by polling the session.
     """
     parent = await _get_owned_parent(parent_session_id, user_id)
 
@@ -801,54 +1023,94 @@ async def resume_policy_analysis(
             f"Policy '{policy_id}' is not waiting for clarification (current status: {entry.status})"
         )
 
-    _log_stage(str(parent.id), policy_id, "clarification_resume", "started")
-
-    child_session_id = entry.session_id
-    lock = asyncio.Lock()
-
     # Answering restarts this policy at the rule engine, so the finished-step
     # count goes back to what is genuinely done again.
-    await _set_stage(parent, policy_id, "rule_engine", lock, status="reanalyzing", questions=[])
-
-    async def _on_stage(stage: str) -> None:
-        await _set_stage(parent, policy_id, stage, lock, status="reanalyzing")
-
-    try:
-        # Reuses the existing single-policy clarification flow verbatim,
-        # including its round limits and answer-handling rules.
-        result = await resume_analysis_session(
-            session_id=child_session_id,
-            user_id=user_id,
-            answers=answers,
-            background_tasks=background_tasks,
-            on_stage=_on_stage,
+    claim = {
+        "status": "reanalyzing",
+        "stage": "rule_engine",
+        "completed_steps": POLICY_STAGES.index("rule_engine"),
+        "total_steps": POLICY_TOTAL_STEPS,
+        "questions": [],
+        "error_message": "",
+    }
+    claimed = await _db_set_entry(
+        parent.id, policy_id, claim, only_if_status=("waiting_for_user",)
+    )
+    if not claimed:
+        raise ValueError(
+            f"Policy '{policy_id}' is not waiting for clarification (its answers were already submitted)"
         )
-        async with lock:
-            entry = parent.get_entry(policy_id)
-            if entry is not None:
-                _entry_from_result(entry, result)
-                if entry.status == "waiting_for_user":
-                    entry.stage = "waiting_for_user"
-                else:
-                    entry.stage = "done"
-                    entry.completed_steps = entry.total_steps or POLICY_TOTAL_STEPS
-            await parent.save()
-    except Exception as e:
-        async with lock:
-            entry = parent.get_entry(policy_id)
-            if entry is not None:
-                entry.status = "failed"
-                entry.stage = "failed"
-                entry.error_message = str(e)
-                entry.failed_at_stage = "clarification_resume"
-                entry.completed_at = datetime.now(timezone.utc)
-            await parent.save()
-        logger.error(f"[MultiPolicy] session={parent.id} policy={policy_id} resume error: {e}", exc_info=True)
+    for key, value in claim.items():
+        setattr(entry, key, value)
 
-    entry = parent.get_entry(policy_id)
-    _log_stage(str(parent.id), policy_id, "clarification_resume", entry.status if entry else "")
-    await _refresh_parent_status(parent)
-    return serialize_multi_session(parent)
+    _log_stage(str(parent.id), policy_id, "clarification_resume", "started")
+    child_session_id = entry.session_id
+
+    if not wait:
+        _detach(
+            _run_claimed_resume(parent, policy_id, child_session_id, user_id, answers, None),
+            f"session={parent.id} policy={policy_id} resume",
+        )
+        return serialize_multi_session(await _reload(parent))
+
+    fresh = await _run_claimed_resume(
+        parent, policy_id, child_session_id, user_id, answers, background_tasks
+    )
+    return serialize_multi_session(fresh)
+
+
+async def _run_claimed_retry(
+    parent: MultiPolicyAnalysisSession,
+    policy_id: str,
+    user_id: str,
+    background_tasks: Optional[BackgroundTasks],
+) -> MultiPolicyAnalysisSession:
+    """Analyse one policy again whose slot this caller has already claimed."""
+    parent_id = str(parent.id)
+    _mark_active(parent_id, +1)
+    try:
+        try:
+            rx_ctx = await _resolve_prescription_context(user_id, parent.prescription_id)
+            rx_text = parent.prescription_text or ""
+            prescription_json = copy.deepcopy(parent.prescription_json or {})
+
+            if not rx_text or not prescription_json:
+                rx_ctx, rx_text, prescription_json = await _extract_shared_prescription(parent, user_id)
+                await _set_parent(
+                    parent,
+                    prescription_id=parent.prescription_id,
+                    prescription_text=rx_text,
+                    prescription_json=prescription_json,
+                    prescription_stage="ready",
+                )
+        except Exception as e:
+            await _db_set_entry(
+                parent.id,
+                policy_id,
+                {
+                    "status": "failed",
+                    "stage": "failed",
+                    "failed_at_stage": "prescription_extraction",
+                    "error_message": str(e),
+                    "completed_at": datetime.now(timezone.utc),
+                },
+            )
+            logger.error(f"[MultiPolicy] session={parent_id} policy={policy_id} retry error: {e}", exc_info=True)
+            return await _refresh_parent_status(parent)
+
+        await _analyze_one_policy(
+            parent,
+            policy_id,
+            user_id=user_id,
+            rx_ctx=rx_ctx,
+            rx_text=rx_text,
+            prescription_json=prescription_json,
+            semaphore=asyncio.Semaphore(1),
+            background_tasks=background_tasks,
+        )
+        return await _refresh_parent_status(parent)
+    finally:
+        _mark_active(parent_id, -1)
 
 
 async def retry_policy_analysis(
@@ -856,12 +1118,15 @@ async def retry_policy_analysis(
     policy_id: str,
     user_id: str,
     background_tasks: Optional[BackgroundTasks] = None,
+    wait: bool = True,
 ) -> dict:
     """
     Retry a single failed policy without touching its siblings.
 
-    Idempotent by design: a policy that already produced a result is returned
-    as-is rather than analysed again, so retries never create duplicate reports.
+    Idempotent by design: a policy that already produced a result (or whose
+    retry is already running) is returned as-is rather than analysed again, so
+    retries never create duplicate reports. With `wait=False` the analysis runs
+    in the background and the call returns at once.
     """
     parent = await _get_owned_parent(parent_session_id, user_id)
 
@@ -869,55 +1134,86 @@ async def retry_policy_analysis(
     if not entry:
         raise ValueError(f"Policy '{policy_id}' is not part of this analysis session")
 
-    if entry.status not in ("failed", "invalid"):
+    # Reset the slot so the retry starts from a clean state — including the
+    # progress counters, which must not keep a failed run's finished steps.
+    reset = {
+        "status": "queued",
+        "stage": "queued",
+        "completed_steps": 0,
+        "total_steps": POLICY_TOTAL_STEPS,
+        "error_message": "",
+        "failed_at_stage": "",
+        "questions": [],
+        "report_id": "",
+        "session_id": "",
+        "completed_at": None,
+    }
+    claimed = entry.status in ("failed", "invalid") and await _db_set_entry(
+        parent.id, policy_id, reset, only_if_status=("failed", "invalid")
+    )
+    if not claimed:
         logger.info(
             f"[MultiPolicy] session={parent.id} policy={policy_id} retry skipped "
             f"(status={entry.status}) — returning existing result"
         )
-        return serialize_multi_session(parent)
+        return serialize_multi_session(await _reload(parent))
+    for key, value in reset.items():
+        setattr(entry, key, value)
 
-    rx_ctx = await _resolve_prescription_context(user_id, parent.prescription_id)
-    rx_text = parent.prescription_text or ""
-    prescription_json = copy.deepcopy(parent.prescription_json or {})
+    if not wait:
+        _detach(
+            _run_claimed_retry(parent, policy_id, user_id, None),
+            f"session={parent.id} policy={policy_id} retry",
+        )
+        return serialize_multi_session(await _reload(parent))
 
-    if not rx_text or not prescription_json:
-        rx_ctx, rx_text, prescription_json = await _extract_shared_prescription(parent, user_id)
-        parent.prescription_text = rx_text
-        parent.prescription_json = prescription_json
-        parent.prescription_stage = "ready"
+    fresh = await _run_claimed_retry(parent, policy_id, user_id, background_tasks)
+    return serialize_multi_session(fresh)
 
-    # Reset the slot so the retry starts from a clean state — including the
-    # progress counters, which must not keep a failed run's finished steps.
-    entry.status = "queued"
-    entry.stage = "queued"
-    entry.completed_steps = 0
-    entry.total_steps = POLICY_TOTAL_STEPS
-    entry.error_message = ""
-    entry.failed_at_stage = ""
-    entry.questions = []
-    entry.report_id = ""
-    entry.session_id = ""
-    entry.completed_at = None
-    await parent.save()
 
-    await _analyze_one_policy(
-        parent,
-        policy_id,
-        user_id=user_id,
-        rx_ctx=rx_ctx,
-        rx_text=rx_text,
-        prescription_json=prescription_json,
-        semaphore=asyncio.Semaphore(1),
-        background_tasks=background_tasks,
-    )
+def _as_utc(value) -> Optional[datetime]:
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
-    await _refresh_parent_status(parent)
-    return serialize_multi_session(parent)
+
+async def _fail_interrupted_runs(parent: MultiPolicyAnalysisSession) -> MultiPolicyAnalysisSession:
+    """
+    A policy shown as running whose session has had no update for a long time
+    (and is not running in this process) was interrupted — typically by a
+    server restart. Mark it failed so the app offers Retry instead of waiting
+    forever.
+    """
+    if str(parent.id) in _ACTIVE_PARENTS:
+        return parent
+    if not any(e.status in RUNNING_STATUSES for e in parent.policy_analyses):
+        return parent
+    last = _as_utc(parent.updated_at)
+    if last is None or (datetime.now(timezone.utc) - last).total_seconds() < STALE_RUN_SECONDS:
+        return parent
+
+    for entry in parent.policy_analyses:
+        if entry.status in RUNNING_STATUSES:
+            await _db_set_entry(
+                parent.id,
+                entry.policy_id,
+                {
+                    "status": "failed",
+                    "stage": "failed",
+                    "failed_at_stage": entry.stage or "policy_analysis",
+                    "error_message": INTERRUPTED_MESSAGE,
+                    "completed_at": datetime.now(timezone.utc),
+                },
+                only_if_status=RUNNING_STATUSES,
+            )
+    logger.warning(f"[MultiPolicy] session={parent.id} marked interrupted policies as failed")
+    return await _refresh_parent_status(parent)
 
 
 async def get_multi_policy_session(parent_session_id: str, user_id: str) -> dict:
     """Read the current state of a multi-policy session (safe to poll / refresh)."""
     parent = await _get_owned_parent(parent_session_id, user_id)
+    parent = await _fail_interrupted_runs(parent)
     return serialize_multi_session(parent)
 
 
@@ -966,10 +1262,14 @@ def serialize_multi_session(
     and clarification prompts — no policy text, no internal extraction dumps.
     """
     rx_json = parent.prescription_json or {}
+    status = parent.status
+    if parent.prescription_stage == "ready" and parent.policy_analyses:
+        # Always agree with the policies themselves, whichever writer finished last.
+        status = _derive_parent_status(parent.policy_analyses)
     payload = {
         "sessionId": str(parent.id),
         "prescriptionId": parent.prescription_id,
-        "status": parent.status,
+        "status": status,
         "isManualPrescription": parent.is_manual_prescription,
         "totalProcessingTimeMs": parent.total_processing_time_ms,
         "errorMessage": parent.error_message or "",
@@ -982,6 +1282,10 @@ def serialize_multi_session(
         "comparisonSummary": parent.comparison_summary or {},
         "policyAnalyses": [
             {
+                # Temporary number for this comparison, in the order the user
+                # selected/uploaded the policies — lets the app say which policy a
+                # question belongs to even before the policy's real name is known.
+                "queueNumber": index + 1,
                 "policyId": e.policy_id,
                 "policyName": e.policy_name or "",
                 "insuranceCompany": e.insurance_company or "",
@@ -1002,7 +1306,7 @@ def serialize_multi_session(
                 "completedAt": e.completed_at.isoformat() if e.completed_at else None,
                 "continuity": _continuity_brief((parent.policy_continuity or {}).get(e.policy_id)),
             }
-            for e in parent.policy_analyses
+            for index, e in enumerate(parent.policy_analyses)
         ],
     }
 

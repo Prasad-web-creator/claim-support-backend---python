@@ -15,6 +15,7 @@ async def analyze_coverage(
     policy_json: dict = None,
     policy_id: str = None,
     on_stage=None,
+    extra_instruction: str = "",
 ) -> dict:
     """`on_stage`, when given, is awaited as each real phase of this analysis
     begins, so callers can report progress that matches the work done."""
@@ -261,6 +262,8 @@ PREVIOUS CLARIFICATION HISTORY
 
 {json.dumps(clarification_history or [], indent=2, default=str)}
 """
+    if extra_instruction:
+        user_prompt += f"\n==================================================\n{extra_instruction}\n"
 
     await _stage("coverage_analysis")
     try:
