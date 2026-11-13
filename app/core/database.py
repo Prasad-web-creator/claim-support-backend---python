@@ -64,6 +64,7 @@ async def connect_to_mongodb() -> None:
     )
     from app.models.multi_policy_session import MultiPolicyAnalysisSession
     from app.models.rag_chunk import PolicyChunk
+    from app.models.otp import OtpCode
     from app.models.expert_review import (
         ClaimCase,
         ClaimAnalysisVersion,
@@ -80,6 +81,7 @@ async def connect_to_mongodb() -> None:
         database=db,
         document_models=[
             User,
+            OtpCode,
             Policy,
             Prescription,
             AnalysisReport,

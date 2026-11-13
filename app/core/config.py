@@ -22,6 +22,23 @@ class Settings(BaseSettings):
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7, description="Refresh token TTL")
     ALLOWED_ORIGINS: str = Field(default="", description="Comma-separated CORS origins")
 
+    # ─── OTP / SMS ────────────────────────────────────────────────────────────
+    # static  -> no SMS is sent; every OTP is OTP_STATIC_CODE (current mode, "1234")
+    # console -> random OTP, written to the backend log only (no SMS)
+    # msg91   -> random OTP sent as a real SMS through MSG91 (needs DLT + keys below)
+    OTP_PROVIDER: str = Field(default="static", description="static | console | msg91")
+    OTP_STATIC_CODE: str = Field(default="1234", description="OTP used when OTP_PROVIDER=static")
+    OTP_LENGTH: int = Field(default=4, ge=4, le=8, description="Digits in a generated OTP")
+    OTP_EXPIRE_SECONDS: int = Field(default=300, ge=60, description="OTP validity")
+    OTP_MAX_ATTEMPTS: int = Field(default=5, ge=1, description="Wrong tries before the OTP is discarded")
+    OTP_RESEND_COOLDOWN_SECONDS: int = Field(default=30, ge=0, description="Min gap between OTP requests")
+    OTP_TEST_NUMBERS: str = Field(
+        default="", description="Fixed OTPs for store reviewers, e.g. 9999999999:4321,8888888888:8765"
+    )
+    MSG91_AUTH_KEY: Optional[str] = Field(default=None, description="MSG91 auth key")
+    MSG91_TEMPLATE_ID: Optional[str] = Field(default=None, description="MSG91 flow/template id (DLT approved)")
+    MSG91_OTP_VAR: str = Field(default="otp", description="Variable name of the OTP in the MSG91 template")
+
     # ─── Database ─────────────────────────────────────────────────────────────
     MONGODB_URI: str = Field(
         ...,

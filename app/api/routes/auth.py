@@ -1,33 +1,61 @@
 """
 Auth routes — migrated from authController.js.
-Mock authentication for testing.
+Phone + OTP authentication. The OTP is verified on the server (see app/services/otp_service.py);
+OTP_PROVIDER decides whether a real SMS is sent.
 """
 
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Body, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
 from app.core.security import create_access_token, generate_refresh_token, get_refresh_token_expiry
 from app.models.user import User
-from app.schemas.auth import RegisterRequest, LoginRequest, RefreshRequest, TokenResponse, UserResponse
+from app.schemas.auth import (
+    RegisterRequest, LoginRequest, RefreshRequest, SendOtpRequest, TokenResponse, UserResponse,
+)
 from app.middleware.auth import get_current_user
+from app.middleware.rate_limiter import limiter
+from app.services.otp_service import send_otp, verify_otp
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
 
-@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-async def register(request: RegisterRequest):
+@router.post("/send-otp")
+@limiter.limit("5/minute")
+async def send_otp_route(request: Request, body: SendOtpRequest):
+    """Send an OTP to the phone number for login or registration."""
+    user = await User.find_one(User.phone == body.phone)
+    if body.purpose == "login":
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found. Please register first.")
+    else:
+        if user:
+            raise HTTPException(status_code=400, detail="This mobile number is already registered. Please login.")
+        if body.email and await User.find_one(User.email == body.email):
+            raise HTTPException(status_code=400, detail="User already exists")
 
-    # Check if user exists
-    existing = await User.find_one(User.email == request.email)
+    await send_otp(body.phone, body.purpose)
+    return {"success": True, "message": "OTP sent"}
+
+
+@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("10/minute")
+async def register(request: Request, body: RegisterRequest):
+
+    # Check if user exists (before consuming the OTP)
+    existing = await User.find_one(User.email == body.email)
     if existing:
         raise HTTPException(status_code=400, detail="User already exists")
+    if await User.find_one(User.phone == body.phone):
+        raise HTTPException(status_code=400, detail="This mobile number is already registered. Please login.")
+
+    await verify_otp(body.phone, "register", body.otp)
 
     # Create user
     user = User(
-        name=request.name,
-        email=request.email,
-        phone=request.phone,
+        name=body.name,
+        email=body.email,
+        phone=body.phone,
         created_by="system",
         refresh_token=generate_refresh_token(),
         refresh_token_expiry=get_refresh_token_expiry()
@@ -45,13 +73,15 @@ async def register(request: RegisterRequest):
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(request: LoginRequest):
-    """Login a user (mock implementation)."""
-    # For mock login, we just find the user by phone or return a default user
-    user = await User.find_one(User.phone == request.phone)
+@limiter.limit("10/minute")
+async def login(request: Request, body: LoginRequest):
+    """Login a user with phone number + OTP."""
+    user = await User.find_one(User.phone == body.phone)
     if not user:
         raise HTTPException(status_code=404, detail="User not found. Please register first.")
-        
+
+    await verify_otp(body.phone, "login", body.otp)
+
     # Update refresh token
     user.refresh_token = generate_refresh_token()
     user.refresh_token_expiry = get_refresh_token_expiry()
