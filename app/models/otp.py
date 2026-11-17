@@ -10,10 +10,11 @@ from pydantic import Field
 
 
 class OtpCode(Document):
-    """A pending OTP for one phone number and purpose (login | register)."""
+    """A pending OTP for one destination (phone number or email), channel and purpose."""
 
-    phone: str
-    purpose: str
+    channel: str  # sms | email
+    target: str  # 10-digit phone number, or lower-cased email address
+    purpose: str  # login | register | verify
     code_hash: str
     attempts: int = 0
     expires_at: datetime
@@ -22,7 +23,7 @@ class OtpCode(Document):
     class Settings:
         name = "otp_codes"
         indexes = [
-            [("phone", pymongo.ASCENDING), ("purpose", pymongo.ASCENDING)],
+            [("channel", pymongo.ASCENDING), ("target", pymongo.ASCENDING), ("purpose", pymongo.ASCENDING)],
             # TTL index: MongoDB deletes the document once expires_at has passed.
             pymongo.IndexModel([("expires_at", pymongo.ASCENDING)], expireAfterSeconds=0),
         ]

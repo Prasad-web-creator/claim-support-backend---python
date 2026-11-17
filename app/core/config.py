@@ -25,8 +25,10 @@ class Settings(BaseSettings):
     # ─── OTP / SMS ────────────────────────────────────────────────────────────
     # static  -> no SMS is sent; every OTP is OTP_STATIC_CODE (current mode, "1234")
     # console -> random OTP, written to the backend log only (no SMS)
-    # msg91   -> random OTP sent as a real SMS through MSG91 (needs DLT + keys below)
-    OTP_PROVIDER: str = Field(default="static", description="static | console | msg91")
+    # twilio  -> random OTP sent as a real SMS through Twilio (needs the TWILIO_* keys below)
+    OTP_PROVIDER: str = Field(
+        default="static", pattern=r"^(static|console|twilio)$", description="static | console | twilio"
+    )
     OTP_STATIC_CODE: str = Field(default="1234", description="OTP used when OTP_PROVIDER=static")
     OTP_LENGTH: int = Field(default=4, ge=4, le=8, description="Digits in a generated OTP")
     OTP_EXPIRE_SECONDS: int = Field(default=300, ge=60, description="OTP validity")
@@ -35,9 +37,45 @@ class Settings(BaseSettings):
     OTP_TEST_NUMBERS: str = Field(
         default="", description="Fixed OTPs for store reviewers, e.g. 9999999999:4321,8888888888:8765"
     )
-    MSG91_AUTH_KEY: Optional[str] = Field(default=None, description="MSG91 auth key")
-    MSG91_TEMPLATE_ID: Optional[str] = Field(default=None, description="MSG91 flow/template id (DLT approved)")
-    MSG91_OTP_VAR: str = Field(default="otp", description="Variable name of the OTP in the MSG91 template")
+    OTP_SMS_COUNTRY_CODE: str = Field(
+        default="+91", pattern=r"^\+\d{1,3}$", description="Prefix added to the 10-digit number for SMS"
+    )
+    OTP_SMS_MESSAGE: str = Field(
+        default="Your Claim Support OTP is {code}. It is valid for {minutes} minutes. Do not share it with anyone.",
+        description="SMS text; {code} and {minutes} are filled in",
+    )
+
+    # ─── Twilio (used when OTP_PROVIDER=twilio) ───────────────────────────────
+    TWILIO_ACCOUNT_SID: Optional[str] = Field(default=None, description="Twilio Account SID (AC...)")
+    TWILIO_AUTH_TOKEN: Optional[str] = Field(default=None, description="Twilio Auth Token (secret)")
+    TWILIO_FROM_NUMBER: Optional[str] = Field(
+        default=None, description="Twilio phone number that sends the SMS, E.164 (e.g. +15017122661)"
+    )
+    TWILIO_MESSAGING_SERVICE_SID: Optional[str] = Field(
+        default=None, description="Optional Messaging Service (MG...); used instead of TWILIO_FROM_NUMBER if set"
+    )
+
+    # ─── Email OTP ────────────────────────────────────────────────────────────
+    # static  -> no email is sent; every email OTP is OTP_STATIC_CODE
+    # console -> random OTP, written to the backend log only (no email)
+    # smtp    -> random OTP sent by email through the SMTP server below (e.g. Gmail)
+    EMAIL_OTP_PROVIDER: str = Field(
+        default="console", pattern=r"^(static|console|smtp)$", description="static | console | smtp"
+    )
+    OTP_TEST_EMAILS: str = Field(
+        default="", description="Fixed email OTPs for store reviewers, e.g. review@example.com:4321"
+    )
+    OTP_EMAIL_SUBJECT: str = Field(
+        default="Your {app} verification code: {code}",
+        description="Email subject; {code}, {minutes} and {app} are filled in",
+    )
+    SMTP_HOST: str = Field(default="smtp.gmail.com", description="SMTP server host")
+    SMTP_PORT: int = Field(default=587, description="SMTP port (587 = STARTTLS, 465 = SSL)")
+    SMTP_USERNAME: Optional[str] = Field(default=None, description="SMTP login (Gmail address)")
+    SMTP_PASSWORD: Optional[str] = Field(default=None, description="SMTP password (Gmail app password)")
+    SMTP_FROM_EMAIL: Optional[str] = Field(default=None, description="Sender address; defaults to SMTP_USERNAME")
+    SMTP_FROM_NAME: str = Field(default="ClaimSupport", description="Sender display name / app name in emails")
+    SMTP_TIMEOUT_SECONDS: int = Field(default=15, ge=1, description="SMTP connect/send timeout")
 
     # ─── Database ─────────────────────────────────────────────────────────────
     MONGODB_URI: str = Field(

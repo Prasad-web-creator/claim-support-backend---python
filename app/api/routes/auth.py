@@ -1,109 +1,197 @@
 """
 Auth routes — migrated from authController.js.
-Phone + OTP authentication. The OTP is verified on the server (see app/services/otp_service.py);
-OTP_PROVIDER decides whether a real SMS is sent.
+
+OTP authentication over two independent channels:
+  sms   -> OTP sent to the user's mobile number
+  email -> OTP sent to the user's email address
+A user registers with name + email + phone and verifies ONE of them with an OTP. They can
+then log in with any channel whose contact is verified; the other contact can be verified
+later from the profile (/auth/me/verify/*). A contact that was never verified cannot be
+used to log in, so a mistyped phone/email at registration does not open the account to
+whoever owns it.
+
+The OTP is generated and verified on the server (see app/services/otp_service.py);
+OTP_PROVIDER / EMAIL_OTP_PROVIDER decide whether a real SMS / email is sent.
 """
 
+import re
 from datetime import datetime, timezone
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
+from pymongo.errors import DuplicateKeyError
 
 from app.core.security import create_access_token, generate_refresh_token, get_refresh_token_expiry
 from app.models.user import User
 from app.schemas.auth import (
     RegisterRequest, LoginRequest, RefreshRequest, SendOtpRequest, TokenResponse, UserResponse,
+    VerifyContactRequest, VerifyContactSendRequest,
 )
 from app.middleware.auth import get_current_user
 from app.middleware.rate_limiter import limiter
-from app.services.otp_service import send_otp, verify_otp
+from app.services.otp_service import EMAIL, SMS, OtpSent, normalize_email, send_otp, verify_otp
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
+
+CONTACT_NAME = {SMS: "mobile number", EMAIL: "email address"}
+OTHER_METHOD = {SMS: "Email OTP", EMAIL: "SMS OTP"}
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+
+async def _find_by_email(email: str) -> Optional[User]:
+    """Case-insensitive: older accounts may have stored the email with capitals."""
+    return await User.find_one({"email": {"$regex": f"^{re.escape(normalize_email(email))}$", "$options": "i"}})
+
+
+async def _find_by_contact(channel: str, target: str) -> Optional[User]:
+    if channel == SMS:
+        return await User.find_one(User.phone == target)
+    return await _find_by_email(target)
+
+
+def is_verified(user: User, channel: str) -> bool:
+    if channel == SMS:
+        # None = account registered before verification was tracked; those could only be
+        # created (and logged into) through phone OTP, so their phone counts as verified.
+        return bool(user.phone) and user.phone_verified is not False
+    return bool(user.email_verified)
+
+
+def _target(channel: str, phone: Optional[str], email: Optional[str]) -> str:
+    if channel == SMS:
+        if not phone:
+            raise HTTPException(status_code=422, detail="Please enter your mobile number.")
+        return phone
+    if not email:
+        raise HTTPException(status_code=422, detail="Please enter your email address.")
+    return normalize_email(email)
+
+
+def _user_payload(user: User) -> dict:
+    return {
+        "id": str(user.id),
+        "name": user.name,
+        "email": user.email,
+        "phone": user.phone,
+        "emailVerified": is_verified(user, EMAIL),
+        "phoneVerified": is_verified(user, SMS),
+    }
+
+
+def _sent_payload(sent: OtpSent) -> dict:
+    return {
+        "success": True,
+        "message": f"OTP sent to {sent.destination}",
+        "channel": sent.channel,
+        "destination": sent.destination,
+        "otpLength": sent.otp_length,
+        "expiresInSeconds": sent.expires_in_seconds,
+        "resendAfterSeconds": sent.resend_after_seconds,
+    }
+
+
+async def _issue_tokens(user: User) -> TokenResponse:
+    user.refresh_token = generate_refresh_token()
+    user.refresh_token_expiry = get_refresh_token_expiry()
+    await user.save()
+    return TokenResponse(
+        token=create_access_token(str(user.id)),
+        refreshToken=user.refresh_token,
+        user=_user_payload(user),
+    )
+
+
+async def _login_user(channel: str, target: str) -> User:
+    """The account for a login attempt, or a clear error if it cannot log in this way."""
+    user = await _find_by_contact(channel, target)
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No account found with this {CONTACT_NAME[channel]}. Please register first.",
+        )
+    if not is_verified(user, channel):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This {CONTACT_NAME[channel]} is not verified yet. Please log in with "
+                f"{OTHER_METHOD[channel]} and verify it from your profile."
+            ),
+        )
+    return user
+
+
+async def _check_not_registered(phone: Optional[str], email: Optional[str]) -> None:
+    if email and await _find_by_email(email):
+        raise HTTPException(status_code=400, detail="This email address is already registered. Please login.")
+    if phone and await User.find_one(User.phone == phone):
+        raise HTTPException(status_code=400, detail="This mobile number is already registered. Please login.")
+
+
+# ─── Login / registration ─────────────────────────────────────────────────────
 
 
 @router.post("/send-otp")
 @limiter.limit("5/minute")
 async def send_otp_route(request: Request, body: SendOtpRequest):
-    """Send an OTP to the phone number for login or registration."""
-    user = await User.find_one(User.phone == body.phone)
+    """Send a login or registration OTP by SMS or email."""
+    target = _target(body.channel, body.phone, body.email)
     if body.purpose == "login":
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found. Please register first.")
+        await _login_user(body.channel, target)
     else:
-        if user:
-            raise HTTPException(status_code=400, detail="This mobile number is already registered. Please login.")
-        if body.email and await User.find_one(User.email == body.email):
-            raise HTTPException(status_code=400, detail="User already exists")
-
-    await send_otp(body.phone, body.purpose)
-    return {"success": True, "message": "OTP sent"}
+        await _check_not_registered(body.phone, body.email)
+    return _sent_payload(await send_otp(body.channel, target, body.purpose))
 
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit("10/minute")
 async def register(request: Request, body: RegisterRequest):
+    """Create an account once the OTP sent to the chosen contact (email or phone) is verified."""
+    email = normalize_email(body.email)
+    await _check_not_registered(body.phone, email)  # before consuming the OTP
 
-    # Check if user exists (before consuming the OTP)
-    existing = await User.find_one(User.email == body.email)
-    if existing:
-        raise HTTPException(status_code=400, detail="User already exists")
-    if await User.find_one(User.phone == body.phone):
-        raise HTTPException(status_code=400, detail="This mobile number is already registered. Please login.")
+    target = body.phone if body.channel == SMS else email
+    await verify_otp(body.channel, target, "register", body.otp)
 
-    await verify_otp(body.phone, "register", body.otp)
-
-    # Create user
     user = User(
-        name=body.name,
-        email=body.email,
+        name=body.name.strip(),
+        email=email,
         phone=body.phone,
+        email_verified=body.channel == EMAIL,
+        phone_verified=body.channel == SMS,
         created_by="system",
-        refresh_token=generate_refresh_token(),
-        refresh_token_expiry=get_refresh_token_expiry()
     )
-    await user.insert()
-    
-    # Generate token
-    token = create_access_token(str(user.id))
-    
-    return TokenResponse(
-        token=token,
-        refreshToken=user.refresh_token,
-        user={"id": str(user.id), "name": user.name, "email": user.email}
-    )
+    try:
+        await user.insert()
+    except DuplicateKeyError:  # registered concurrently
+        raise HTTPException(status_code=400, detail="This email address is already registered. Please login.")
+    return await _issue_tokens(user)
 
 
 @router.post("/login", response_model=TokenResponse)
 @limiter.limit("10/minute")
 async def login(request: Request, body: LoginRequest):
-    """Login a user with phone number + OTP."""
-    user = await User.find_one(User.phone == body.phone)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found. Please register first.")
-
-    await verify_otp(body.phone, "login", body.otp)
-
-    # Update refresh token
-    user.refresh_token = generate_refresh_token()
-    user.refresh_token_expiry = get_refresh_token_expiry()
-    await user.save()
-        
-    token = create_access_token(str(user.id))
-    
-    return TokenResponse(
-        token=token,
-        refreshToken=user.refresh_token,
-        user={"id": str(user.id), "name": user.name, "email": user.email}
-    )
+    """Log in with an OTP sent to a verified phone number or email address."""
+    target = _target(body.channel, body.phone, body.email)
+    user = await _login_user(body.channel, target)
+    await verify_otp(body.channel, target, "login", body.otp)
+    if body.channel == SMS:
+        user.phone_verified = True  # records legacy (None) accounts as verified
+    else:
+        user.email_verified = True
+    return await _issue_tokens(user)
 
 
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_token(request: RefreshRequest):
     """Refresh the access token using a valid refresh token."""
     user = await User.find_one(User.refresh_token == request.refreshToken)
-    
+
     if not user:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
-        
+
     # Check if expired
     if user.refresh_token_expiry:
         # Ensure timezone-aware comparison
@@ -112,58 +200,87 @@ async def refresh_token(request: RefreshRequest):
             expiry = expiry.replace(tzinfo=timezone.utc)
         if expiry < datetime.now(timezone.utc):
             raise HTTPException(status_code=401, detail="Refresh token expired")
-            
-    # Generate new tokens
-    user.refresh_token = generate_refresh_token()
-    user.refresh_token_expiry = get_refresh_token_expiry()
-    await user.save()
-    
-    token = create_access_token(str(user.id))
-    
-    return TokenResponse(
-        token=token,
-        refreshToken=user.refresh_token,
-        user={"id": str(user.id), "name": user.name, "email": user.email}
-    )
+
+    return await _issue_tokens(user)
+
+
+# ─── Current user ─────────────────────────────────────────────────────────────
+
+
+async def _current(current_user: dict) -> User:
+    user = await User.get(current_user["id"])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
 
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: dict = Depends(get_current_user)):
     """Get current user details."""
-    user = await User.get(current_user["id"])
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-        
-    return UserResponse(
-        id=str(user.id),
-        name=user.name,
-        email=user.email
-    )
+    return UserResponse(**_user_payload(await _current(current_user)))
+
 
 class UpdateProfileRequest(BaseModel):
     name: str
-    email: str
+    email: EmailStr
+
 
 @router.put("/me", response_model=UserResponse)
 async def update_me(request: UpdateProfileRequest, current_user: dict = Depends(get_current_user)):
-    """Update current user details."""
-    user = await User.get(current_user["id"])
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-        
-    if request.email != user.email:
-        existing = await User.find_one(User.email == request.email)
-        if existing:
+    """Update current user details. A changed email must be verified again before email login."""
+    user = await _current(current_user)
+    email = normalize_email(request.email)
+    if email != normalize_email(user.email):
+        existing = await _find_by_email(email)
+        if existing and existing.id != user.id:
             raise HTTPException(status_code=400, detail="Email address is already in use by another account")
-        
+        user.email_verified = False
     user.name = request.name
-    user.email = request.email
+    user.email = email
     await user.save()
-    
-    return UserResponse(
-        id=str(user.id),
-        name=user.name,
-        email=user.email
-    )
+    return UserResponse(**_user_payload(user))
+
+
+async def _verification_target(user: User, channel: str) -> str:
+    target = user.phone if channel == SMS else normalize_email(user.email)
+    if not target:
+        raise HTTPException(status_code=400, detail=f"Please add a {CONTACT_NAME[channel]} to your profile first.")
+    if is_verified(user, channel):
+        raise HTTPException(status_code=400, detail=f"Your {CONTACT_NAME[channel]} is already verified.")
+    other = await _find_by_contact(channel, target)
+    if other and other.id != user.id and is_verified(other, channel):
+        raise HTTPException(
+            status_code=409, detail=f"This {CONTACT_NAME[channel]} is already verified on another account."
+        )
+    return target
+
+
+@router.post("/me/verify/send-otp")
+@limiter.limit("5/minute")
+async def send_verification_otp(
+    request: Request, body: VerifyContactSendRequest, current_user: dict = Depends(get_current_user)
+):
+    """Send an OTP to the signed-in user's own (unverified) phone or email."""
+    user = await _current(current_user)
+    target = await _verification_target(user, body.channel)
+    return _sent_payload(await send_otp(body.channel, target, "verify"))
+
+
+@router.post("/me/verify", response_model=UserResponse)
+@limiter.limit("10/minute")
+async def verify_contact(
+    request: Request, body: VerifyContactRequest, current_user: dict = Depends(get_current_user)
+):
+    """Mark the phone or email as verified, enabling login through that channel."""
+    user = await _current(current_user)
+    target = await _verification_target(user, body.channel)
+    await verify_otp(body.channel, target, "verify", body.otp)
+    if body.channel == SMS:
+        user.phone_verified = True
+    else:
+        user.email_verified = True
+    await user.save()
+    return UserResponse(**_user_payload(user))
 
 
 @router.post("/logout")
