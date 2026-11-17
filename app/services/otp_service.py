@@ -60,6 +60,8 @@ class OtpSent:
     otp_length: int
     expires_in_seconds: int
     resend_after_seconds: int
+    delivered: bool = True  # False when no SMS/email was actually sent (static/console/test mode)
+    test_code: str | None = None  # the fixed OTP to use when OTP_PROVIDER / EMAIL_OTP_PROVIDER = static
 
 
 def _utc(dt: datetime) -> datetime:
@@ -110,19 +112,20 @@ def _generate_code(channel: str, target: str) -> str:
     return "".join(secrets.choice("0123456789") for _ in range(settings.OTP_LENGTH))
 
 
-async def _deliver(channel: str, target: str, code: str) -> None:
+async def _deliver(channel: str, target: str, code: str) -> bool:
+    """Send the OTP. Returns False when nothing was actually sent to the user."""
     provider = _provider(channel)
     if target in _test_codes(channel) or provider == "static":
-        return  # nothing is sent
+        return False
     if provider == "console":
         logger.warning(f"[OTP console] {channel} OTP for {target}: {code}")
-        return
+        return False
     if channel == SMS and provider == "twilio":
         await _send_twilio_sms(target, code)
-        return
+        return True
     if channel == EMAIL and provider == "smtp":
         await _send_email(target, code)
-        return
+        return True
     raise HTTPException(status_code=503, detail="OTP service is not configured.")
 
 
@@ -286,7 +289,7 @@ async def send_otp(channel: str, target: str, purpose: str) -> OtpSent:
             )
 
     code = _generate_code(channel, target)
-    await _deliver(channel, target, code)  # send first: if delivery fails, the old OTP stays usable
+    delivered = await _deliver(channel, target, code)  # send first: if delivery fails, the old OTP stays usable
 
     await _query(channel, target, purpose).delete()
     await OtpCode(
@@ -303,6 +306,9 @@ async def send_otp(channel: str, target: str, purpose: str) -> OtpSent:
         otp_length=len(code),
         expires_in_seconds=settings.OTP_EXPIRE_SECONDS,
         resend_after_seconds=settings.OTP_RESEND_COOLDOWN_SECONDS,
+        delivered=delivered,
+        # Only the shared static code is revealed; reviewer test codes and console codes are not.
+        test_code=code if _provider(channel) == "static" and target not in _test_codes(channel) else None,
     )
 
 

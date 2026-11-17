@@ -82,9 +82,18 @@ def _user_payload(user: User) -> dict:
 
 
 def _sent_payload(sent: OtpSent) -> dict:
+    if sent.delivered:
+        message = f"OTP sent to {sent.destination}"
+    elif sent.test_code:
+        # OTP_PROVIDER / EMAIL_OTP_PROVIDER = static: no SMS/email service is set up.
+        message = f"OTP could not be sent to {sent.destination}. Please use test OTP {sent.test_code}."
+    else:  # console mode, or a reviewer test number/email with its own fixed code
+        message = f"OTP could not be sent to {sent.destination}. Please use the test OTP given to you."
     return {
         "success": True,
-        "message": f"OTP sent to {sent.destination}",
+        "message": message,
+        "delivered": sent.delivered,
+        "testOtp": sent.test_code,
         "channel": sent.channel,
         "destination": sent.destination,
         "otpLength": sent.otp_length,

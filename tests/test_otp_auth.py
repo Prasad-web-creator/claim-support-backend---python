@@ -55,6 +55,22 @@ async def test_register_and_login_with_static_otp(client):
 
 
 @pytest.mark.asyncio
+async def test_static_mode_says_otp_not_sent_and_gives_test_code(client, monkeypatch):
+    """With no SMS/email service set up, the app must not claim the OTP was sent."""
+    r = await client.post("/auth/send-otp", json={"phone": "9876543210", "purpose": "register"})
+    body = r.json()
+    assert body["delivered"] is False and body["testOtp"] == "1234"
+    assert body["message"] == "OTP could not be sent to ******3210. Please use test OTP 1234."
+
+    # Reviewer test numbers never reveal their code.
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "OTP_TEST_NUMBERS", "9123456789:4321")
+    body = (await client.post("/auth/send-otp", json={"phone": "9123456789", "purpose": "register"})).json()
+    assert body["delivered"] is False and body["testOtp"] is None and "4321" not in body["message"]
+
+
+@pytest.mark.asyncio
 async def test_login_without_requesting_otp_is_rejected(client):
     """Previously the backend ignored the OTP; a direct API call must now fail."""
     assert (await _register(client)).status_code == 201
@@ -478,6 +494,8 @@ async def test_smtp_sends_email_and_the_sent_code_registers(client, monkeypatch)
     )
     assert r.status_code == 200, r.text
     assert r.json()["destination"] == "us**@mail.com"
+    assert r.json()["delivered"] is True and r.json()["testOtp"] is None
+    assert r.json()["message"] == "OTP sent to us**@mail.com"
 
     assert len(server.sent) == 1
     msg = server.sent[0]
