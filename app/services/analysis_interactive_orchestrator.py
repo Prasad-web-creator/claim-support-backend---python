@@ -159,8 +159,10 @@ def _apply_declared_inception(policy_json: dict, policy_doc):
     if getattr(policy_doc, "is_renewal", None) is False:
         start = inception
         basis = f"Based on your inputs, this is a new policy first taken on {inception:%d-%b-%Y}"
-    elif getattr(policy_doc, "continuous_renewal", None) is False:
+    elif getattr(policy_doc, "continuous_renewal", None) is False and (not current_start or inception < current_start):
         # A break in renewals: cover is counted from the uploaded policy document's start date.
+        # (When the first start is the current period's start there is no earlier period,
+        # so no break is possible and the branch below applies.)
         start = current_start or inception
         basis = (f"You have a coverage gap in your policy continuity, so waiting periods count from the "
                  f"uploaded policy's start date ({start:%d-%b-%Y})")
@@ -1395,6 +1397,11 @@ async def _apply_confirmed_renewal(session: AnalysisSession) -> None:
     """
     pj = session.policy_json
     pj["isRenewal"] = True
+    # "Renewed every year without a break?" was never asked for this policy (it was
+    # entered as New). Any break answer still stored from an earlier upload or app
+    # version does not belong to this answer, so it is cleared and not read as a gap.
+    for key in ("continuousRenewal", "renewedWithoutBreak", "breakStartDate", "coverRestartDate", "restartDate"):
+        pj[key] = None
     stated = _document_first_start_date(pj)
     start = stated or _as_date(pj.get("policyStartDate"))
     if start:
@@ -1415,6 +1422,9 @@ async def _apply_confirmed_renewal(session: AnalysisSession) -> None:
             pol_record = await Policy.get(ObjectId(session.policy_id))
             if pol_record:
                 pol_record.is_renewal = True
+                pol_record.continuous_renewal = None
+                pol_record.break_start_date = None
+                pol_record.cover_restart_date = None
                 if start:
                     pol_record.inception_date = datetime(start.year, start.month, start.day)
                 await pol_record.save()

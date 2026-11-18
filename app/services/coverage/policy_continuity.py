@@ -568,12 +568,23 @@ def declared_policy_continuity(policy_json: Optional[dict], prescription_json: O
             start = start or parse_policy_date(curr.get("startDate"))
             end = end or parse_policy_date(curr.get("endDate"))
 
+    # Cover cannot have first started after the current period began: a later
+    # entered date is a typing slip, and cover is counted from the period's start.
+    if start and inception > start:
+        inception = start
+
+    renewal = _bool(pj.get("isRenewal"))
     # A new (first-year) policy has no renewals, so it cannot have a break.
-    is_new = pj.get("isRenewal") is not None and not _bool(pj.get("isRenewal"))
+    is_new = renewal is False
     continuous_val = pj.get("continuousRenewal")
     if continuous_val is None:
         continuous_val = pj.get("renewedWithoutBreak")
-    continuous = True if is_new else (_bool(continuous_val) if continuous_val is not None else True)
+    # Only an explicit "No" is a break. A missing or unreadable answer is never read as a gap.
+    declared_break = not is_new and _bool(continuous_val) is False
+    # A break needs an earlier policy period. When cover first started on the day the
+    # current period starts, there is none, so no break is possible.
+    has_earlier_periods = bool(start) and inception < start
+    break_applies = declared_break and has_earlier_periods
 
     claim, claim_source = resolve_claim_date(prescription_json)
 
@@ -597,7 +608,13 @@ def declared_policy_continuity(policy_json: Optional[dict], prescription_json: O
         summary = f"The current policy ended on {_fmt(end)}, before the claim date {_fmt(claim)}."
         gaps.append({"from": _iso(end + timedelta(days=1)), "to": _iso(claim), "days": (claim - end).days,
                      "description": "No active policy on the claim date."})
-    elif not continuous:
+    elif break_applies and claim < start:
+        status = STATUS_GAP
+        # After a break, cover is counted only from the uploaded policy's start date.
+        summary = (f"You have a coverage gap in your policy continuity since it was first taken on "
+                   f"{_fmt(inception)}. Cover is counted from the uploaded policy's start date ({_fmt(start)}), "
+                   f"which is after the claim date {_fmt(claim)}, so this policy does not cover that date.")
+    elif break_applies:
         status = STATUS_GAP
         # The break dates are not asked: cover is counted from the uploaded policy's start date.
         summary = (f"You have a coverage gap in your policy continuity since it was first taken on "
@@ -608,6 +625,11 @@ def declared_policy_continuity(policy_json: Optional[dict], prescription_json: O
         status = STATUS_VERIFIED
         summary = (f"This is a new policy, first taken on {_fmt(inception)}. Cover has been active from that date "
                    f"to the claim date {_fmt(claim)}.")
+    elif renewal is True and not has_earlier_periods:
+        status = STATUS_VERIFIED
+        summary = (f"This is a renewed policy. Cover is counted from {_fmt(inception)}, the start of the uploaded "
+                   f"policy period and the earliest start date known, and has been active from then to the claim "
+                   f"date {_fmt(claim)}.")
     else:
         status = STATUS_VERIFIED
         summary = f"Cover has continued without interruption from {_fmt(inception)} to the claim date {_fmt(claim)}."
