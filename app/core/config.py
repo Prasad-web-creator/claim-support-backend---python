@@ -41,7 +41,7 @@ class Settings(BaseSettings):
         default="+91", pattern=r"^\+\d{1,3}$", description="Prefix added to the 10-digit number for SMS"
     )
     OTP_SMS_MESSAGE: str = Field(
-        default="Your Claim Support OTP is {code}. It is valid for {minutes} minutes. Do not share it with anyone.",
+        default="Your Policy Pal OTP is {code}. It is valid for {minutes} minutes. Do not share it with anyone.",
         description="SMS text; {code} and {minutes} are filled in",
     )
 
@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     SMTP_USERNAME: Optional[str] = Field(default=None, description="SMTP login (Gmail address)")
     SMTP_PASSWORD: Optional[str] = Field(default=None, description="SMTP password (Gmail app password)")
     SMTP_FROM_EMAIL: Optional[str] = Field(default=None, description="Sender address; defaults to SMTP_USERNAME")
-    SMTP_FROM_NAME: str = Field(default="ClaimSupport", description="Sender display name / app name in emails")
+    SMTP_FROM_NAME: str = Field(default="Policy Pal", description="Sender display name / app name in emails")
     SMTP_TIMEOUT_SECONDS: int = Field(default=15, ge=1, description="SMTP connect/send timeout")
 
     # ─── Database ─────────────────────────────────────────────────────────────
