@@ -114,12 +114,49 @@ class FileUploadService:
         }
 
     @staticmethod
+    async def find_file_user(stored_file_id: str, user_id: str):
+        """
+        A policy or prescription that still points at this stored file, if any.
+
+        Uploads are de-duplicated by content hash, so one stored file can back
+        several records (the same PDF uploaded twice, or the same file used as
+        both a policy and a prescription).
+        """
+        from app.models.policy import Policy
+        from app.models.prescription import Prescription
+
+        return await Policy.find_one(
+            Policy.user_id == user_id,
+            Policy.grid_fs_file_id == stored_file_id,
+        ) or await Prescription.find_one(
+            Prescription.user_id == user_id,
+            Prescription.grid_fs_file_id == stored_file_id,
+        )
+
+    @staticmethod
     async def delete_file(stored_file_id: str, deleted_by_user_id: str) -> None:
-        """Delete a file from storage and metadata."""
+        """
+        Delete a file from storage and metadata — unless another policy or
+        prescription still uses it. Deleting a shared file would leave that
+        record pointing at nothing, and its next analysis fails with
+        "File metadata not found".
+        """
         record = await StoredFile.get(ObjectId(stored_file_id))
         if not record:
             raise ValueError(f"StoredFile not found: {stored_file_id}")
-            
+        if record.user_id != deleted_by_user_id:
+            raise ValueError(f"StoredFile not found: {stored_file_id}")
+
+        user = await FileUploadService.find_file_user(stored_file_id, deleted_by_user_id)
+        if user is not None:
+            logger.info(
+                f"[File Delete] Kept shared file {stored_file_id}: still used by record {user.id}"
+            )
+            if record.document_id != str(user.id):
+                record.document_id = str(user.id)
+                await record.save()
+            return
+
         try:
             await _provider.delete_file(record.storage_key)
         except Exception as e:

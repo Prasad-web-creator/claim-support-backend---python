@@ -62,7 +62,10 @@ async def _fetch_file_bytes_by_gridfs_id(file_id: str, user_id: str) -> tuple[by
     
     stored_file = await StoredFile.get(ObjectId(file_id))
     if not stored_file or stored_file.user_id != user_id:
-         raise FileNotFoundError(f"File metadata not found for ID {file_id}")
+        logger.warning(f"[File] Stored file missing or not owned by user: id={file_id}")
+        raise FileNotFoundError(
+            "The uploaded document is no longer available. Please upload it again."
+        )
          
     chunks = []
     async for chunk in await FileUploadService.get_file_stream(stored_file.storage_key):

@@ -130,16 +130,23 @@ class CrudService:
             # Note: We intentionally do NOT delete associated Analysis Reports 
             # so users can retain their historical analyses.
             
-            # Delete associated files from GridFS AND metadata
+            # Delete associated files from GridFS AND metadata. delete_file keeps
+            # any file another policy/prescription still uses (uploads are
+            # de-duplicated by content, so one file can back several records).
             from app.services.storage.file_upload_service import FileUploadService
-            stored_files = await StoredFile.find(
+
+            candidate_ids = set()
+            for sf in await StoredFile.find(
                 StoredFile.document_id == str(doc.id),
                 StoredFile.user_id == user_id
-            ).to_list()
-            
-            for sf in stored_files:
+            ).to_list():
+                candidate_ids.add(str(sf.id))
+            if getattr(doc, "grid_fs_file_id", None):
+                candidate_ids.add(str(doc.grid_fs_file_id))
+
+            for file_id in candidate_ids:
                 try:
-                    await FileUploadService.delete_file(str(sf.id), user_id)
+                    await FileUploadService.delete_file(file_id, user_id)
                 except Exception:
                     pass
             
