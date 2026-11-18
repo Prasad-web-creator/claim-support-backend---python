@@ -137,7 +137,9 @@ CRITICAL RULES:
 5. isRenewal: true ONLY if the text says the policy is a renewal (e.g. "Renewal", "Renewed", "Policy Year 3", "Renewal of policy no."); false ONLY if the text says it is a fresh/new policy (e.g. "Fresh", "New Business", "First Year"); otherwise null.
 6. continuousCoverageSince: a date the text presents as the start of uninterrupted cover across renewals, e.g. "Continuous coverage since", "Insured with us since", "Member since", "First inception date", "Date of first enrollment", "Coverage continuous from". Do NOT use the start date of the current policy period for this field unless the text explicitly labels it that way.
 7. previousPolicyNumber / previousPolicyStartDate / previousPolicyEndDate / previousInsurer: only when the text explicitly refers to a previous or expiring policy (including portability/migration from another insurer).
-8. continuityEvidence: up to 5 short verbatim quotes (max 200 characters each) from the text that support the fields above. Empty array if none.
+8. renewedWithoutBreak: true ONLY if the text explicitly says the policy was renewed without a break (e.g. "Renewed without break in coverage", "Continuous renewal", "No break in insurance"); false ONLY if the text explicitly says there was a break, lapse or gap in renewals (e.g. "Renewed after break", "Policy lapsed and revived"); otherwise null. Never infer it from dates.
+9. renewalBreakStatement: the exact wording that decided renewedWithoutBreak, copied verbatim (max 200 characters); null when renewedWithoutBreak is null.
+10. continuityEvidence: up to 5 short verbatim quotes (max 200 characters each) from the text that support the fields above. Empty array if none.
 
 Return ONLY a valid JSON object with these fields:
 - policyNumber (string or null)
@@ -152,6 +154,8 @@ Return ONLY a valid JSON object with these fields:
 - previousPolicyEndDate (string or null)
 - previousInsurer (string or null)
 - continuousCoverageSince (string or null)
+- renewedWithoutBreak (boolean or null)
+- renewalBreakStatement (string or null)
 - continuityEvidence (array of strings)"""
 
 # Prescription extraction prompt

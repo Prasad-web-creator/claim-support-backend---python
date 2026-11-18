@@ -231,26 +231,104 @@ def _document_first_start_date(policy_json: dict):
     return stated
 
 
-def _inception_conflict_question(policy_json: dict, declared_start) -> Optional[dict]:
+def _document_previous_period_start(policy_json: dict):
     """
-    For a renewed policy: ask only when the policy document itself states a
-    different FIRST start date than the one the user entered.
+    The start of the previous policy period the document prints, when that period
+    runs straight into the current one (ends the day before it starts, or on the
+    same day). Cover is then proven continuous since at least that date. None otherwise.
+    """
+    block = _continuity_block(policy_json)
+    prev_start = _as_date(block.get("previousPolicyStartDate"))
+    prev_end = _as_date(block.get("previousPolicyEndDate"))
+    current_start = _as_date(block.get("policyStartDate") or policy_json.get("policyStartDate"))
+    if not (prev_start and prev_end and current_start):
+        return None
+    if not (prev_start < prev_end < current_start) or (current_start - prev_end).days > 1:
+        return None
+    if prev_start > datetime.now().date():
+        return None
+    return prev_start
+
+
+def _document_earliest_start(policy_json: dict):
+    """
+    The earliest date the policy document proves cover has run without a break since,
+    as (date, exact):
+      • exact=True  — the document names the first start ("Continuous coverage since");
+      • exact=False — only the previous period it prints, so cover may go back further.
+    None when the document proves nothing before the current period.
     """
     stated = _document_first_start_date(policy_json)
-    if not stated or not declared_start or stated == declared_start:
-        return None
-    mine, theirs = f"{declared_start:%d-%m-%Y}", f"{stated:%d-%m-%Y}"
+    if stated:
+        return stated, True
+    previous = _document_previous_period_start(policy_json)
+    if previous:
+        return previous, False
+    return None
+
+
+def _first_start_conflict_question(entered, document_date) -> dict:
+    mine, theirs = f"{entered:%d %b %Y}", f"{document_date:%d %b %Y}"
     return {
         "id": "policy_inception_date_conflict",
         "category": "eligibility",
         "title": "Policy First Start Date",
-        "question": (f"You entered that this policy was first taken on {mine}, but the policy document says "
-                     f"it was first taken (continuous cover) on {theirs}. Which date should I use?"),
+        "question": f"The document shows cover since {theirs}, but you entered {mine}. Which date should I use?",
         "type": "single_choice",
         "required": True,
         "options": [f"Use my entered date ({mine})", f"Use policy document date ({theirs})"],
         "reason": "Waiting periods are counted from the date cover first started without a break.",
     }
+
+
+def _inception_conflict_question(policy_json: dict, declared_start) -> Optional[dict]:
+    """
+    For a renewed policy: ask when the first start date the user entered disagrees
+    with what the policy document proves.
+      • The document names its first start date: ask when the dates differ.
+      • The document only prints a previous period: cover may go back further than
+        it, so ask only when the entered date is LATER than that period's start.
+    """
+    earliest = _document_earliest_start(policy_json)
+    if not earliest or not declared_start:
+        return None
+    document_date, exact = earliest
+    if declared_start == document_date or (not exact and declared_start < document_date):
+        return None
+    return _first_start_conflict_question(declared_start, document_date)
+
+
+FIRST_START_QUESTION_ID = "policy_first_start_date"
+
+
+def _first_start_date_question(policy_json: dict) -> dict:
+    """
+    After the user confirms a policy entered as New is renewed: the date it was first
+    taken was never asked (the date they entered was this policy's start date), so ask it.
+    """
+    current_start = _as_date(policy_json.get("policyStartDate"))
+    earliest = _document_earliest_start(policy_json)
+    text = "When was this policy first taken? Pick the very first start date of this policy, before any renewals."
+    if earliest:
+        text += f" The policy document shows cover since {earliest[0]:%d %b %Y}."
+    question = {
+        "id": FIRST_START_QUESTION_ID,
+        "category": "eligibility",
+        "title": "Policy First Start Date",
+        "question": text,
+        "type": "date",
+        "required": True,
+        "options": [],
+        "reason": "Waiting periods are counted from the date cover first started without a break.",
+        "minDate": "1970-01-01",
+    }
+    initial = earliest[0] if earliest else current_start
+    if initial:
+        question["initialDate"] = initial.isoformat()
+    if current_start:
+        # Cover cannot have first started after this policy period began.
+        question["maxDate"] = current_start.isoformat()
+    return question
 
 
 def _start_date_conflict_question(user_disp: str, doc_disp: str) -> dict:
@@ -304,6 +382,256 @@ def _new_or_renewed_conflict_question(policy_json: dict) -> Optional[dict]:
     }
 
 
+def _document_says_new(policy_json: dict) -> Optional[str]:
+    """
+    The document's own wording when it EXPLICITLY says the policy is new ("Fresh",
+    "New Business", "First Year"), or None. A document that says neither new nor
+    renewal, or that names a previous policy or an earlier first start, is not new.
+    """
+    block = _continuity_block(policy_json)
+    if block.get("isRenewal") is not False:
+        return None
+    if (_meaningful(block.get("previousPolicyNumber")) or _as_date(block.get("previousPolicyStartDate"))
+            or _document_first_start_date(policy_json)):
+        return None
+    return _meaningful(block.get("renewalInformation"))
+
+
+def _renewed_but_document_new_question(policy_json: dict) -> Optional[dict]:
+    """The user said the policy is renewed, but the document explicitly says it is new."""
+    if _document_says_new(policy_json) is None:
+        return None
+    wording = _document_says_new(policy_json)
+    shown = f' ("{wording[:80]}")' if wording else ""
+    return {
+        "id": NEW_OR_RENEWED_QUESTION_ID,
+        "category": "eligibility",
+        "title": "New or Renewed Policy",
+        "question": (f"You selected Renewed policy, but the policy document shows it is a new policy{shown}. "
+                     f"Is this policy new or renewed?"),
+        "type": "single_choice",
+        "required": True,
+        "options": [NEW_POLICY_OPTION, RENEWED_POLICY_OPTION],
+        "reason": "Waiting periods depend on whether this is the first year of cover or a renewal.",
+    }
+
+
+NEW_START_QUESTION_ID = "policy_new_start_date"
+
+
+def _new_start_date_question(policy_json: dict) -> dict:
+    """
+    After the user confirms a policy entered as Renewed is new: the date they entered
+    was the FIRST start date (a renewed policy's question), so the start date is asked.
+    """
+    question = {
+        "id": NEW_START_QUESTION_ID,
+        "category": "eligibility",
+        "title": "Policy Start Date",
+        "question": "When did this policy start? Pick the policy start date shown on your policy document.",
+        "type": "date",
+        "required": True,
+        "options": [],
+        "reason": "For a new policy, waiting periods are counted from its start date.",
+        "minDate": "1970-01-01",
+    }
+    doc_start = _as_date(policy_json.get("policyStartDate"))
+    if doc_start:
+        question["initialDate"] = doc_start.isoformat()
+    return question
+
+
+RENEWED_WITHOUT_BREAK_QUESTION_ID = "policy_renewed_without_break"
+NO_BREAK_OPTION = "Yes, renewed every year without a break"
+BREAK_OPTION = "No, there was a break"
+
+
+def _renewed_without_break_question() -> dict:
+    return {
+        "id": RENEWED_WITHOUT_BREAK_QUESTION_ID,
+        "category": "eligibility",
+        "title": "Renewed Without a Break",
+        "question": "Has this policy been renewed every year without a break?",
+        "type": "single_choice",
+        "required": True,
+        "options": [NO_BREAK_OPTION, BREAK_OPTION],
+        "reason": "After a break in renewals, waiting periods count from the current policy's start date.",
+    }
+
+
+def _no_break_from_answer(answer) -> Optional[bool]:
+    """True for "renewed without a break", False for "there was a break", None if unclear."""
+    text = str(answer or "").strip().lower()
+    if text.startswith("yes") or text in ("true", "without a break", "no break"):
+        return True
+    if text.startswith("no") or text in ("false", "break", "there was a break"):
+        return False
+    return None
+
+
+# Wording that states renewals had no break, and wording that states a break.
+_NO_BREAK_WORDING = re.compile(
+    r"without\s+(?:any\s+|a\s+)?(?:break|gap)|no\s+(?:break|gap)|uninterrupted|continuous(?:ly)?\s+renew|renewed\s+continuously",
+    re.IGNORECASE,
+)
+_BREAK_WORDING = re.compile(r"\bbreak\b|\blapsed?\b|\binterrupt|\bgap\b|\brevived\b", re.IGNORECASE)
+
+
+def _document_break_statement(policy_json: dict):
+    """
+    (renewed_without_break, wording) when the document EXPLICITLY states whether
+    renewals had a break, or None. The extracted flag only counts when the document's
+    own wording, copied verbatim, says the same thing.
+    """
+    block = _continuity_block(policy_json)
+    flag = block.get("renewedWithoutBreak")
+    if not isinstance(flag, bool):
+        flag = {"true": True, "false": False}.get(str(flag).strip().lower()) if flag is not None else None
+    if flag is None:
+        return None
+    wording = _meaningful(block.get("renewalBreakStatement"))
+    quotes = [wording] + [q for q in (block.get("continuityEvidence") or []) if isinstance(q, str)]
+    for quote in quotes:
+        if not quote:
+            continue
+        says_no_break = bool(_NO_BREAK_WORDING.search(quote))
+        if flag is True and says_no_break:
+            return True, quote.strip()
+        if flag is False and not says_no_break and _BREAK_WORDING.search(quote):
+            return False, quote.strip()
+    return None
+
+
+BREAK_CONFLICT_QUESTION_ID = "policy_renewal_break_conflict"
+
+
+def _break_conflict_question(policy_json: dict) -> Optional[dict]:
+    """
+    The user's "renewed every year without a break?" answer disagrees with what the
+    document explicitly states. Asked only when the document states it in words.
+    """
+    user_no_break = policy_json.get("continuousRenewal")
+    if not isinstance(user_no_break, bool):
+        return None
+    statement = _document_break_statement(policy_json)
+    if not statement or statement[0] == user_no_break:
+        return None
+    doc_no_break, wording = statement
+    quote = f' ("{wording[:100]}")'
+    if doc_no_break:
+        text = (f"The document shows this policy was renewed without a break{quote}, but you answered there was "
+                f"a break. Which should I use?")
+        options = ["Use my answer (there was a break)", "Use policy document (renewed without a break)"]
+    else:
+        text = (f"The document shows there was a break in this policy's renewals{quote}, but you answered it was "
+                f"renewed every year without a break. Which should I use?")
+        options = ["Use my answer (renewed without a break)", "Use policy document (there was a break)"]
+    return {
+        "id": BREAK_CONFLICT_QUESTION_ID,
+        "category": "eligibility",
+        "title": "Renewal Break Conflict",
+        "question": text,
+        "type": "single_choice",
+        "required": True,
+        "options": options,
+        "reason": "After a break in renewals, waiting periods count from the current policy's start date.",
+    }
+
+
+def _was_asked(session: AnalysisSession, question_id: str) -> bool:
+    return any(q.id == question_id for q in (session.questions or []))
+
+
+def _renewed_next_question(session: AnalysisSession, policy_json: dict) -> Optional[dict]:
+    """
+    The next question a renewed policy still needs, in order, each asked at most once:
+      1. the break answer disagrees with what the document explicitly states;
+      2. renewed without a break: the first start date disagrees with the document's.
+    None when nothing is left to ask.
+    """
+    if not _was_asked(session, BREAK_CONFLICT_QUESTION_ID):
+        question = _break_conflict_question(policy_json)
+        if question:
+            return question
+    # After a break, cover counts from the current policy's start, so the first start
+    # date does not change the result and is not checked.
+    if policy_json.get("continuousRenewal") is not False and not _was_asked(session, "policy_inception_date_conflict"):
+        return _inception_conflict_question(policy_json, _as_date(policy_json.get("declaredInceptionDate")))
+    return None
+
+
+def _apply_renewed_waiting_start(policy_json: dict):
+    """
+    Waiting-period start for a renewed policy from its answers in policy_json: the first
+    start date, or, after a break in renewals, the current policy's start date.
+    """
+    current_start = _as_date(policy_json.get("policyStartDate"))
+    first = _as_date(policy_json.get("declaredInceptionDate")) or current_start
+    if not first:
+        return None
+    if current_start and first > current_start:
+        # Cover cannot have first started after the current period began.
+        first = current_start
+    policy_json["declaredInceptionDate"] = policy_json["inceptionDate"] = first.isoformat()
+    no_break = policy_json.get("continuousRenewal")
+    if no_break is False and current_start and first < current_start:
+        start = current_start
+        basis = (f"You have a coverage gap in your policy continuity, so waiting periods count from the "
+                 f"uploaded policy's start date ({start:%d-%b-%Y})")
+    elif no_break is True:
+        start = first
+        basis = (f"Based on your answers, this policy was first taken on {first:%d-%b-%Y} and renewed every "
+                 f"year without a break")
+    else:
+        start = first
+        basis = f"Based on your answers, this is a renewed policy first taken on {first:%d-%b-%Y}"
+    policy_json["waitingPeriodStartDate"] = start.isoformat()
+    policy_json["waitingPeriodBasis"] = basis
+    return start
+
+
+async def _save_policy_answers(session: AnalysisSession, **fields) -> None:
+    """Keep the Policy record in step with the answers, for the report and later analyses."""
+    if not session.policy_id or len(str(session.policy_id)) != 24:
+        return
+    try:
+        pol_record = await Policy.get(ObjectId(session.policy_id))
+        if pol_record:
+            for key, value in fields.items():
+                setattr(pol_record, key, value)
+            await pol_record.save()
+    except Exception as pe:
+        logger.error(f"[Clarification] Error saving policy answers {list(fields)}: {pe}")
+
+
+def _as_datetime(d):
+    return datetime(d.year, d.month, d.day) if d else None
+
+
+async def _continue_renewed(session: AnalysisSession) -> Optional[dict]:
+    """
+    After any answer on the renewed path: ask the next question it still needs, or
+    settle the waiting-period start and save the answers. Returns the clarification
+    payload when a question is asked, else None.
+    """
+    pj = session.policy_json
+    question = _renewed_next_question(session, pj)
+    if question:
+        logger.info(f"[Clarification] Renewed policy: asking '{question['id']}'.")
+        return await _ask_clarification(session, [question])
+    start = _apply_renewed_waiting_start(pj)
+    logger.info(f"[Clarification] Renewed policy settled; waiting periods count from {start}.")
+    await _save_policy_answers(
+        session,
+        is_renewal=True,
+        continuous_renewal=pj.get("continuousRenewal") if isinstance(pj.get("continuousRenewal"), bool) else None,
+        inception_date=_as_datetime(_as_date(pj.get("declaredInceptionDate"))),
+        break_start_date=None,
+        cover_restart_date=None,
+    )
+    return None
+
+
 async def _ask_clarification(session: AnalysisSession, questions: list) -> dict:
     """Store the questions on the session and pause it for the user's answers."""
     for q in questions:
@@ -316,6 +644,9 @@ async def _ask_clarification(session: AnalysisSession, questions: list) -> dict:
             required=q["required"],
             options=q["options"],
             reason=q["reason"],
+            initialDate=q.get("initialDate"),
+            minDate=q.get("minDate"),
+            maxDate=q.get("maxDate"),
         ))
     session.status = "waiting_for_user"
     await session.save()
@@ -678,21 +1009,26 @@ async def run_single_policy_analysis(
     declared_start = _apply_declared_inception(policy_json, policy_doc)
     declared_renewal = getattr(policy_doc, "is_renewal", None)
 
-    # The user said New, but the document says it is a renewal: confirm that first,
-    # because it decides which date the waiting periods count from.
+    # New or renewed disagrees with what the document explicitly says: confirm that
+    # first, because it decides which date the waiting periods count from.
     if declared_start and declared_renewal is False:
         type_question = _new_or_renewed_conflict_question(policy_json)
         if type_question:
             logger.info("[Claim Analysis] Policy declared new, but the document says renewal; asking the user.")
             return await _ask_clarification(session, [type_question])
+    if declared_start and declared_renewal is True:
+        type_question = _renewed_but_document_new_question(policy_json)
+        if type_question:
+            logger.info("[Claim Analysis] Policy declared renewed, but the document says new; asking the user.")
+            return await _ask_clarification(session, [type_question])
 
-    # Renewed every year without a break: the first start date the user entered is
-    # checked against a first start date the document itself states (if it states one).
-    if declared_start and declared_renewal is True and getattr(policy_doc, "continuous_renewal", None) is not False:
-        first_start_question = _inception_conflict_question(policy_json, _as_date(policy_doc.inception_date))
-        if first_start_question:
-            logger.info("[Claim Analysis] Entered first start date differs from the document's; asking the user.")
-            return await _ask_clarification(session, [first_start_question])
+    # Renewed: the break answer and the first start date are checked against what the
+    # document explicitly states (break first, then the first start date when no break).
+    if declared_start and declared_renewal is True:
+        renewed_question = _renewed_next_question(session, policy_json)
+        if renewed_question:
+            logger.info(f"[Claim Analysis] Renewed policy answers differ from the document; asking '{renewed_question['id']}'.")
+            return await _ask_clarification(session, [renewed_question])
 
     # Policies saved before the inception question existed: the start date the user
     # entered is checked against the document's current period start.
@@ -1402,15 +1738,17 @@ async def _apply_confirmed_renewal(session: AnalysisSession) -> None:
     # version does not belong to this answer, so it is cleared and not read as a gap.
     for key in ("continuousRenewal", "renewedWithoutBreak", "breakStartDate", "coverRestartDate", "restartDate"):
         pj[key] = None
-    stated = _document_first_start_date(pj)
-    start = stated or _as_date(pj.get("policyStartDate"))
+    # Until the user answers the first start date question, the earliest date the
+    # document proves is used, or this policy's own start date when it proves none.
+    earliest = _document_earliest_start(pj)
+    start = earliest[0] if earliest else _as_date(pj.get("policyStartDate"))
     if start:
         pj["waitingPeriodStartDate"] = start.isoformat()
         pj["declaredInceptionDate"] = pj["inceptionDate"] = start.isoformat()
         pj["waitingPeriodBasis"] = (
             f"Based on your answer, this is a renewed policy, and the policy document shows continuous cover "
             f"since {start:%d-%b-%Y}"
-            if stated else
+            if earliest else
             f"Based on your answer, this is a renewed policy. Its first start date is not known, so waiting "
             f"periods count from this policy's start date ({start:%d-%b-%Y}). To count them from an earlier "
             f"date, upload the policy again with its first start date"
@@ -1430,6 +1768,7 @@ async def _apply_confirmed_renewal(session: AnalysisSession) -> None:
                 await pol_record.save()
         except Exception as pe:
             logger.error(f"[Clarification] Error saving renewed policy answer: {pe}")
+
 
 
 async def resume_analysis_session(
@@ -1461,19 +1800,74 @@ async def resume_analysis_session(
             answer=answer_val
         ))
     
-    # New or renewed: asked when the user said New but the document says renewal.
+    # New or renewed: asked when the user's answer disagrees with what the document
+    # explicitly says (entered New, document says renewal; or entered Renewed,
+    # document says new).
     type_ans = str(answers.get(NEW_OR_RENEWED_QUESTION_ID, "") or "").lower()
     if type_ans:
         if not session.policy_json:
             session.policy_json = {}
-        if "renew" in type_ans:
+        pj = session.policy_json
+        entered_renewed = pj.get("isRenewal") is True
+        if "renew" in type_ans and not entered_renewed:
+            # Entered New, confirmed Renewed. The date entered was this policy's START
+            # date, so ask when it was FIRST taken and whether renewals had a break.
             await _apply_confirmed_renewal(session)
+            if not _was_asked(session, FIRST_START_QUESTION_ID):
+                logger.info("[Clarification] Renewed policy confirmed; asking first start date and breaks.")
+                return await _ask_clarification(
+                    session, [_first_start_date_question(pj), _renewed_without_break_question()]
+                )
+        elif "renew" in type_ans:
+            # Entered Renewed, confirmed Renewed: the upload answers (first start date,
+            # renewed without a break) stand and are checked against the document.
+            follow_up = await _continue_renewed(session)
+            if follow_up:
+                return follow_up
+        elif entered_renewed:
+            # Entered Renewed, confirmed New. The date entered was the FIRST start date
+            # (a renewed policy's question) and the break answer no longer applies.
+            pj["isRenewal"] = False
+            for key in ("continuousRenewal", "renewedWithoutBreak", "breakStartDate", "coverRestartDate", "restartDate"):
+                pj[key] = None
+            await _save_policy_answers(
+                session, is_renewal=False, continuous_renewal=None, break_start_date=None, cover_restart_date=None,
+            )
+            if not _was_asked(session, NEW_START_QUESTION_ID):
+                logger.info("[Clarification] New policy confirmed; asking its start date.")
+                return await _ask_clarification(session, [_new_start_date_question(pj)])
         else:
-            # Confirmed new: the entered start date is still checked against the document's.
+            # Entered New, confirmed New: the entered start date is checked against the document's.
             follow_up = _new_policy_start_date_question(session)
             if follow_up:
                 logger.info("[Clarification] New policy confirmed; start dates differ, asking which to use.")
                 return await _ask_clarification(session, [follow_up])
+
+    # The start date of a policy confirmed New after it was entered as Renewed.
+    new_start_ans = answers.get(NEW_START_QUESTION_ID)
+    if new_start_ans:
+        if not session.policy_json:
+            session.policy_json = {}
+        pj = session.policy_json
+        picked = _date_from_answer(new_start_ans)
+        doc_start = _as_date(pj.get("policyStartDate"))
+        if not picked:
+            # Unreadable: the document's start date is used.
+            logger.warning(f"[Clarification] Policy start date answer not understood: {new_start_ans!r}")
+            picked = doc_start
+        else:
+            picked = picked.date()
+        if picked and doc_start and picked != doc_start and not _was_asked(session, "policy_start_date_conflict"):
+            logger.info("[Clarification] Entered start date differs from the document's; asking which to use.")
+            return await _ask_clarification(
+                session, [_start_date_conflict_question(f"{picked:%d-%m-%Y}", f"{doc_start:%d-%m-%Y}")]
+            )
+        if picked:
+            pj["declaredInceptionDate"] = pj["inceptionDate"] = pj["waitingPeriodStartDate"] = picked.isoformat()
+            if not doc_start:
+                pj["policyStartDate"] = picked.isoformat()
+            pj["waitingPeriodBasis"] = f"Based on your answer, this is a new policy first taken on {picked:%d-%b-%Y}"
+            await _save_policy_answers(session, is_renewal=False, inception_date=_as_datetime(picked))
 
     # Check if policy start date conflict was answered
     date_ans = answers.get("policy_start_date_conflict")
@@ -1511,28 +1905,46 @@ async def resume_analysis_session(
                 except Exception as pe:
                     logger.error(f"[Clarification] Error updating policy start date in DB: {pe}")
 
-    # Check if the inception date conflict was answered
+    # Renewed path answers: the first start date and "renewed without a break?" (asked
+    # together after New was corrected to Renewed), and the two conflict questions.
+    first_start_ans = answers.get(FIRST_START_QUESTION_ID)
+    break_ans = answers.get(RENEWED_WITHOUT_BREAK_QUESTION_ID)
+    break_conflict_ans = str(answers.get(BREAK_CONFLICT_QUESTION_ID, "") or "").lower()
     inception_ans = answers.get("policy_inception_date_conflict")
-    if inception_ans:
-        chosen = _date_from_answer(inception_ans)
-        if chosen:
-            if not session.policy_json:
-                session.policy_json = {}
-            session.policy_json["waitingPeriodStartDate"] = chosen.strftime("%Y-%m-%d")
-            session.policy_json["waitingPeriodBasis"] = (
-                f"Based on your answer, cover has been continuous since {chosen:%d-%b-%Y}"
-            )
-            # The continuity card reports the same first start date.
-            session.policy_json["declaredInceptionDate"] = chosen.strftime("%Y-%m-%d")
-            session.policy_json["inceptionDate"] = chosen.strftime("%Y-%m-%d")
-            if session.policy_id and len(str(session.policy_id)) == 24:
-                try:
-                    pol_record = await Policy.get(ObjectId(session.policy_id))
-                    if pol_record:
-                        pol_record.inception_date = chosen
-                        await pol_record.save()
-                except Exception as pe:
-                    logger.error(f"[Clarification] Error saving inception date: {pe}")
+    if first_start_ans or break_ans or break_conflict_ans or inception_ans:
+        if not session.policy_json:
+            session.policy_json = {}
+        pj = session.policy_json
+        if first_start_ans:
+            picked = _date_from_answer(first_start_ans)
+            if picked:
+                picked = picked.date()
+                current_start = _as_date(pj.get("policyStartDate"))
+                if current_start and picked > current_start:
+                    # Cover cannot have first started after this policy period began.
+                    picked = current_start
+                pj["declaredInceptionDate"] = pj["inceptionDate"] = picked.isoformat()
+            else:
+                # Unreadable: the default set when Renewed was confirmed stays in place.
+                logger.warning(f"[Clarification] First start date answer not understood: {first_start_ans!r}")
+        if break_ans:
+            no_break = _no_break_from_answer(break_ans)
+            if no_break is None:
+                logger.warning(f"[Clarification] Renewed-without-break answer not understood: {break_ans!r}")
+            else:
+                pj["continuousRenewal"] = no_break
+        if break_conflict_ans and "document" in break_conflict_ans:
+            statement = _document_break_statement(pj)
+            if statement:
+                pj["continuousRenewal"] = statement[0]
+        if inception_ans:
+            chosen = _date_from_answer(inception_ans)
+            if chosen:
+                pj["declaredInceptionDate"] = pj["inceptionDate"] = chosen.date().isoformat()
+        # Next question on the renewed path, or settle the waiting-period start.
+        follow_up = await _continue_renewed(session)
+        if follow_up:
+            return follow_up
 
     # Check if treatment date was answered (a picked date such as "14-Oct-2026", or today/yesterday)
     treatment_date_ans = answers.get("prescription_treatment_date")

@@ -959,7 +959,10 @@ async def test_progress_is_readable_while_the_analysis_is_still_running(harness,
     observed.append(mid["progress"]["completedSteps"])
     # The shared prescription step plus each policy's finished steps so far.
     assert 0 < mid["progress"]["completedSteps"] < mid["progress"]["totalSteps"]
-    assert mid["progress"]["label"] == mpo.STAGE_LABELS["rule_engine"]
+    # Names the step actually in flight (prefixed with the policy number when
+    # only one of several policies is running) — never "Waiting to start".
+    assert mid["progress"]["label"].endswith(mpo.STAGE_LABELS["rule_engine"])
+    assert mid["progress"]["label"] != mpo.STAGE_LABELS["queued"]
     assert mid["prescriptionStage"] == "ready"
 
     mid_entry = harness.entry(mid, "A")

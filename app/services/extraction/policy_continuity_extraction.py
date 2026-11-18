@@ -12,7 +12,7 @@ from app.services.llm.ai_client import extract_json_with_retry
 from app.services.llm.prompts import POLICY_CONTINUITY_EXTRACTION_PROMPT
 
 # Bump when the continuity fields or prompt change, so cached policies are re-read once.
-CONTINUITY_EXTRACTION_VERSION = 1
+CONTINUITY_EXTRACTION_VERSION = 2
 
 # The continuity facts live in their own object on the policy JSON, so this pass
 # can never overwrite what the main extraction (or the user) put at the top level.
@@ -35,6 +35,8 @@ CONTINUITY_FIELDS = (
     "previousPolicyEndDate",
     "previousInsurer",
     "continuousCoverageSince",
+    "renewedWithoutBreak",
+    "renewalBreakStatement",
     "continuityEvidence",
 )
 

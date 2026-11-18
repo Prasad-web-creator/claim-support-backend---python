@@ -245,26 +245,40 @@ def _session_progress(parent: MultiPolicyAnalysisSession) -> dict:
     completed = 1 if parent.prescription_stage == "ready" else 0
     total = 1
 
-    running_stages = []
-    for entry in parent.policy_analyses:
+    # Policies with a step genuinely in flight, as (queue number, stage). A policy
+    # still "queued" (waiting for a free slot) is not doing any work yet, so it
+    # must never decide the label while another policy is actively running.
+    active = []
+    queued = 0
+    for index, entry in enumerate(parent.policy_analyses):
         done, entry_total = _entry_progress(entry)
         completed += done
         total += entry_total
-        if entry.status not in TERMINAL_STATUSES and entry.status != "waiting_for_user":
-            running_stages.append(entry.stage or "queued")
+        if entry.status in TERMINAL_STATUSES or entry.status == "waiting_for_user":
+            continue
+        if (entry.stage or "queued") in POLICY_STAGES:
+            active.append((index + 1, entry.stage))
+        else:
+            queued += 1
 
-    if any(e.status == "waiting_for_user" for e in parent.policy_analyses):
+    if any(e.status == "waiting_for_user" for e in parent.policy_analyses) and not active:
         label = STAGE_LABELS["waiting_for_user"]
     elif parent.prescription_stage != "ready":
         label = STAGE_LABELS["prescription_extraction"]
-    elif running_stages:
-        # Report the least-advanced step still in flight: that is the work the
-        # session is genuinely still waiting on.
-        earliest = min(
-            running_stages,
-            key=lambda st: POLICY_STAGES.index(st) if st in POLICY_STAGES else -1,
+    elif len(active) == 1:
+        number, stage = active[0]
+        label = (
+            f"Policy {number}: {stage_label(stage)}"
+            if len(parent.policy_analyses) > 1
+            else stage_label(stage)
         )
+    elif active:
+        # Several policies running side by side: report the least-advanced step
+        # that is actually in flight — the work the session is still waiting on.
+        earliest = min((stage for _, stage in active), key=POLICY_STAGES.index)
         label = stage_label(earliest)
+    elif queued:
+        label = "Starting policy analysis"
     else:
         label = STAGE_LABELS["done"]
 

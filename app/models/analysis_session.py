@@ -21,6 +21,10 @@ class ClarificationQuestion(BaseModel):
     required: bool = True
     options: Optional[List[str]] = Field(default_factory=list)
     reason: str = ""
+    # Date questions only (YYYY-MM-DD): where the calendar opens and the dates it allows.
+    initialDate: Optional[str] = None
+    minDate: Optional[str] = None
+    maxDate: Optional[str] = None
 
 
 class ClarificationAnswer(BaseModel):
