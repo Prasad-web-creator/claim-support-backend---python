@@ -177,3 +177,39 @@ class FileUploadService:
     async def get_file_stream(storage_key: str):
         """Get an async generator for file streaming."""
         return await _provider.download_file(storage_key)
+
+    @staticmethod
+    async def get_file_bytes(storage_key_or_id: str) -> bytes:
+        """Get full file bytes from GridFS by storage key or StoredFile id."""
+        storage_key = storage_key_or_id
+        try:
+            from beanie import PydanticObjectId
+            if PydanticObjectId.is_valid(storage_key_or_id):
+                sf = await StoredFile.get(PydanticObjectId(storage_key_or_id))
+                if sf:
+                    storage_key = sf.storage_key
+        except Exception:
+            pass
+
+        try:
+            stream = await FileUploadService.get_file_stream(storage_key)
+            chunks = []
+            async for chunk in stream:
+                chunks.append(chunk)
+            return b"".join(chunks)
+        except Exception:
+            # Fallback: check if storage_key_or_id is directly a GridFS ObjectId
+            try:
+                from bson import ObjectId
+                bucket = get_gridfs_bucket()
+                stream = await bucket.open_download_stream(ObjectId(storage_key_or_id))
+                chunks = []
+                while True:
+                    chunk = await stream.readchunk()
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                return b"".join(chunks)
+            except Exception:
+                raise
+

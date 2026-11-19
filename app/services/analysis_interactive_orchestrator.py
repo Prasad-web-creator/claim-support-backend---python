@@ -698,6 +698,35 @@ class PrescriptionContext:
         self.json: dict = {}
 
 
+# Keys that hold the user's own continuity answers or derived dates, not facts read
+# from the policy document. A stored JSON with only these (or only empty lists) has
+# never been extracted.
+_NON_EXTRACTED_KEYS = {
+    "policy_id", "continuity", "inceptionDate", "declaredInceptionDate", "isRenewal",
+    "continuousRenewal", "renewedWithoutBreak", "breakStartDate", "coverRestartDate",
+    "restartDate", "waitingPeriodStartDate", "waitingPeriodBasis", "authorityLevel",
+}
+
+
+def has_extracted_policy_details(policy_json: Optional[dict]) -> bool:
+    """
+    True when a stored policy JSON holds facts actually read from the document.
+
+    The policy text can be cached at upload time without the structured details,
+    and validation can leave behind a skeleton of empty lists. Neither may be
+    reused as an extraction, or every analysis of that policy reports
+    "Invalid policy" without the document ever being read.
+    """
+    if not isinstance(policy_json, dict):
+        return False
+    for key, value in policy_json.items():
+        if key in _NON_EXTRACTED_KEYS:
+            continue
+        if value not in (None, "", [], {}):
+            return True
+    return False
+
+
 class PolicyContext:
     """Resolved policy inputs for one policy (document record + any cached extraction)."""
 
@@ -706,7 +735,8 @@ class PolicyContext:
         self.policy_doc = policy_doc
         self.policy_file_id = policy_file_id
         self.cached_text = cached_text
-        self.cached_json = cached_json or None
+        # Only a real extraction counts as cached; otherwise the text is extracted again.
+        self.cached_json = cached_json if has_extracted_policy_details(cached_json) else None
         self.text: str = ""
 
     @property
@@ -954,7 +984,13 @@ async def run_single_policy_analysis(
     policy_doc = policy_ctx.policy_doc
 
     # Cache the policy extraction on the Policy record for instant reuse next time
-    if policy_doc and (not policy_doc.extracted_policy_text or not policy_doc.extracted_policy_json):
+    if policy_doc and (
+        not policy_doc.extracted_policy_text
+        or not has_extracted_policy_details(policy_doc.extracted_policy_json)
+    ):
+        previous = policy_doc.extracted_policy_json if isinstance(policy_doc.extracted_policy_json, dict) else {}
+        if CONTINUITY_KEY not in policy_json and isinstance(previous.get(CONTINUITY_KEY), dict):
+            policy_json[CONTINUITY_KEY] = previous[CONTINUITY_KEY]
         policy_doc.extracted_policy_text = policy_text
         policy_doc.extracted_policy_json = policy_json
         if policy_json.get("policyHolder") and not policy_doc.policy_holder_name:

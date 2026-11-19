@@ -129,6 +129,8 @@ def create_app() -> FastAPI:
     # ─── API Routes ──────────────────────────────────────────────────────────
     
     app.include_router(api_router)
+    from app.api.routes.policy_custom import router as policy_custom_router
+    app.include_router(policy_custom_router)
     
     @app.get("/health", tags=["Health"])
     async def health_check():

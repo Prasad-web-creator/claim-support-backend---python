@@ -121,7 +121,10 @@ async def _login_user(channel: str, target: str) -> User:
             status_code=404,
             detail=f"No account found with this {CONTACT_NAME[channel]}. Please register first.",
         )
-    if not is_verified(user, channel):
+    # Email OTP is the only login method. Entering the OTP sent to the inbox proves the
+    # user owns it, and /login then marks the email verified, so accounts whose email was
+    # never verified (e.g. made with the old SMS sign-up) are not locked out.
+    if channel != EMAIL and not is_verified(user, channel):
         raise HTTPException(
             status_code=403,
             detail=(
@@ -234,6 +237,16 @@ class UpdateProfileRequest(BaseModel):
     email: EmailStr
 
 
+class ChangeEmailSendOtpRequest(BaseModel):
+    newEmail: EmailStr
+
+
+class ChangeEmailVerifyRequest(BaseModel):
+    newEmail: EmailStr
+    otp: str
+    name: Optional[str] = None
+
+
 @router.put("/me", response_model=UserResponse)
 async def update_me(request: UpdateProfileRequest, current_user: dict = Depends(get_current_user)):
     """Update current user details. A changed email must be verified again before email login."""
@@ -246,6 +259,49 @@ async def update_me(request: UpdateProfileRequest, current_user: dict = Depends(
         user.email_verified = False
     user.name = request.name
     user.email = email
+    await user.save()
+    return UserResponse(**_user_payload(user))
+
+
+@router.post("/me/change-email/send-otp")
+@limiter.limit("5/minute")
+async def send_change_email_otp(
+    request: Request, body: ChangeEmailSendOtpRequest, current_user: dict = Depends(get_current_user)
+):
+    """Send an OTP to verify a new email address before updating profile."""
+    user = await _current(current_user)
+    new_email = normalize_email(body.newEmail)
+    if not new_email:
+        raise HTTPException(status_code=422, detail="Please enter a valid email address.")
+    
+    # Check if the email is already in use by another account
+    existing = await _find_by_email(new_email)
+    if existing and existing.id != user.id:
+        raise HTTPException(status_code=400, detail="This email address is already in use by another account.")
+    
+    return _sent_payload(await send_otp(EMAIL, new_email, "change_email"))
+
+
+@router.post("/me/change-email/verify", response_model=UserResponse)
+@limiter.limit("10/minute")
+async def verify_change_email(
+    request: Request, body: ChangeEmailVerifyRequest, current_user: dict = Depends(get_current_user)
+):
+    """Verify OTP and update user's email address and name."""
+    user = await _current(current_user)
+    new_email = normalize_email(body.newEmail)
+    
+    # Final check before applying
+    existing = await _find_by_email(new_email)
+    if existing and existing.id != user.id:
+        raise HTTPException(status_code=400, detail="This email address is already in use by another account.")
+    
+    await verify_otp(EMAIL, new_email, "change_email", body.otp)
+    
+    user.email = new_email
+    user.email_verified = True
+    if body.name and body.name.strip():
+        user.name = body.name.strip()
     await user.save()
     return UserResponse(**_user_payload(user))
 

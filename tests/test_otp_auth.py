@@ -360,7 +360,6 @@ async def test_unverified_contact_cannot_log_in_until_verified(client, email_sta
 @pytest.mark.asyncio
 async def test_register_with_sms_then_verify_email_and_log_in_by_email(client, email_static):
     token = (await _register_via(client, "sms")).json()["token"]
-    assert (await _login_via(client, "email")).status_code == 403
 
     r = await client.post("/auth/me/verify/send-otp", json={"channel": "email"}, headers=_auth(token))
     assert r.status_code == 200
@@ -421,7 +420,9 @@ async def test_legacy_phone_account_can_use_sms_but_must_verify_email(client, em
     r = await _login_via(client, "sms", phone="12345")
     assert r.status_code == 200, r.text
     assert r.json()["user"]["phoneVerified"] is True
-    assert (await _login_via(client, "email", email="old@example.com")).status_code == 403
+    # Email OTP login proves the inbox, so it works and verifies the email.
+    r = await _login_via(client, "email", email="old@example.com")
+    assert r.status_code == 200 and r.json()["user"]["emailVerified"] is True
 
 
 @pytest.mark.asyncio
@@ -429,7 +430,6 @@ async def test_changing_email_requires_verifying_it_again(client, email_static):
     token = (await _register_via(client, "email")).json()["token"]
     r = await client.put("/auth/me", json={"name": "A", "email": "new@b.com"}, headers=_auth(token))
     assert r.status_code == 200 and r.json()["emailVerified"] is False
-    assert (await _login_via(client, "email", email="new@b.com")).status_code == 403
 
     r = await client.post("/auth/me/verify/send-otp", json={"channel": "email"}, headers=_auth(token))
     assert r.status_code == 200
@@ -551,3 +551,22 @@ async def test_test_emails_never_hit_smtp(client, monkeypatch):
     monkeypatch.setattr(settings, "OTP_TEST_EMAILS", "Review@Example.com:4321")
     r = await _register_via(client, "email", otp="4321", email="review@example.com")
     assert r.status_code == 201, r.text
+
+
+
+
+@pytest.mark.asyncio
+async def test_unverified_email_logs_in_with_email_otp_and_becomes_verified(client, email_static):
+    """SMS login was removed, so an unverified email must not lock the user out."""
+    from app.models.user import User
+
+    await _register_via(client, "email")
+    user = await User.find_one(User.email == EMAIL)
+    user.email_verified = False
+    await user.save()
+
+    r = await client.post("/auth/send-otp", json={"channel": "email", "purpose": "login", "email": EMAIL})
+    assert r.status_code == 200, r.text
+    r = await _login_via(client, "email")
+    assert r.status_code == 200, r.text
+    assert r.json()["user"]["emailVerified"] is True

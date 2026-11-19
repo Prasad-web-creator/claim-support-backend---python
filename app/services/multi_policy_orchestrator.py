@@ -644,10 +644,16 @@ async def _analyze_one_policy(
 
             policy_ctx = await _resolve_policy_context(user_id, policy_doc_id=policy_id)
 
-            if policy_ctx.has_cached_text:
+            if policy_ctx.has_cached_text and policy_ctx.cached_json:
                 _log_stage(parent_id, policy_id, "policy_extraction", "cache_hit")
                 policy_text = policy_ctx.cached_text
                 policy_json_raw = policy_ctx.cached_json
+            elif policy_ctx.has_cached_text:
+                # Text was cached (e.g. at upload) but the details were never extracted.
+                _log_stage(parent_id, policy_id, "policy_extraction", "text_cache_hit")
+                policy_text = policy_ctx.cached_text
+                policy_data = await extract_policy_details(policy_text)
+                policy_json_raw = policy_data.get("extractedJson")
             else:
                 _log_stage(parent_id, policy_id, "policy_extraction", "cache_miss")
                 policy_text = await _process_document(

@@ -3,7 +3,7 @@ API Router configuration.
 """
 
 from fastapi import APIRouter
-from app.api.routes import auth, upload, analysis, dashboard, policy_custom, knowledge_base, rag, expert_review, dataset_tuning
+from app.api.routes import auth, upload, analysis, dashboard, policy_custom, policy_benefits, knowledge_base, rag, expert_review, dataset_tuning
 from app.api.routes.crud_factory import create_crud_router
 from app.models.policy import Policy
 from app.models.prescription import Prescription
@@ -26,6 +26,7 @@ api_router.include_router(dataset_tuning.router)
 
 # Include custom policy routes FIRST so they override generic CRUD
 api_router.include_router(policy_custom.router)
+api_router.include_router(policy_benefits.router)
 
 # Include dynamic CRUD routers
 policy_router = create_crud_router(
