@@ -1689,6 +1689,8 @@ async def _complete_with_report(
         reference_comparison=final_report.get("referenceComparison") or {},
         policy_continuity=final_report.get("policyContinuity") or {},
         major_terms=final_report.get("majorTerms") or [],
+        financial_summary=final_report.get("financialSummary") or {},
+        next_steps=final_report.get("nextSteps") or [],
 
         decision_type="Automatic" if next_action == "generate_report" else "Manual Review",
         confidence_score=confidence,

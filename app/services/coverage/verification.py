@@ -341,5 +341,23 @@ def apply_consistency_checks(comparison: List[dict]) -> List[dict]:
                 item["consistencyCheck"] = "copay_applies"
                 item["coverageStatus"] = item["status"] = "Partially Covered"
 
+        if status in _COVERED_STATUSES and _zero_payable_on_a_cost(item):
+            # "Covered" yet nothing payable: the amount is unknown, not zero.
+            item["consistencyCheck"] = "zero_payable_conflict"
+            item["estimatedPayableAmount"] = None
+            item["estimatedPatientPayable"] = None
+            note = "The amount payable depends on the final itemised bill."
+            fin = str(item.get("financialDecision") or "").strip()
+            item["financialDecision"] = f"{fin} {note}".strip() if note not in fin else fin
+
         checked.append(item)
     return checked
+
+
+def _zero_payable_on_a_cost(item: dict) -> bool:
+    try:
+        cost = float(item.get("prescriptionCost") or 0)
+        payable = item.get("estimatedPayableAmount")
+        return cost > 0 and payable is not None and float(payable) == 0
+    except (TypeError, ValueError):
+        return False

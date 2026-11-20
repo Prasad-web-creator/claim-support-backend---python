@@ -56,6 +56,10 @@ class AnalysisReport(Document):
     policy_continuity: Optional[dict] = Field(default_factory=dict, alias="policyContinuity")
     # Policy terms (exact wording) that make the analysis Not Covered, across all items.
     major_terms: Optional[List[dict]] = Field(default_factory=list, alias="majorTerms")
+    # Estimated bill, insurer-payable and patient-payable amounts from the prescription's own cost estimate.
+    financial_summary: Optional[dict] = Field(default_factory=dict, alias="financialSummary")
+    # Short actions for the policyholder (documents to keep, pre-authorisation, ...).
+    next_steps: Optional[List[str]] = Field(default_factory=list, alias="nextSteps")
 
     # ─── Snapshot Caches ──────────────────────────────────────────────────────
     policy_json: Optional[dict] = Field(default_factory=dict, alias="policyJson")

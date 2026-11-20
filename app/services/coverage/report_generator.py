@@ -513,4 +513,42 @@ def generate_report(
         "referenceComparison": reference_comparison,
         "policyContinuity": policy_continuity,
         "majorTerms": [] if is_doc_invalid else build_major_terms(comparison, all_blockers),
+        # A blocked claim (policy inactive, not an insured member) pays nothing, so no estimate is shown.
+        "financialSummary": {} if (is_doc_invalid or is_blocked) else _financial_summary(coverage_analysis.get("financialSummary")),
+        "nextSteps": [] if is_doc_invalid else _next_steps(coverage_analysis.get("nextSteps")),
     }
+
+
+def _amount(value):
+    """A rupee amount the AI returned, or None. Never a negative or non-numeric value."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        digits = value.replace("₹", "").replace(",", "").replace("Rs.", "").replace("Rs", "").strip()
+        try:
+            n = float(digits)
+        except ValueError:
+            return None
+        return (int(n) if n.is_integer() else n) if n >= 0 else None
+    return None
+
+
+def _financial_summary(raw) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    summary = {
+        "estimatedTotalCost": _amount(raw.get("estimatedTotalCost")),
+        "estimatedPayableAmount": _amount(raw.get("estimatedPayableAmount")),
+        "estimatedPatientPayable": _amount(raw.get("estimatedPatientPayable")),
+        "roomRentCheck": str(raw.get("roomRentCheck") or "").strip(),
+        "notes": str(raw.get("notes") or "").strip(),
+    }
+    return summary if any(v not in (None, "") for v in summary.values()) else {}
+
+
+def _next_steps(raw) -> list:
+    if not isinstance(raw, list):
+        return []
+    return [str(s).strip() for s in raw if str(s or "").strip()][:6]

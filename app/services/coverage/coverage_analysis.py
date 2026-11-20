@@ -182,9 +182,15 @@ NEAR-MATCH CLARIFICATIONS REQUIRED
 CURRENT CLAIM
 • Evaluation Date: {today_str}
 • Prescription Source: {source_label}{manual_note}
-• Diagnosis: {prescription_json.get('diagnosis', 'Not specified')}
-• Symptoms: {', '.join(str(s) for s in (prescription_json.get('symptoms') or [])) or 'None reported'}
-• Procedures: {', '.join(str(p) for p in (prescription_json.get('procedures') or [])) or 'None reported'}
+{_claim_facts_block(prescription_json)}
+
+==================================================
+
+PRESCRIPTION (FULL TEXT OF THE DOCTOR'S DOCUMENT — THE AUTHORITY FOR WHAT WAS PRESCRIBED)
+(The extracted fields above are a summary. Read this text for every test, scan, procedure, consultation,
+ hospital service, room category, cost estimate and history line it contains.)
+
+{_prescription_text_block(prescription_text, is_manual_prescription)}
 
 ==================================================
 
@@ -254,6 +260,35 @@ CRITICAL ADJUDICATION INSTRUCTIONS:
 7. If the policy text is insufficient to decide an item, set "next_action": "manual_review".
 8. In reasons, never call anything "statutory", "permanently excluded by law" or "non-payable" in general terms:
    always state what THIS policy says, quoting its clause.
+9. Report EVERY non-medicine item the PRESCRIPTION documents as its own "comparison" entry: each lab test, scan,
+   procedure, anaesthesia, surgeon / anaesthetist fees, consultation, room / nursing, operation theatre, equipment
+   and consumables (merge true duplicates only). Do not fold tests or hospital services into the diagnosis card.
+   When the prescription has a cost estimate table, report ONE item per line of that table, in its order and with
+   its wording, so the items' prescriptionCost add up to the estimate total. A billed line such as "Medicines & IV
+   fluids" during the admission is a hospital-service line and IS reported (individual medicines are not).
+   ALWAYS also report the documented diagnosis as the FIRST item (itemType "Diagnosis", prescriptionCost null): its
+   reason carries the waiting-period day count, the pre-existing disease check and every cause / purpose / person
+   exclusion you checked.
+10. Costs: when the prescription gives a cost estimate, put each line's amount in that item's "prescriptionCost"
+   and fill "estimatedPayableAmount" / "estimatedPatientPayable" from THIS policy's limits. When it states a room
+   category or charge per day, compare it with this policy's room-rent limit in that item's "financialDecision"
+   (within limit, or the proportionate deduction the policy states). Never invent an amount.
+11. Return, inside "analysis", a "financialSummary" object:
+   {{"estimatedTotalCost": number|null, "estimatedPayableAmount": number|null, "estimatedPatientPayable": number|null,
+     "roomRentCheck": "", "notes": ""}}
+   and a "nextSteps" array of short actions for the policyholder (documents to keep or obtain, pre-authorisation,
+   items whose admissibility depends on the final itemised bill). Amounts come ONLY from the prescription.
+12. History facts in the prescription (alcohol, smoking, previous illness) only matter when THIS policy has a clause
+   that depends on them AND the prescription links them to this illness. When you checked such a clause and it does
+   not apply, say so in one line in the reason (e.g. "Occasional alcohol use is recorded, but nothing links it to
+   this illness, so the alcohol exclusion (D.12) does not apply").
+13. "Partially Covered" means a co-payment, deductible, room-rent deduction or sub-limit of THIS policy reduces the
+   payment by a stated amount. When an item is admissible but some of its contents MAY be non-payable (for example
+   items in a non-payable list / annexure) and only the final itemised bill can show which, keep it "Covered", keep
+   its full estimate as payable, and say "subject to the itemised bill" in its financialDecision. Never give a
+   Covered or Partially Covered item an estimatedPayableAmount of 0.
+14. "summary": two or three plain sentences with the final position only. Never think aloud, correct yourself or
+   mention a deduction that does not apply. Item names carry no amounts (put amounts in prescriptionCost).
 
 =================================================={near_match_block}
 
@@ -271,7 +306,7 @@ PREVIOUS CLARIFICATION HISTORY
         result = await extract_json_with_retry(
             system_prompt=COVERAGE_ANALYSIS_SYSTEM_PROMPT,
             user_content=user_prompt,
-            max_tokens=8192,
+            max_tokens=16384,
             operation_name="Coverage Analysis",
         )
         
@@ -286,7 +321,7 @@ PREVIOUS CLARIFICATION HISTORY
                     "\n\nSELF-ENTERED CHECK: questions are not allowed. Return next_action \"generate_report\" "
                     "with the full analysis now, evaluated for treatment today."
                 ),
-                max_tokens=8192,
+                max_tokens=16384,
                 operation_name="Coverage Analysis",
             )
             extracted = result["extractedJson"]
@@ -483,6 +518,64 @@ PREVIOUS CLARIFICATION HISTORY
                 }
             }
         }
+
+
+MAX_PRESCRIPTION_CHARS = 20000
+
+
+def _item_names(values) -> str:
+    """Names (with any stated cost) of extracted prescription items, never raw dicts."""
+    out = []
+    for v in values or []:
+        if isinstance(v, dict):
+            name = str(v.get("name") or v.get("item") or v.get("test") or "").strip()
+            if not name:
+                continue
+            cost = v.get("cost")
+            out.append(f"{name} (₹{cost:,})" if isinstance(cost, (int, float)) and cost else name)
+        elif v is not None and str(v).strip():
+            out.append(str(v).strip())
+    return ", ".join(out)
+
+
+def _claim_facts_block(rx: dict) -> str:
+    """Every extracted prescription fact that can change a coverage decision."""
+    rx = rx or {}
+    hosp = rx.get("hospitalizationRequired")
+    lines = [
+        f"• Patient: {rx.get('patientName') or 'not stated'}; age {rx.get('patientAge') or rx.get('age') or 'not stated'}; "
+        f"gender {rx.get('patientGender') or rx.get('gender') or 'not stated'}",
+        f"• Treatment / admission date: {rx.get('admissionDate') or rx.get('admission') or rx.get('visitDate') or 'not stated'}",
+        f"• Diagnosis: {rx.get('diagnosis') or 'Not specified'}",
+        f"• Symptoms: {', '.join(str(s) for s in (rx.get('symptoms') or [])) or 'None reported'}",
+        f"• Procedures: {_item_names(rx.get('procedures')) or 'None reported'}",
+        f"• Tests / investigations: {_item_names(rx.get('medicalTests')) or 'None reported'}",
+        "• Hospitalisation: "
+        + ("required (in-patient)" if hosp is True else "not required (out-patient)" if hosp is False else "not stated"),
+    ]
+    if rx.get("discharge"):
+        lines.append(f"• Discharge: {rx.get('discharge')}")
+    cost = rx.get("estimatedCost")
+    if cost:
+        lines.append(f"• Estimated cost (from the prescription): ₹{cost:,}" if isinstance(cost, (int, float))
+                     else f"• Estimated cost (from the prescription): {cost}")
+    for key, label in (("medicalNotes", "History / notes"), ("doctorNotes", "Doctor's notes")):
+        if rx.get(key):
+            lines.append(f"• {label}: {rx.get(key)}")
+    return "\n".join(lines)
+
+
+def _prescription_text_block(prescription_text: str, is_manual: bool) -> str:
+    text = (prescription_text or "").strip()
+    if not text:
+        return "Not available; use the extracted fields above."
+    if is_manual:
+        return f"(Self-entered text) {text}"
+    if len(text) > MAX_PRESCRIPTION_CHARS:
+        logger.warning(f"[AI Analysis] Prescription text is {len(text)} characters; only the first "
+                       f"{MAX_PRESCRIPTION_CHARS} are sent to the AI.")
+        text = text[:MAX_PRESCRIPTION_CHARS]
+    return text
 
 
 def _app_checks_for_prompt(business_rule_results: dict) -> dict:

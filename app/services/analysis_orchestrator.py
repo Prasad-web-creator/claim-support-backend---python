@@ -560,6 +560,8 @@ async def run_analysis_pipeline(
         report.comparison = final_report.get("comparison")
         report.reference_comparison = final_report.get("referenceComparison") or {}
         report.major_terms = final_report.get("majorTerms") or []
+        report.financial_summary = final_report.get("financialSummary") or {}
+        report.next_steps = final_report.get("nextSteps") or []
         report.processing_time_ms = processing_time
         
         await report.save()
