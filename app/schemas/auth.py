@@ -24,7 +24,7 @@ class SendOtpRequest(BaseModel):
 class RegisterRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     email: EmailStr
-    phone: str = Field(..., pattern=PHONE_PATTERN)
+    phone: Optional[str] = Field(default=None, pattern=PHONE_PATTERN)  # optional; required for channel "sms"
     otp: str
     channel: Channel = "sms"  # which contact the OTP was sent to
 

@@ -164,7 +164,7 @@ async def register(request: Request, body: RegisterRequest):
     email = normalize_email(body.email)
     await _check_not_registered(body.phone, email)  # before consuming the OTP
 
-    target = body.phone if body.channel == SMS else email
+    target = _target(body.channel, body.phone, email)  # SMS registration still needs a phone
     await verify_otp(body.channel, target, "register", body.otp)
 
     user = User(

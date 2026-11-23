@@ -15,11 +15,16 @@ class Settings(BaseSettings):
     # ─── Application ──────────────────────────────────────────────────────────
     PORT: int = Field(default=8000, description="Server port")
     ENVIRONMENT: str = Field(default="development", description="development | production")
+    SUPPORT_EMAIL: str = Field(
+        default="", description="Help & Support contact shown in the app (served by GET /api/app-config)"
+    )
 
     # ─── Security ─────────────────────────────────────────────────────────────
     JWT_SECRET: str = Field(..., description="Secret key for JWT signing")
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=60, description="Access token TTL")
-    JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7, description="Refresh token TTL")
+    # Sliding: every refresh issues a new refresh token with a fresh TTL, so a user
+    # stays signed in until they log out unless the app is unused for this long.
+    JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=365, ge=1, description="Refresh token TTL (days)")
     ALLOWED_ORIGINS: str = Field(default="", description="Comma-separated CORS origins")
 
     # ─── OTP / SMS ────────────────────────────────────────────────────────────

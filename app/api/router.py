@@ -3,7 +3,7 @@ API Router configuration.
 """
 
 from fastapi import APIRouter
-from app.api.routes import auth, upload, analysis, dashboard, policy_custom, policy_benefits, knowledge_base, rag, expert_review, dataset_tuning
+from app.api.routes import app_config, auth, upload, analysis, dashboard, policy_custom, policy_benefits, knowledge_base, rag, expert_review, dataset_tuning
 from app.api.routes.crud_factory import create_crud_router
 from app.models.policy import Policy
 from app.models.prescription import Prescription
@@ -15,6 +15,7 @@ from pydantic import BaseModel
 api_router = APIRouter(prefix="/api")
 
 # Include static routers
+api_router.include_router(app_config.router)
 api_router.include_router(auth.router)
 api_router.include_router(upload.router)
 api_router.include_router(analysis.router)

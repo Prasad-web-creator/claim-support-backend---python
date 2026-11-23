@@ -570,3 +570,20 @@ async def test_unverified_email_logs_in_with_email_otp_and_becomes_verified(clie
     r = await _login_via(client, "email")
     assert r.status_code == 200, r.text
     assert r.json()["user"]["emailVerified"] is True
+
+
+async def test_email_registration_without_phone_allows_many_users(client, email_static):
+    """The app no longer asks for a mobile number; each user registers with email only."""
+    for email in ("one@b.com", "two@b.com"):
+        r = await client.post("/auth/send-otp", json={"channel": "email", "purpose": "register", "email": email})
+        assert r.status_code == 200, r.text
+        r = await client.post(
+            "/auth/register", json={"name": "A", "email": email, "otp": "1234", "channel": "email"}
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["user"]["phone"] is None
+
+
+async def test_sms_registration_still_requires_phone(client, email_static):
+    r = await client.post("/auth/register", json={"name": "A", "email": EMAIL, "otp": "1234", "channel": "sms"})
+    assert r.status_code == 422
