@@ -87,14 +87,6 @@ def enforce_business_rules(policy: dict, prescription: dict, policy_text: str | 
     if not members and policyholder:
         members = [{"name": policyholder}]
 
-    # DEBUG: log actual members seen (remove after diagnosis is confirmed)
-    from app.core.logging import logger as _br_logger
-    _br_logger.debug(
-        f"[BizRules DEBUG] p_name={repr(p_name)} | "
-        f"policyholder={repr(policyholder)} | "
-        f"members={[m.get('name','?') for m in members[:5]]}"
-    )
-
     # 1. Patient Name Match Check
     matched_member = None
     match_is_exact = False
@@ -393,10 +385,7 @@ def enforce_business_rules(policy: dict, prescription: dict, policy_text: str | 
     except Exception as e:
         evaluate_rule("policyActive", True, f"Date parse note: {e}", blocker=False)
 
-    # 9. Waiting periods: which waiting period applies (initial, pre-existing, specified
-    #    illnesses, and any exceptions such as accidents) is decided by the AI coverage
-    #    analysis from the policy's own wording. Only the cover duration is computed here,
-    #    so the AI never has to do date arithmetic.
+    # Calculate duration for the later contractual waiting-period evaluation.
     from app.services.coverage.cover_duration import cover_duration
     results["coverDuration"] = cover_duration(policy, prescription)
 
@@ -404,8 +393,7 @@ def enforce_business_rules(policy: dict, prescription: dict, policy_text: str | 
     # STAGE 3 — DIAGNOSIS, CARE SETTING & EXCLUSIONS
     # ===========================================================
 
-    # 10-11. Exclusions, care setting (in-patient / day care / out-patient) and their
-    #        exceptions are decided by the AI coverage analysis from the policy wording.
+    # 10-11. The adjudicator applies reviewed exclusions and care-setting conditions.
 
     # ===========================================================
     # STAGE 4 — DETERMINISTIC COVERAGE RULE ENGINE & AGGREGATION
@@ -428,7 +416,7 @@ def enforce_business_rules(policy: dict, prescription: dict, policy_text: str | 
                 results["warnings"].append(warn)
     except Exception as e:
         from app.core.logging import logger as _err_logger
-        _err_logger.error(f"[enforce_business_rules] Deterministic engine error: {e}")
+        _err_logger.error(f"[enforce_business_rules] Deterministic engine error: {type(e).__name__}")
 
     # Synchronize overallEligible and deterministicResult with ALL accumulated blockers
     if results["blockers"]:
