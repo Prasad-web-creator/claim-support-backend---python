@@ -1,32 +1,68 @@
-"""
-File Upload Service — migrated from FileUploadService.js.
-Coordinates the full upload workflow (hashing, UUID generation, storage, and DB metadata).
-"""
+"""Manage owned upload records and shared GridFS content."""
 
+import asyncio
 import hashlib
-import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from uuid import uuid4
 
 from beanie import PydanticObjectId as ObjectId
-from app.core.database import get_gridfs_bucket
-from app.core.logging import logger, log_section
+from starlette.concurrency import run_in_threadpool
+
+from app.core.config import get_settings
+from app.core.exceptions import NotFoundError
+from app.core.logging import logger
 from app.models.stored_file import StoredFile
+from app.services.storage.file_lease import hold_file_lease
 from app.services.storage.gridfs_provider import GridFSProvider
+from app.services.storage.pdf_optimization import optimize_pdf_for_storage
 
-# Singleton provider instance
 _provider = GridFSProvider()
+_pdf_workers = asyncio.Semaphore(1)
+GRIDFS_STORAGE_SCHEMA = 2
+_ANALYSIS_COLLECTIONS = ("analysissessions", "analysisreports", "multipolicyanalysissessions")
 
 
-def _build_storage_key(document_type: str, user_id: str, document_id: str | None, stored_filename: str) -> str:
-    """Builds the storage key following the bucket structure convention."""
-    doc_id = document_id or "unlinked"
-    return f"{document_type}s/{user_id}/{doc_id}/original/{stored_filename}"
+def _receipt(record: StoredFile) -> dict[str, str]:
+    return {
+        "storedFileId": str(record.id),
+        "storageKey": record.storage_key,
+        "storedFilename": record.stored_filename,
+    }
+
+
+def file_lease_key(storage_key: str, digest: str | None) -> str:
+    return f"sha256:{digest}" if digest else f"file:{storage_key}"
+
+
+async def has_physical_reference(storage_keys: list[str | ObjectId]) -> bool:
+    collection = StoredFile.get_motor_collection()
+    keys = list(set(storage_keys))
+    query = {"storageKey": {"$in": keys}}
+    if await collection.find_one(query, {"_id": 1}):
+        return True
+
+    # Old imports may point at a GridFS ID directly instead of through StoredFile.
+    db = collection.database
+    query = {"$or": [{"gridFsFileId": {"$in": keys}}, {"grid_fs_file_id": {"$in": keys}}]}
+    for name in ("policies", "prescriptions"):
+        if await db[name].find_one(query, {"_id": 1}):
+            return True
+    for name in _ANALYSIS_COLLECTIONS:
+        if await db[name].find_one(_analysis_reference_filter({"$in": keys}), {"_id": 1}):
+            return True
+    return False
+
+
+def _analysis_reference_filter(file_reference) -> dict:
+    return {"$or": [
+        {"policyId": file_reference},
+        {"prescriptionId": file_reference},
+        {"policyAnalyses.policyId": file_reference},
+    ]}
 
 
 class FileUploadService:
-    """Upload Orchestrator."""
-
     @staticmethod
     async def upload_file(
         buffer: bytes,
@@ -34,182 +70,140 @@ class FileUploadService:
         mime_type: str,
         document_type: str,
         user_id: str,
-        document_id: str | None = None
-    ) -> dict[str, Any]:
-        """
-        Coordinates hashing, deduplication, storage upload, and DB metadata persistence.
-        """
-        log_section("File Upload")
-        # 1. Generate SHA256
-        sha256_hash = hashlib.sha256(buffer).hexdigest()
-        file_size = len(buffer)
-        
-        # 2. Check for duplicate within the same user's scope
-        existing_file = await StoredFile.find_one(
-            StoredFile.user_id == user_id,
-            StoredFile.sha256_hash == sha256_hash,
-            StoredFile.is_deleted == False
-        )
-        
-        if existing_file:
-            # Verify it actually exists in GridFS
-            try:
-                # This will raise FileNotFoundError if missing
-                bucket = get_gridfs_bucket()
-                cursor = bucket.find({"filename": existing_file.storage_key}).limit(1)
-                files = await cursor.to_list(length=1)
-                if files:
-                    logger.info(f"[File Upload] Duplicate document detected for user {user_id}. Returning existing file.")
-                    return {
-                        "storedFileId": str(existing_file.id),
-                        "storageKey": existing_file.storage_key,
-                        "storedFilename": existing_file.stored_filename
-                    }
+        document_id: str | None = None,
+    ) -> dict[str, str]:
+        settings = get_settings()
+        digest = hashlib.sha256(buffer).hexdigest()
+        filename = f"{uuid4().hex}{Path(original_filename).suffix.lower()}"
+        storage_key = f"documents/{uuid4().hex}"
+        lock_digest = digest if settings.FILE_DEDUPLICATION_ENABLED else None
+
+        async with hold_file_lease(file_lease_key(storage_key, lock_digest)) as renew:
+            stored_size = len(buffer)
+            existing = None
+            if settings.FILE_DEDUPLICATION_ENABLED:
+                candidates = StoredFile.find(
+                    {"sha256Hash": digest, "isDeleted": {"$ne": True}},
+                ).sort("createdAt")
+                async for candidate in candidates:
+                    if await _provider.find_file(candidate.storage_key):
+                        existing = candidate
+                        break
+
+            if existing:
+                storage_key = existing.storage_key
+                stored_size = existing.stored_size or existing.file_size
+            else:
+                if mime_type == "application/pdf":
+                    async with _pdf_workers:
+                        stored = await run_in_threadpool(optimize_pdf_for_storage, buffer, settings)
                 else:
-                    logger.warning(f"[File Upload] Corrupted file entry {existing_file.id} found (missing in GridFS). Deleting metadata.")
-                    await existing_file.delete()
-            except Exception as e:
-                logger.warning(f"[File Upload] Error checking storage for duplicate: {e}")
-            
-        # 3. Generate UUID filename and storage key
-        ext = Path(original_filename).suffix.lower() or ".pdf"
-        unique_id = uuid.uuid4().hex[:8]
-        stored_filename = f"{document_type}_{unique_id}{ext}"
-        storage_key = _build_storage_key(document_type, user_id, document_id, stored_filename)
-        
-        # 4. Upload to GridFS
-        await _provider.upload_file(
-            buffer=buffer,
-            storage_key=storage_key,
-            metadata={
-                "contentType": mime_type,
-                "sha256": sha256_hash,
-                "originalName": original_filename
-            }
-        )
-        
-        # 5. Save metadata to MongoDB
-        stored_file = StoredFile(
-            user_id=user_id,
-            document_id=document_id,
-            document_type=document_type,
-            original_filename=original_filename,
-            stored_filename=stored_filename,
-            storage_key=storage_key,
-            storage_provider="local",
-            mime_type=mime_type,
-            file_size=file_size,
-            sha256_hash=sha256_hash,
-            processing_status="pending",
-            analysis_status="pending"
-        )
-        
-        await stored_file.insert()
-        logger.info(f"[File Upload] Saved {stored_filename} ({file_size / 1024.0:.1f} KB, {mime_type})")
-        
-        return {
-            "storedFileId": str(stored_file.id),
-            "storageKey": storage_key,
-            "storedFilename": stored_filename
-        }
+                    stored = buffer
+                stored_size = len(stored)
+                await renew()
+                await _provider.upload_file(
+                    buffer=stored,
+                    storage_key=storage_key,
+                    metadata={"contentType": mime_type, "sha256": digest, "storageSchema": GRIDFS_STORAGE_SCHEMA},
+                )
+
+            record = StoredFile(
+                user_id=user_id,
+                document_id=document_id,
+                document_type=document_type,
+                original_filename=original_filename,
+                stored_filename=filename,
+                storage_key=storage_key,
+                storage_provider="local",
+                mime_type=mime_type,
+                file_size=len(buffer),
+                stored_size=stored_size,
+                sha256_hash=digest,
+            )
+            await renew()
+            # Keep failed publication bytes for the orphan job. A network error
+            # can leave the insert committed even though the caller saw failure.
+            await record.insert()
+            return _receipt(record)
+
+    @staticmethod
+    async def get_owned_file(stored_file_id: str, user_id: str) -> StoredFile:
+        if not ObjectId.is_valid(stored_file_id):
+            raise NotFoundError("File not found")
+        record = await StoredFile.get(ObjectId(stored_file_id))
+        if not record or record.user_id != user_id or record.is_deleted:
+            raise NotFoundError("File not found")
+        return record
+
+    @staticmethod
+    @asynccontextmanager
+    async def hold_owned_reference(stored_file_id: str, user_id: str):
+        record = await FileUploadService.get_owned_file(stored_file_id, user_id)
+        async with hold_file_lease(file_lease_key(record.storage_key, record.sha256_hash)) as renew:
+            record = await FileUploadService.get_owned_file(stored_file_id, user_id)
+            await renew()
+            yield record
 
     @staticmethod
     async def find_file_user(stored_file_id: str, user_id: str):
-        """
-        A policy or prescription that still points at this stored file, if any.
-
-        Uploads are de-duplicated by content hash, so one stored file can back
-        several records (the same PDF uploaded twice, or the same file used as
-        both a policy and a prescription).
-        """
+        """Find an owned policy or prescription that still links to the handle."""
         from app.models.policy import Policy
         from app.models.prescription import Prescription
 
-        return await Policy.find_one(
-            Policy.user_id == user_id,
-            Policy.grid_fs_file_id == stored_file_id,
-        ) or await Prescription.find_one(
-            Prescription.user_id == user_id,
-            Prescription.grid_fs_file_id == stored_file_id,
-        )
+        query = {
+            "userId": user_id,
+            "$or": [{"gridFsFileId": stored_file_id}, {"grid_fs_file_id": stored_file_id}],
+        }
+        return await Policy.find_one(query) or await Prescription.find_one(query)
 
     @staticmethod
     async def delete_file(stored_file_id: str, deleted_by_user_id: str) -> None:
-        """
-        Delete a file from storage and metadata — unless another policy or
-        prescription still uses it. Deleting a shared file would leave that
-        record pointing at nothing, and its next analysis fails with
-        "File metadata not found".
-        """
-        record = await StoredFile.get(ObjectId(stored_file_id))
-        if not record:
-            raise ValueError(f"StoredFile not found: {stored_file_id}")
-        if record.user_id != deleted_by_user_id:
-            raise ValueError(f"StoredFile not found: {stored_file_id}")
+        async with FileUploadService.hold_owned_reference(stored_file_id, deleted_by_user_id) as record:
+            linked = await FileUploadService.find_file_user(stored_file_id, deleted_by_user_id)
+            if linked is not None:
+                if record.document_id != str(linked.id):
+                    await StoredFile.get_motor_collection().update_one(
+                        {"_id": record.id}, {"$set": {"documentId": str(linked.id)}},
+                    )
+                return
 
-        user = await FileUploadService.find_file_user(stored_file_id, deleted_by_user_id)
-        if user is not None:
-            logger.info(
-                f"[File Delete] Kept shared file {stored_file_id}: still used by record {user.id}"
-            )
-            if record.document_id != str(user.id):
-                record.document_id = str(user.id)
-                await record.save()
-            return
+            # Some historical sessions/reports may store an upload ID directly.
+            db = StoredFile.get_motor_collection().database
+            if ObjectId.is_valid(record.document_id):
+                associated = {"userId": deleted_by_user_id, "_id": ObjectId(record.document_id)}
+                for name in ("policies", "prescriptions"):
+                    if await db[name].find_one(associated, {"_id": 1}):
+                        return
+            query = {
+                "userId": deleted_by_user_id,
+                **_analysis_reference_filter(stored_file_id),
+            }
+            for name in _ANALYSIS_COLLECTIONS:
+                if await db[name].find_one(query, {"_id": 1}):
+                    return
 
-        try:
-            await _provider.delete_file(record.storage_key)
-        except Exception as e:
-            logger.warning(f"Failed to delete file from GridFS: {e}")
-        
-        await record.delete()
+            physical = await _provider.find_file(record.storage_key)
+            keys = [record.storage_key]
+            if physical:
+                keys.extend((physical["_id"], str(physical["_id"]), physical["filename"]))
+            await record.delete()
+            if not await has_physical_reference(keys):
+                try:
+                    await _provider.delete_file(str(physical["_id"]) if physical else record.storage_key)
+                except Exception as exc:
+                    logger.warning("GridFS deletion will be retried by orphan cleanup ({})", type(exc).__name__)
 
     @staticmethod
-    async def generate_signed_url(stored_file_id: str) -> str:
-        """Generate a temporary signed URL (or stream route) for download."""
-        record = await StoredFile.get(ObjectId(stored_file_id))
-        if not record or record.is_deleted:
-            raise ValueError(f"StoredFile not found or deleted: {stored_file_id}")
-            
-        return await _provider.generate_signed_url(record.storage_key)
+    async def generate_signed_url(stored_file_id: str, user_id: str) -> str:
+        record = await FileUploadService.get_owned_file(stored_file_id, user_id)
+        return f"/api/upload/{record.id}"
 
     @staticmethod
     async def get_file_stream(storage_key: str):
-        """Get an async generator for file streaming."""
         return await _provider.download_file(storage_key)
 
     @staticmethod
-    async def get_file_bytes(storage_key_or_id: str) -> bytes:
-        """Get full file bytes from GridFS by storage key or StoredFile id."""
-        storage_key = storage_key_or_id
-        try:
-            from beanie import PydanticObjectId
-            if PydanticObjectId.is_valid(storage_key_or_id):
-                sf = await StoredFile.get(PydanticObjectId(storage_key_or_id))
-                if sf:
-                    storage_key = sf.storage_key
-        except Exception:
-            pass
-
-        try:
-            stream = await FileUploadService.get_file_stream(storage_key)
-            chunks = []
-            async for chunk in stream:
-                chunks.append(chunk)
-            return b"".join(chunks)
-        except Exception:
-            # Fallback: check if storage_key_or_id is directly a GridFS ObjectId
-            try:
-                from bson import ObjectId
-                bucket = get_gridfs_bucket()
-                stream = await bucket.open_download_stream(ObjectId(storage_key_or_id))
-                chunks = []
-                while True:
-                    chunk = await stream.readchunk()
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                return b"".join(chunks)
-            except Exception:
-                raise
-
+    async def get_file_bytes(stored_file_id: str, user_id: str) -> bytes:
+        record = await FileUploadService.get_owned_file(stored_file_id, user_id)
+        stream = await FileUploadService.get_file_stream(record.storage_key)
+        return b"".join([chunk async for chunk in stream])

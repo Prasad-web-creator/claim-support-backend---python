@@ -1,3 +1,0 @@
-"""
-Policy RAG Services Package.
-"""

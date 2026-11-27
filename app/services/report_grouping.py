@@ -191,6 +191,7 @@ def _multi_group(session: MultiPolicyAnalysisSession, reports_by_id: dict) -> di
     return {
         "groupId": str(session.id),
         "groupType": "multi",
+        "isDurableJob": session.durable_job,
         "sessionId": str(session.id),
         "prescriptionId": session.prescription_id or "",
         "prescription": _prescription_summary(session.prescription_json),
@@ -204,6 +205,31 @@ def _multi_group(session: MultiPolicyAnalysisSession, reports_by_id: dict) -> di
         "updatedAt": _iso(session.updated_at) or _iso(created),
         "policyReports": rows,
     }
+
+
+async def _reports_for_sessions(user_id: str, sessions) -> dict:
+    ids = {
+        ObjectId(entry.report_id)
+        for session in sessions
+        for entry in session.policy_analyses
+        if entry.report_id and ObjectId.is_valid(entry.report_id)
+    }
+    if not ids:
+        return {}
+    linked = await AnalysisReport.find({"_id": {"$in": list(ids)}, "userId": user_id}).to_list()
+    return {str(report.id): report for report in linked}
+
+
+async def get_report_group(user_id: str, group_id: str) -> Optional[dict]:
+    """Return one owned group using the same representation as History."""
+    if not ObjectId.is_valid(group_id):
+        return None
+    owned = {"_id": ObjectId(group_id), "userId": user_id}
+    session = await MultiPolicyAnalysisSession.find_one(owned)
+    if session:
+        return _multi_group(session, await _reports_for_sessions(user_id, [session]))
+    report = await AnalysisReport.find_one(owned, _UNGROUPED_REPORT_CLAUSE)
+    return _single_group(report) if report else None
 
 
 async def list_report_groups(user_id: str, page: int = 1, limit: int = 10) -> dict:
@@ -235,21 +261,7 @@ async def list_report_groups(user_id: str, page: int = 1, limit: int = 10) -> di
 
     # Pull the reports referenced by the multi-policy sessions in this window,
     # so each policy row can show its report number and timings.
-    referenced_ids = []
-    for session in sessions:
-        for entry in session.policy_analyses:
-            if entry.report_id:
-                try:
-                    referenced_ids.append(ObjectId(entry.report_id))
-                except Exception:
-                    continue
-
-    reports_by_id: dict = {}
-    if referenced_ids:
-        linked = await AnalysisReport.find(
-            {"_id": {"$in": referenced_ids}, "userId": user_id}
-        ).to_list()
-        reports_by_id = {str(r.id): r for r in linked}
+    reports_by_id = await _reports_for_sessions(user_id, sessions)
 
     groups = [_multi_group(s, reports_by_id) for s in sessions]
     groups += [_single_group(r) for r in single_reports]

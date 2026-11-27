@@ -3,10 +3,11 @@ JWT token management and security utilities.
 Replaces jsonwebtoken from Node.js.
 """
 
+import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from jose import JWTError, jwt
+import jwt
 
 from app.core.config import get_settings
 
@@ -29,15 +30,20 @@ def verify_access_token(token: str) -> dict:
     """
     Verify and decode a JWT access token.
     Returns the decoded payload.
-    Raises JWTError on invalid/expired tokens.
+    Raises InvalidTokenError on invalid or expired tokens.
     """
     settings = get_settings()
-    return jwt.decode(token, settings.JWT_SECRET, algorithms=[ALGORITHM])
+    return jwt.decode(token, settings.JWT_SECRET, algorithms=[ALGORITHM], options={"require": ["exp"]})
 
 
 def generate_refresh_token() -> str:
     """Generate a cryptographically secure refresh token."""
     return secrets.token_hex(40)
+
+
+def hash_refresh_token(token: str) -> str:
+    """Hash a high-entropy bearer token for storage and lookup."""
+    return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def get_refresh_token_expiry() -> datetime:

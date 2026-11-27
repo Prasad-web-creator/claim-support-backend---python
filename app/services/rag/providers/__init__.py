@@ -1,3 +1,0 @@
-"""
-RAG Search Providers Package.
-"""

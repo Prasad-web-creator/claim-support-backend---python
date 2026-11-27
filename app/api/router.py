@@ -3,14 +3,19 @@ API Router configuration.
 """
 
 from fastapi import APIRouter
-from app.api.routes import app_config, auth, upload, analysis, dashboard, policy_custom, policy_benefits, knowledge_base, rag, expert_review, dataset_tuning
+from pydantic import BaseModel
+
+from app.api.routes import analysis, app_config, auth, dashboard, policy_custom, upload
 from app.api.routes.crud_factory import create_crud_router
+from app.models.analysis_report import AnalysisReport
 from app.models.policy import Policy
 from app.models.prescription import Prescription
-from app.models.activity_log import ActivityLog
-from app.models.analysis_report import AnalysisReport
-from app.schemas.crud import PolicyCreate, PolicyUpdate, PrescriptionCreate, PrescriptionUpdate
-from pydantic import BaseModel
+from app.schemas.crud import (
+    PolicyCreate,
+    PolicyUpdate,
+    PrescriptionCreate,
+    PrescriptionUpdate,
+)
 
 api_router = APIRouter(prefix="/api")
 
@@ -20,14 +25,9 @@ api_router.include_router(auth.router)
 api_router.include_router(upload.router)
 api_router.include_router(analysis.router)
 api_router.include_router(dashboard.router)
-api_router.include_router(knowledge_base.router)
-api_router.include_router(rag.router)
-api_router.include_router(expert_review.router)
-api_router.include_router(dataset_tuning.router)
 
 # Include custom policy routes FIRST so they override generic CRUD
 api_router.include_router(policy_custom.router)
-api_router.include_router(policy_benefits.router)
 
 # Include dynamic CRUD routers
 policy_router = create_crud_router(
@@ -52,16 +52,6 @@ api_router.include_router(prescription_router)
 # Basic schemas for read-only / minimal models
 class EmptyCreate(BaseModel): pass
 class EmptyUpdate(BaseModel): pass
-
-activity_log_router = create_crud_router(
-    entity_name="ActivityLog",
-    model_class=ActivityLog,
-    schema_create=EmptyCreate,
-    schema_update=EmptyUpdate,
-    searchable_fields=["action", "entityType"],
-    prefix_override="/logs"
-)
-api_router.include_router(activity_log_router)
 
 report_router = create_crud_router(
     entity_name="AnalysisReport",

@@ -5,7 +5,7 @@ FastAPI dependency for route-level authentication.
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import JWTError
+from jwt import ExpiredSignatureError, InvalidTokenError
 
 from app.core.security import verify_access_token
 
@@ -33,10 +33,10 @@ async def get_current_user(
     try:
         payload = verify_access_token(token)
         user = payload.get("user")
-        if not user or not user.get("id"):
+        if not isinstance(user, dict) or not isinstance(user.get("id"), str) or not user["id"]:
             raise HTTPException(status_code=401, detail="Token is not valid")
         return user
-    except JWTError as e:
-        if "expired" in str(e).lower():
-            raise HTTPException(status_code=401, detail="Token expired")
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except InvalidTokenError:
         raise HTTPException(status_code=401, detail="Token is not valid")

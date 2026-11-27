@@ -325,7 +325,8 @@ async def test_case5_one_policy_failure_is_isolated(harness):
     assert harness.entry(result, "C")["status"] == "completed"
     failed = harness.entry(result, "B")
     assert failed["status"] == "failed"
-    assert "exploded" in failed["errorMessage"]
+    # Internal error text is not exposed to clients.
+    assert failed["errorMessage"] == "Analysis could not be completed. Please try again."
     # The failure is attributed to the real step the policy had reached.
     assert failed["failedAtStage"] in mpo.POLICY_STAGES
 
@@ -653,9 +654,9 @@ def test_case12_single_policy_request_contract_unchanged():
 
 
 def test_case12b_existing_routes_still_registered():
-    from app.api.router import api_router
+    from main import create_app
 
-    paths = {r.path for r in api_router.routes}
+    paths = create_app().openapi()["paths"]
     for legacy in (
         "/api/analysis/start",
         "/api/analysis/{session_id}/answer",
@@ -675,9 +676,9 @@ def test_case12b_existing_routes_still_registered():
 
 def test_case12c_multi_routes_registered_before_catchall():
     """/analysis/multi/... must not be shadowed by /analysis/{report_id}."""
-    from app.api.router import api_router
+    from main import create_app
 
-    paths = [r.path for r in api_router.routes]
+    paths = list(create_app().openapi()["paths"])
     assert paths.index("/api/analysis/multi/{session_id}") < paths.index("/api/analysis/{report_id}")
 
 

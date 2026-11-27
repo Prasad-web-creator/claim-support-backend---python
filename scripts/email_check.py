@@ -1,11 +1,10 @@
 """
-Check the SMTP settings in .env before switching EMAIL_OTP_PROVIDER to smtp.
+Check the configured email OTP provider in .env.
 
-    python -m scripts.email_check                      # logs in to the SMTP server only, sends nothing
-    python -m scripts.email_check someone@example.com  # also sends one test OTP email (code 0000)
+    python -m scripts.email_check                      # SMTP connection check
+    python -m scripts.email_check someone@example.com  # sends a one-time delivery check
 
-For Gmail, SMTP_PASSWORD must be an App Password (Google Account > Security >
-2-Step Verification > App passwords), not the normal account password.
+Omit the recipient to check SMTP authentication without sending a message.
 """
 
 import asyncio
@@ -13,36 +12,45 @@ import smtplib
 import sys
 
 from app.core.config import settings
-from app.services.otp_service import _send_email, _smtp_connect
+import httpx
+
+from app.services.microsoft_smtp import MicrosoftTokenError
+from app.services.otp_service import EMAIL, _deliver, _generate_code, _smtp_access_token, _smtp_connect, normalize_email
 
 
 async def main() -> int:
-    missing = [n for n, v in [("SMTP_USERNAME", settings.SMTP_USERNAME), ("SMTP_PASSWORD", settings.SMTP_PASSWORD)] if not v]
-    if missing:
-        print("Missing in .env:", ", ".join(missing))
-        return 1
-
-    print(f"Connecting to {settings.SMTP_HOST}:{settings.SMTP_PORT} as {settings.SMTP_USERNAME} ...")
-    try:
-        server = await asyncio.to_thread(_smtp_connect)
-        await asyncio.to_thread(server.quit)
-    except smtplib.SMTPAuthenticationError as exc:
-        print(f"Login rejected ({exc.smtp_code}). Check SMTP_USERNAME / SMTP_PASSWORD (Gmail needs an App Password).")
-        return 1
-    except (smtplib.SMTPException, OSError) as exc:
-        print(f"Could not connect: {type(exc).__name__}: {exc}")
-        return 1
-    print("Login OK.")
-    print(f"Sender: {settings.SMTP_FROM_NAME} <{settings.SMTP_FROM_EMAIL or settings.SMTP_USERNAME}>")
-    print(f"EMAIL_OTP_PROVIDER is currently: {settings.EMAIL_OTP_PROVIDER}")
-
     if len(sys.argv) > 1:
         try:
-            await _send_email(sys.argv[1].strip().lower(), "0000")
-        except Exception as exc:  # HTTPException carries the user-facing reason
-            print(f"Send failed: {getattr(exc, 'detail', exc)}")
+            await _deliver(EMAIL, normalize_email(sys.argv[1]), _generate_code())
+        except Exception as exc:
+            print(f"Email delivery check failed: {getattr(exc, 'status_code', type(exc).__name__)}")
             return 1
-        print(f"Test email sent to {sys.argv[1]}.")
+        print("Test email sent. The code was generated only for this delivery check.")
+        return 0
+
+    if settings.EMAIL_OTP_PROVIDER not in ("smtp", "smtp_oauth"):
+        print("Supply an email address to run a delivery check with the configured provider.")
+        return 1
+    print(f"Connecting to {settings.SMTP_HOST}:{settings.SMTP_PORT} ...")
+    try:
+        token = await _smtp_access_token()
+        if token is not None:
+            print("Microsoft Entra issued an SMTP access token.")
+        server = await asyncio.to_thread(_smtp_connect, token)
+        await asyncio.to_thread(server.quit)
+    except MicrosoftTokenError as exc:
+        print(f"Microsoft Entra rejected the token request ({exc}).")
+        return 1
+    except httpx.HTTPError as exc:
+        print(f"Could not reach Microsoft Entra ({type(exc).__name__}).")
+        return 1
+    except smtplib.SMTPAuthenticationError as exc:
+        print(f"SMTP authentication rejected ({exc.smtp_code}). Check the configured mailbox and its permissions.")
+        return 1
+    except (smtplib.SMTPException, OSError) as exc:
+        print(f"Could not connect: {type(exc).__name__}")
+        return 1
+    print("Login OK.")
     return 0
 
 

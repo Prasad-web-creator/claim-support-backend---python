@@ -1,88 +1,56 @@
-"""
-Local Disk Storage Provider — migrated from LocalStorageProvider.js.
-Uses GridFS conceptually for DB-backed local storage, or raw disk if preferred.
-Since the original app used GridFS, we implement GridFS here.
-"""
+"""MongoDB GridFS storage access."""
 
-from io import BytesIO
 from urllib.parse import urlencode
 
-from app.core.config import get_settings
-from app.core.database import get_gridfs_bucket
+from bson import ObjectId
+from gridfs.errors import NoFile
+
+from app.core.database import get_database, get_gridfs_bucket
 from app.services.storage.storage_provider import StorageProvider
-from app.core.logging import logger
 
 
 class GridFSProvider(StorageProvider):
-    """Storage provider using MongoDB GridFS."""
-
     async def upload_file(self, buffer: bytes, storage_key: str, metadata: dict | None = None) -> dict:
-        """Upload file bytes to GridFS."""
-        bucket = get_gridfs_bucket()
-        
-        file_id = await bucket.upload_from_stream(
-            storage_key,
-            buffer,
-            metadata=metadata or {}
+        file_id = await get_gridfs_bucket().upload_from_stream(
+            storage_key, buffer, metadata=metadata or {},
         )
-        
-        logger.info(f"[GridFS] Uploaded {storage_key} with ID {file_id}")
-        
-        return {
-            "key": storage_key,
-            "provider": "local",
-            "fileId": str(file_id)
-        }
+        return {"key": storage_key, "provider": "local", "fileId": str(file_id)}
+
+    async def find_file(self, storage_key: str) -> dict | None:
+        files = get_database()["fs.files"]
+        if ObjectId.is_valid(storage_key):
+            match = await files.find_one({"_id": ObjectId(storage_key)})
+            if match:
+                return match
+        return await files.find_one({"filename": storage_key}, sort=[("uploadDate", -1)])
 
     async def download_file(self, storage_key: str):
-        """Download a file from GridFS as an async generator."""
-        bucket = get_gridfs_bucket()
-        
-        # Find the latest file by filename (storage_key)
-        cursor = bucket.find({"filename": storage_key}).sort("uploadDate", -1).limit(1)
-        files = await cursor.to_list(length=1)
-        
-        if not files:
-            raise FileNotFoundError(f"File not found in GridFS: {storage_key}")
-            
-        file_id = files[0]["_id"]
-        
-        # FastAPI StreamingResponse expects an async generator
+        record = await self.find_file(storage_key)
+        if not record:
+            raise FileNotFoundError("File content not found")
+        try:
+            stream = await get_gridfs_bucket().open_download_stream(record["_id"])
+        except NoFile as exc:
+            raise FileNotFoundError("File content not found") from exc
+
         async def file_iterator():
-            stream = await bucket.open_download_stream(file_id)
             try:
-                while True:
-                    chunk = await stream.readchunk()
-                    if not chunk:
-                        break
+                while chunk := await stream.readchunk():
                     yield chunk
             finally:
-                pass # GridFS streams in motor close automatically or don't need explicit close
-                
+                stream.close()
+
         return file_iterator()
 
     async def delete_file(self, storage_key: str) -> bool:
-        """Delete all versions of a file from GridFS."""
-        bucket = get_gridfs_bucket()
-        
-        cursor = bucket.find({"filename": storage_key})
-        files = await cursor.to_list(length=None)
-        
-        for f in files:
-            await bucket.delete(f["_id"])
-            
-        logger.info(f"[GridFS] Deleted {len(files)} file(s) for key {storage_key}")
-        return len(files) > 0
+        record = await self.find_file(storage_key)
+        if not record:
+            return False
+        try:
+            await get_gridfs_bucket().delete(record["_id"])
+        except NoFile:
+            return False
+        return True
 
     async def generate_signed_url(self, storage_key: str, expires_in_seconds: int = 900) -> str:
-        """
-        GridFS doesn't have native signed URLs like S3.
-        We return a route-able URL to the local backend's file-serving endpoint.
-        The endpoint will verify JWT auth.
-        """
-        settings = get_settings()
-        # In a real setup with a domain, this would be the public URL.
-        # For now, relative path that the frontend can append to backend URL.
-        # Format: /api/files/stream?key=STORAGE_KEY
-        params = urlencode({"key": storage_key})
-        return f"/api/files/stream?{params}"
+        return f"/api/files/stream?{urlencode({'key': storage_key})}"

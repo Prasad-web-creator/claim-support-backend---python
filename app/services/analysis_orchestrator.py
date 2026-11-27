@@ -3,28 +3,28 @@ Analysis Orchestrator — migrated from analysisOrchestrator.js.
 Coordinates the entire 11-stage AI processing pipeline asynchronously.
 """
 
-import time
 import asyncio
 from datetime import datetime
 from typing import Optional
 from beanie import PydanticObjectId as ObjectId
 
 from app.core.logging import logger, log_section
+from app.core.exceptions import OCRError
 from app.models.analysis_report import AnalysisReport
 from app.models.policy import Policy
 from app.models.prescription import Prescription
 from app.models.stored_file import StoredFile
 
-from app.services.extraction.document_extraction import extract_text_from_document
-from app.services.extraction.text_cleaning import clean_text
-from app.services.extraction.policy_extraction import extract_policy_details
-from app.services.extraction.prescription_extraction import extract_prescription_details
-from app.services.extraction.json_validation import validate_extracted_json
-from app.services.coverage.business_rules import enforce_business_rules
-from app.services.coverage.coverage_analysis import analyze_coverage
-from app.services.coverage.report_generator import generate_report
 from app.services.extraction.metadata_extraction import extract_policy_metadata, extract_prescription_metadata
 from app.services.storage.file_upload_service import FileUploadService
+
+
+def public_analysis_error(error: Exception) -> str:
+    if isinstance(error, OCRError):
+        return error.message
+    if isinstance(error, FileNotFoundError):
+        return "The uploaded document is no longer available. Please upload it again."
+    return "Analysis could not be completed. Please try again."
 
 
 def _safe_parse_datetime(d_val):
@@ -61,7 +61,7 @@ async def _fetch_file_bytes_by_gridfs_id(file_id: str, user_id: str) -> tuple[by
     from app.services.storage.file_upload_service import FileUploadService
     
     stored_file = await StoredFile.get(ObjectId(file_id))
-    if not stored_file or stored_file.user_id != user_id:
+    if not stored_file or stored_file.user_id != user_id or stored_file.is_deleted:
         logger.warning(f"[File] Stored file missing or not owned by user: id={file_id}")
         raise FileNotFoundError(
             "The uploaded document is no longer available. Please upload it again."
@@ -74,8 +74,6 @@ async def _fetch_file_bytes_by_gridfs_id(file_id: str, user_id: str) -> tuple[by
     return b"".join(chunks), stored_file.mime_type
 
 
-from fastapi import BackgroundTasks
-
 async def _background_post_processing(
     user_id: str,
     report_id: str,
@@ -85,7 +83,7 @@ async def _background_post_processing(
     skip_prescription_metadata: bool = False
 ):
     """
-    Executes Metadata Extraction and RAG Indexing in the background.
+    Updates policy and prescription metadata after analysis.
 
     `skip_prescription_metadata` is set for the children of a multi-policy
     session: the prescription is identical for every policy, so its metadata is
@@ -94,7 +92,7 @@ async def _background_post_processing(
     """
     try:
         report = await AnalysisReport.get(ObjectId(report_id))
-        if not report:
+        if not report or report.user_id != user_id:
             return
 
         # ─── Stage 10: Extract & Persist Metadata in Policies & Prescriptions Collections ───
@@ -114,10 +112,10 @@ async def _background_post_processing(
                     return_exceptions=True
                 )
             if isinstance(policy_meta, Exception):
-                logger.error(f"[Background] Policy metadata error: {policy_meta}")
+                logger.error(f"[Background] Policy metadata error: {type(policy_meta).__name__}")
                 policy_meta = {}
             if isinstance(rx_meta, Exception):
-                logger.error(f"[Background] Prescription metadata error: {rx_meta}")
+                logger.error(f"[Background] Prescription metadata error: {type(rx_meta).__name__}")
                 rx_meta = {}
 
             # 1. Update / Insert in `policies` collection
@@ -127,6 +125,8 @@ async def _background_post_processing(
                     target_policy_doc = await Policy.get(ObjectId(policy_doc_id))
                 except Exception:
                     pass
+                if target_policy_doc and target_policy_doc.user_id != user_id:
+                    return
 
             if not target_policy_doc and policy_file_id:
                 target_policy_doc = await Policy.find_one(
@@ -203,6 +203,8 @@ async def _background_post_processing(
                 target_rx_doc = await Prescription.get(ObjectId(prescription_id))
             except Exception:
                 pass
+            if target_rx_doc and target_rx_doc.user_id != user_id:
+                return
 
             if not target_rx_doc:
                 target_rx_doc = await Prescription.find_one(
@@ -233,24 +235,21 @@ async def _background_post_processing(
             rx_visit_date = _safe_parse_datetime(rx_meta.get("hospital_visit_date") or rx_meta.get("consultation_date") or rx_meta.get("visit_date") or rx_meta.get("admission_date") or (report.prescription_json.get("visitDate") if report.prescription_json else None) or (report.prescription_json.get("consultationDate") if report.prescription_json else None) or (report.prescription_json.get("admissionDate") if report.prescription_json else None))
 
             if target_rx_doc:
-                target_rx_doc.extracted_prescription_text = report.prescription_text or ""
-                target_rx_doc.extracted_prescription_json = report.prescription_json or {}
-                if is_manual_rx:
-                    target_rx_doc.is_manual = True
-                if rx_hospital:
-                    target_rx_doc.hospital_name = str(rx_hospital)
-                if rx_doctor:
-                    target_rx_doc.doctor_name = str(rx_doctor)
-                if rx_patient:
-                    target_rx_doc.patient_name = str(rx_patient)
-                if rx_number:
-                    target_rx_doc.prescription_number = str(rx_number)
-                if diag_str:
-                    target_rx_doc.diagnosis = str(diag_str)
-                if rx_visit_date:
-                    target_rx_doc.visit_date = rx_visit_date
-                target_rx_doc.processing_status = "completed"
-                await target_rx_doc.save()
+                facts = {
+                    "hospitalName": rx_hospital, "doctorName": rx_doctor, "patientName": rx_patient,
+                    "prescriptionNumber": rx_number, "diagnosis": diag_str, "visitDate": rx_visit_date,
+                }
+                await Prescription.get_motor_collection().update_one(
+                    {"_id": target_rx_doc.id, "userId": user_id},
+                    {"$set": {
+                        "extractedPrescriptionText": report.prescription_text or "",
+                        "extractedPrescriptionJson": report.prescription_json or {},
+                        "isManual": is_manual_rx,
+                        "processingStatus": "completed",
+                        "updatedAt": datetime.now(),
+                        **{key: val for key, val in facts.items() if val},
+                    }},
+                )
                 report.prescription_id = str(target_rx_doc.id)
             else:
                 new_rx = Prescription(
@@ -272,313 +271,9 @@ async def _background_post_processing(
 
             await report.save()
         except Exception as meta_err:
-            logger.error(f"[Background] Error during metadata extraction: {meta_err}", exc_info=True)
-
-        # Register ClaimCase in expert review knowledge base
-        try:
-            log_section("Case Review System")
-            from app.services.expert_learning.expert_case_service import ExpertCaseService
-            case = await ExpertCaseService.create_case_from_report(
-                report_id=report_id,
-                user_id=user_id,
-                policy_id=report.policy_id or policy_doc_id,
-                prescription_id=report.prescription_id or prescription_id
-            )
-            case_id = getattr(case, "case_id", "New Case") if case else "New Case"
-            logger.info(f"[Case Review] Registered claim case {case_id} in PENDING_EXPERT_REVIEW")
-        except Exception as expert_err:
-            logger.error(f"[Case Review] Error registering case for review: {expert_err}", exc_info=True)
+            logger.error(f"[Background] Error during metadata extraction: {type(meta_err).__name__}")
 
         logger.info("[Background] Post-processing complete.")
 
     except Exception as e:
-        logger.error(f"[Background] Fatal error: {e}", exc_info=True)
-
-
-async def run_analysis_pipeline(
-    user_id: str,
-    prescription_id: str,
-    policy_file_id: Optional[str] = None,
-    policy_doc_id: Optional[str] = None,
-    background_tasks: Optional[BackgroundTasks] = None
-) -> dict:
-    """
-    Executes the 11-stage analysis pipeline.
-    """
-    start_time = time.time()
-    log_section("Claim Analysis Started")
-    logger.info(f"[Claim Analysis] Started session for User: {user_id}")
-    
-    report = AnalysisReport(
-        user_id=user_id,
-        policy_id=policy_doc_id or policy_file_id,
-        prescription_id=prescription_id,
-        status="extracting",
-        analysis_version="2.1.0",
-        model="gemini-2.5-flash",
-        model_version="2.5-flash",
-        prompt_version="1.2.0",
-        rule_engine_version="2.0.0-deterministic",
-        knowledge_base_version="1.0.0",
-        dataset_version="1.0.0",
-    )
-    await report.insert()
-    
-    try:
-        # Load Metadata & Extract Text
-        logger.debug("[Claim Analysis] Loading file data and extracting text...")
-        
-        async def process_document(doc_id, doc_label="Document"):
-            logger.debug(f"[Claim Analysis] Loading {doc_label} (ID: {doc_id})...")
-            bytes_data, mime = await _fetch_file_bytes_by_gridfs_id(doc_id, user_id)
-            raw_text = await extract_text_from_document(bytes_data, mime, doc_label=doc_label)
-            return clean_text(raw_text)
-
-        # Check if prescription_id refers to a Prescription document or manual prescription
-        is_manual_rx = False
-        manual_rx_text = None
-        rx_doc = None
-        target_rx_file_id = prescription_id
-
-        if prescription_id:
-            try:
-                if len(str(prescription_id)) == 24:
-                    rx_doc = await Prescription.get(ObjectId(prescription_id))
-            except Exception:
-                rx_doc = None
-
-        if rx_doc:
-            if rx_doc.is_manual:
-                is_manual_rx = True
-                manual_rx_text = rx_doc.extracted_prescription_text or ""
-            elif rx_doc.grid_fs_file_id:
-                target_rx_file_id = rx_doc.grid_fs_file_id
-
-        async def load_rx_text():
-            if is_manual_rx and manual_rx_text:
-                logger.debug("[Claim Analysis] Prescription is self-entered manual text by user.")
-                return clean_text(manual_rx_text)
-            try:
-                return await process_document(target_rx_file_id, doc_label="Prescription Document")
-            except Exception as e:
-                # If target_rx_file_id is raw manual text directly passed
-                if prescription_id and len(prescription_id) > 10 and not prescription_id.isalnum():
-                    return clean_text(prescription_id)
-                raise e
-
-        policy_text = ""
-        existing_policy_json = None
-        
-        log_section("Document Processing")
-        if policy_doc_id:
-            policy_doc = await Policy.get(ObjectId(policy_doc_id))
-            if not policy_doc or policy_doc.user_id != user_id:
-                raise ValueError("Invalid Policy ID or unauthorized")
-                
-            if policy_doc.extracted_policy_text:
-                logger.info(
-                    f"[Document] Using cached text for Policy {policy_doc.id} ({len(policy_doc.extracted_policy_text)} chars)"
-                )
-                policy_text = policy_doc.extracted_policy_text
-                existing_policy_json = policy_doc.extracted_policy_json or {}
-                rx_text = await load_rx_text()
-            else:
-                logger.info("[Document] Extracting text from policy and prescription documents...")
-                policy_text, rx_text = await asyncio.gather(
-                    process_document(policy_doc.grid_fs_file_id, doc_label="Policy Document"),
-                    load_rx_text()
-                )
-        else:
-            logger.info("[Document] Extracting text from policy and prescription documents...")
-            policy_text, rx_text = await asyncio.gather(
-                process_document(policy_file_id, doc_label="Policy Document"),
-                load_rx_text()
-            )
-        
-        report.policy_text = policy_text
-        report.prescription_text = rx_text
-        await report.save()
-        
-        if existing_policy_json:
-            log_section("Prescription Extraction")
-            policy_data = {"extractedJson": existing_policy_json}
-            rx_data = await extract_prescription_details(rx_text)
-        else:
-            log_section("Policy & Prescription Extraction")
-            policy_data, rx_data = await asyncio.gather(
-                extract_policy_details(policy_text),
-                extract_prescription_details(rx_text)
-            )
-        
-        validation = validate_extracted_json(
-            policy_data.get("extractedJson"),
-            rx_data.get("extractedJson")
-        )
-        
-        policy_json = validation["validatedPolicyJson"]
-        prescription_json = validation["validatedPrescriptionJson"]
-
-        if is_manual_rx:
-            from app.services.analysis_interactive_orchestrator import _apply_manual_prescription_defaults
-            _apply_manual_prescription_defaults(prescription_json, rx_text)
-            if rx_doc:
-                rx_doc.extracted_prescription_text = rx_text
-                rx_doc.extracted_prescription_json = prescription_json
-                await rx_doc.save()
-
-        report.policy_json = policy_json
-        report.prescription_json = prescription_json
-
-        # Early check for document validity
-        is_policy_valid = validation.get("isPolicyValid", True)
-        is_rx_valid = validation.get("isPrescriptionValid", True)
-        
-        if not is_policy_valid or not is_rx_valid:
-            logger.warning(f"[Claim Analysis] Document validation failed: policyValid={is_policy_valid}, prescriptionValid={is_rx_valid}")
-            p_reason = ""
-            rx_reason = ""
-            if not is_policy_valid:
-                p_reason = "The uploaded policy document contains no recognizable insurance policy clauses, covered treatments, benefit rules, or insurance terms."
-            if not is_rx_valid:
-                if is_manual_rx:
-                    rx_reason = "The self-entered text contains no recognizable medical details (no diagnosis, symptoms, diseases, medicines, or medical tests)."
-                else:
-                    rx_reason = "The uploaded document contains no valid diagnosis, medicines, medical tests, procedures, or symptoms."
-
-            if not is_policy_valid and not is_rx_valid:
-                inv_status = "Invalid Policy and Prescription"
-            elif not is_policy_valid:
-                inv_status = "Invalid Policy"
-            else:
-                inv_status = "Invalid Prescription"
-
-            processing_time = int((time.time() - start_time) * 1000)
-            final_report = generate_report(
-                policy_json=report.policy_json,
-                prescription_json=report.prescription_json,
-                business_rule_results={},
-                coverage_analysis={
-                    "documentValidity": {
-                        "policyValid": is_policy_valid,
-                        "prescriptionValid": is_rx_valid,
-                        "isPolicyValid": is_policy_valid,
-                        "isPrescriptionValid": is_rx_valid,
-                        "policyInvalidReason": p_reason,
-                        "prescriptionInvalidReason": rx_reason,
-                        "errors": validation.get("errors", [])
-                    },
-                    "overallStatus": inv_status,
-                    "comparison": []
-                },
-                processing_time_ms=processing_time
-            )
-            # Do NOT store invalid coverage summary report in DB as per user requirement
-            try:
-                await report.delete()
-                logger.info(f"[Claim Analysis] Removed invalid report {report.id} from DB.")
-            except Exception as del_err:
-                logger.warning(f"[Claim Analysis] Could not delete invalid report: {del_err}")
-
-            return final_report
-
-        report.status = "analyzing"
-        await report.save()
-        
-        # Stage 7: Business Rules
-        log_section("Rule Engine & Eligibility")
-        logger.info("[Rule Engine] Evaluating policy rules, waiting periods, and exclusions...")
-        br_results = enforce_business_rules(
-            report.policy_json,
-            report.prescription_json,
-            policy_text=report.policy_text,
-        )
-        report.business_rules = br_results
-        det_res = br_results.get("deterministicResult") or {}
-        det_status = det_res.get("status") or ("ELIGIBLE" if br_results.get("overallEligible") else "NOT_ELIGIBLE")
-        det_reason = det_res.get("reasonCode") or ""
-        logger.info(f"[Rule Engine] Decision: {det_status} ({det_reason})")
-        
-        # AI Coverage Analysis
-        log_section("AI Analysis")
-        logger.info("[AI Analysis] Evaluating policy coverage and generating explanation with Gemini...")
-        coverage_analysis = await analyze_coverage(
-            policy_text=report.policy_text or "",
-            prescription_text=report.prescription_text or "",
-            business_rule_results=br_results,
-            prescription_json=report.prescription_json or {},
-            policy_json=report.policy_json or {},
-            policy_id=report.policy_id or policy_doc_id or "",
-        )
-        report.coverage_analysis = coverage_analysis
-        report.retrieved_evidence = coverage_analysis.get("retrieved_evidence", [])
-        
-        # Generate Coverage Report
-        processing_time = int((time.time() - start_time) * 1000)
-        
-        final_report = generate_report(
-            policy_json=report.policy_json,
-            prescription_json=report.prescription_json,
-            business_rule_results=br_results,
-            coverage_analysis=coverage_analysis,
-            processing_time_ms=processing_time
-        )
-        
-        # Add Stage 10 and 10.5 to background tasks
-        if background_tasks:
-            background_tasks.add_task(
-                _background_post_processing,
-                user_id=user_id,
-                report_id=str(report.id),
-                policy_doc_id=policy_doc_id,
-                policy_file_id=policy_file_id,
-                prescription_id=prescription_id
-            )
-        else:
-            # If no background_tasks is provided, we run it synchronously (for safety)
-            await _background_post_processing(
-                user_id=user_id,
-                report_id=str(report.id),
-                policy_doc_id=policy_doc_id,
-                policy_file_id=policy_file_id,
-                prescription_id=prescription_id
-            )
-            
-        # Finalize and Save AnalysisReport
-        if str(final_report.get("overallStatus", "")).startswith("Invalid"):
-            try:
-                await report.delete()
-                logger.info(f"[Claim Analysis] Removed invalid report {report.id} from DB.")
-            except Exception:
-                pass
-            return final_report
-        report.status = "completed"
-        report.document_validity = final_report.get("documentValidity")
-        report.overall_status = final_report.get("overallStatus")
-        report.dominance_score = final_report.get("dominanceScore")
-        report.coverage_breakdown = final_report.get("coverageBreakdown")
-        report.summary = final_report.get("summary")
-        report.comparison = final_report.get("comparison")
-        report.reference_comparison = final_report.get("referenceComparison") or {}
-        report.major_terms = final_report.get("majorTerms") or []
-        report.financial_summary = final_report.get("financialSummary") or {}
-        report.next_steps = final_report.get("nextSteps") or []
-        report.processing_time_ms = processing_time
-        
-        await report.save()
-        log_section("Claim Decision Summary")
-        logger.info(f"  - Report Number:   #{report.report_number} | ID: {report.id}")
-        logger.info(f"  - Decision:        {report.overall_status} ({report.decision_type})")
-        logger.info(f"  - Dominance Score: {report.dominance_score}%")
-        logger.info(f"  - Processing Time: {processing_time}ms ({processing_time/1000.0:.2f}s)")
-        
-        # Fetch fresh complete document to return as dict
-        fresh = await AnalysisReport.get(report.id)
-        return fresh.dict(by_alias=True)
-        
-    except Exception as e:
-        logger.error(f"[Claim Analysis] Analysis failed: {e}")
-        report.status = "failed"
-        report.error_message = str(e)
-        report.processing_time_ms = int((time.time() - start_time) * 1000)
-        await report.save()
-        raise e
+        logger.error(f"[Background] Fatal error: {type(e).__name__}")

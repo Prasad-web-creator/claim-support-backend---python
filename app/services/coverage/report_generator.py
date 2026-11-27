@@ -3,14 +3,6 @@ from app.services.coverage.policy_continuity import evaluate_policy_continuity, 
 from app.services.coverage.verification import NEEDS_VERIFICATION, apply_consistency_checks
 
 
-# Stored in place of the old benchmark comparison. It is non-empty on purpose:
-# the app re-fetches a report whose referenceComparison is empty.
-REFERENCE_COMPARISON_DISABLED = {
-    "available": False,
-    "note": "Coverage is decided only from this policy's own wording; no built-in benchmark is used.",
-}
-
-
 def _is_meaningful(val) -> bool:
     """Check if value is meaningful (not None, empty, None string, Unknown, N/A)."""
     if val is None:
@@ -88,7 +80,6 @@ def generate_report(
             coverage_analysis["comparison"] = raw_analysis["comparison"]
         if "overallStatus" in raw_analysis and not coverage_analysis.get("overallStatus"):
             coverage_analysis["overallStatus"] = raw_analysis["overallStatus"]
-    rule_audit = coverage_analysis.get("ruleAudit") or {}
 
     # Check document validity from explicit flags if present
     doc_validity = coverage_analysis.get("documentValidity") or {}
@@ -175,8 +166,6 @@ def generate_report(
         overall_status = "Invalid Policy"
     elif not rx_valid:
         overall_status = "Invalid Prescription"
-    elif rule_audit.get("manualReviewRequired"):
-        overall_status = "Manual Review Required"
     elif total_items > 0 and covered_count + partially_covered_count + not_covered_count + needs_verification_count == 0:
         # Only "Manual Review" items: nothing was decided automatically.
         overall_status = "Manual Review Required"
@@ -184,14 +173,6 @@ def generate_report(
         # The result cannot be stated until the detail is verified.
         overall_status = NEEDS_VERIFICATION
         dominance_score = (needs_verification_count / total_items) * 100
-    elif total_items > 0 and rule_audit:
-        if covered_count == total_items:
-            overall_status = "Covered"
-        elif not_covered_count == total_items:
-            overall_status = "Not Covered"
-        else:
-            overall_status = "Partially Covered"
-        dominance_score = max(covered_count, partially_covered_count, not_covered_count) / total_items * 100
     elif total_items > 0:
         if not_covered_count >= partially_covered_count and not_covered_count >= covered_count:
             overall_status = "Not Covered"
@@ -232,10 +213,6 @@ def generate_report(
         or (det_res.get("status") in ("NOT_COVERED", "NOT_CURRENTLY_COVERED"))
         or (len(all_blockers) > 0)
     )
-    if rule_audit.get("prescriptionConfirmed") is False:
-        is_blocked = False
-        det_res = {}
-        all_blockers = []
 
     if is_blocked and not is_doc_invalid:
         overall_status = "Not Covered"
@@ -382,7 +359,7 @@ def generate_report(
     if not d_name or str(d_name).strip().lower() in ("none", "null", "unknown", "unknown doctor"):
         d_name = None
 
-    if extracted_diag and not prescription_json.get("diagnosis") and not rule_audit:
+    if extracted_diag and not prescription_json.get("diagnosis"):
         prescription_json["diagnosis"] = extracted_diag
 
     prescription_summary = {
@@ -415,7 +392,7 @@ def generate_report(
         matched_items = coverage_analysis.get("coveredTreatments", [c["item"] for c in comparison if c.get("isCovered")]) if not is_doc_invalid else []
         excluded_items = coverage_analysis.get("excludedTreatments", [
             c["item"] for c in comparison
-            if c.get("coverageStatus") == "Not Covered"
+            if not c.get("isCovered") and c.get("coverageStatus") != NEEDS_VERIFICATION
         ]) if not is_doc_invalid else []
 
         if not is_doc_invalid:
@@ -471,10 +448,6 @@ def generate_report(
         "detectedDocumentTypeIfInvalid": doc_validity.get("detectedDocumentTypeIfInvalid", "")
     }
 
-    # No built-in benchmark (other products, generic exclusion lists) is compared
-    # against: coverage comes from this policy's own wording only.
-    reference_comparison = dict(REFERENCE_COMPARISON_DISABLED)
-
     # Continuity from this policy's own document. A multi-policy session later
     # re-evaluates it across every policy in the session.
     policy_continuity = (
@@ -491,25 +464,13 @@ def generate_report(
             combined_blocked.append(b)
 
     final_summary = summary_text if (is_doc_invalid or is_blocked) else coverage_analysis.get("summary", summary_text)
-    if prescription_json.get("admissionAssumed") and not is_doc_invalid and not rule_audit:
+    if prescription_json.get("admissionAssumed") and not is_doc_invalid:
         admission_note = (
             "This result assumes you are admitted to hospital (in-patient or day care). "
             "An out-patient consultation alone is not covered under this policy."
         )
         final_summary = f"{final_summary} {admission_note}".strip()
         summary_text = f"{summary_text} {admission_note}".strip()
-
-    manual_review = (
-        rule_audit.get("manualReviewRequired") or det_res.get("manualReviewRequired") or det_res.get("status") == "MANUAL_REVIEW"
-    )
-    reported_decision = dict(det_res)
-    if rule_audit and not is_doc_invalid:
-        reported_decision["eligibilityStatus"] = det_res.get("status")
-        reported_decision["status"] = {
-            "Covered": "COVERED", "Partially Covered": "PARTIALLY_COVERED", "Not Covered": "NOT_COVERED",
-        }.get(overall_status, "MANUAL_REVIEW")
-        reported_decision["manualReviewRequired"] = bool(manual_review)
-        reported_decision["ruleAudit"] = rule_audit
 
     return {
         "documentValidity": final_doc_validity,
@@ -525,8 +486,8 @@ def generate_report(
         "applicableClauses": coverage_analysis.get("matchedPolicyClauses", []),
         "blockedClauses": combined_blocked,
         "businessRuleResults": business_rule_results,
-        "deterministicResult": reported_decision,
-        "decisionType": "Manual Review" if manual_review else "Automatic",
+        "deterministicResult": det_res,
+        "decisionType": "Manual Review" if (det_res.get("manualReviewRequired") or det_res.get("status") == "MANUAL_REVIEW") else "Automatic",
         "recommendations": recommendations.strip(),
         "reasoning": coverage_analysis.get("reasoning", ""),
         "processingTimeMs": processing_time_ms,
@@ -537,7 +498,6 @@ def generate_report(
         "prescriptionSource": prescription_source,
         "prescriptionJson": prescription_json,
         "policyJson": policy_json,
-        "referenceComparison": reference_comparison,
         "policyContinuity": policy_continuity,
         "majorTerms": [] if is_doc_invalid else build_major_terms(comparison, all_blockers),
         # A blocked claim (policy inactive, not an insured member) pays nothing, so no estimate is shown.

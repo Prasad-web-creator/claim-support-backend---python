@@ -62,6 +62,7 @@ class MultiPolicyAnalysisSession(Document):
 
     user_id: Indexed(str) = Field(alias="userId")  # type: ignore[valid-type]
     prescription_id: Optional[str] = Field(default="", alias="prescriptionId")
+    durable_job: bool = Field(default=False, alias="durableJob")
 
     # queued | extracting | analyzing | waiting_for_user | completed | partial | failed
     status: str = Field(default="queued")

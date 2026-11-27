@@ -7,6 +7,7 @@ Removing one of those records used to delete the shared file, and the next
 analysis of the other record failed with "File metadata not found for ID ...".
 """
 
+
 import pytest
 import pytest_asyncio
 
@@ -20,7 +21,6 @@ async def store(monkeypatch):
     from beanie import init_beanie
     from mongomock_motor import AsyncMongoMockClient
 
-    from app.models.activity_log import ActivityLog
     from app.models.counter import Counter
     from app.models.policy import Policy
     from app.models.prescription import Prescription
@@ -29,12 +29,15 @@ async def store(monkeypatch):
     client = AsyncMongoMockClient()
     await init_beanie(
         database=client["shared_file_test"],
-        document_models=[Policy, Prescription, StoredFile, ActivityLog, Counter],
+        document_models=[Policy, Prescription, StoredFile, Counter],
     )
 
     deleted_keys = []
 
     class FakeProvider:
+        async def find_file(self, storage_key):
+            return None
+
         async def delete_file(self, storage_key):
             deleted_keys.append(storage_key)
             return True
@@ -127,3 +130,47 @@ async def test_upload_rollback_keeps_file_already_used_by_another_record(store):
 
     assert await StoredFile.get(shared.id) is not None
     assert store["deleted_keys"] == []
+
+
+@pytest.mark.asyncio
+async def test_prescription_update_invalidates_extraction_only_on_source_changes(store):
+    from app.core.exceptions import ValidationError
+    from app.services.crud_service import CrudService
+
+    Prescription = store["Prescription"]
+    first = await store["make_file"]("previous")
+    second = await store["make_file"]("replacement")
+    rx = Prescription(
+        user_id=USER,
+        grid_fs_file_id=str(first.id),
+        extracted_prescription_text="Diagnosis: original",
+        extracted_prescription_json={"diagnosis": "original"},
+    )
+    await rx.insert()
+    service = CrudService(Prescription, "Prescription")
+    unchanged = await service.update(USER, str(rx.id), {"gridFsFileId": str(first.id), "hospitalName": "Test"})
+    assert unchanged.extracted_prescription_json == {"diagnosis": "original"}
+
+    replaced = await service.update(USER, str(rx.id), {"gridFsFileId": str(second.id)})
+    assert replaced.grid_fs_file_id == str(second.id)
+    assert replaced.extracted_prescription_json == {}
+    assert replaced.extracted_prescription_text == ""
+
+    await Prescription.get_motor_collection().update_one(
+        {"_id": rx.id},
+        {"$set": {
+            "extractedPrescriptionJson": {"diagnosis": "stale"},
+        }},
+    )
+    with pytest.raises(ValidationError, match="Only typed prescriptions"):
+        await service.update(USER, str(rx.id), {"extractedPrescriptionText": "$literal text"})
+
+    typed = await Prescription(
+        user_id=USER,
+        is_manual=True,
+        extracted_prescription_text="Diagnosis: original",
+        extracted_prescription_json={"diagnosis": "original"},
+    ).insert()
+    updated = await service.update(USER, str(typed.id), {"extractedPrescriptionText": "$literal text"})
+    assert updated.extracted_prescription_text == "$literal text"
+    assert updated.extracted_prescription_json == {}

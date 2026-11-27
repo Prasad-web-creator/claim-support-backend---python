@@ -16,6 +16,7 @@ from app.middleware.auth import get_current_user
 from app.models.policy import Policy
 from app.services.storage.file_upload_service import FileUploadService
 import app.services.extraction.policy_continuity_extraction as pce
+from app.services.extraction import policy_extraction
 
 USER = "test-user-123"
 POLICY_TEXT = "POLICY SCHEDULE\n" + "Health insurance policy schedule text. " * 10
@@ -27,6 +28,10 @@ EMPTY = {
     "renewedWithoutBreak": None,
     "extractedFields": {"isRenewal": False, "startDate": False, "renewedWithoutBreak": False},
 }
+
+
+def _continuity_part(data):
+    return {key: data[key] for key in EMPTY}
 
 
 def _app(user_id=USER):
@@ -50,6 +55,25 @@ def _mock_continuity(monkeypatch, block):
 
     monkeypatch.setattr(pce, "extract_policy_continuity_fields", fake)
 
+    # The AI schedule extraction is mocked: labelled lines become fields.
+    labels = {
+        "insurance company": "insuranceCompany", "policy number": "policyNumber",
+        "policy holder": "policyHolder", "policy start date": "policyStartDate",
+        "policy end date": "policyEndDate", "sum insured": "coverageAmount",
+    }
+
+    async def fake_read(text):
+        if "policy" not in text.lower():
+            return {"isValid": False, "extractedJson": None}
+        fields = {"policyType": "Health Insurance"}
+        for line in text.splitlines():
+            label, _, value = line.partition(":")
+            if label.strip().lower() in labels and value.strip():
+                fields[labels[label.strip().lower()]] = value.strip()
+        return {"isValid": True, "extractedJson": fields}
+
+    monkeypatch.setattr(policy_extraction, "extract_policy_details", fake_read)
+
     async def no_bytes(_):
         return None
 
@@ -67,7 +91,8 @@ async def test_renewed_policy_prefills_first_start_not_current_period(db, monkey
     """Current period starts 2026, cover since 2024: the first start (2024) is prefilled."""
     _mock_continuity(monkeypatch, {
         "policyStartDate": "2026-04-01", "policyEndDate": "2027-03-31", "isRenewal": True,
-        "renewalInformation": "Renewal", "continuousCoverageSince": "2024-04-01",
+        "renewalInformation": "Renewal", "renewalDate": "2026-03-25",
+        "continuousCoverageSince": "2024-04-01",
         "renewedWithoutBreak": True,
         "continuityEvidence": ["Continuous coverage since 01-Apr-2024 without break"],
     })
@@ -80,9 +105,10 @@ async def test_renewed_policy_prefills_first_start_not_current_period(db, monkey
     assert data["renewedWithoutBreak"] is True
     assert data["extractedFields"] == {"isRenewal": True, "startDate": True, "renewedWithoutBreak": True}
 
-    # Cached on the policy for the analysis to reuse, without marking it as fully extracted.
+    # Cached on the policy for the analysis to reuse.
     stored = (await Policy.get(p.id)).extracted_policy_json
     assert stored["continuity"]["continuousCoverageSince"] == "2024-04-01"
+    assert stored["continuity"]["renewalDate"] == "2026-03-25"
 
 
 @pytest.mark.asyncio
@@ -101,7 +127,7 @@ async def test_renewal_clauses_alone_do_not_mean_renewed(db, monkeypatch):
     """The document says neither new nor renewal: nothing is prefilled, so the user answers."""
     _mock_continuity(monkeypatch, {"policyStartDate": "2026-04-01", "isRenewal": None})
     data = (await _post((await _policy()).id)).json()
-    assert data == {**EMPTY}
+    assert _continuity_part(data) == EMPTY
 
 
 @pytest.mark.asyncio
@@ -146,11 +172,47 @@ async def test_requires_login(db):
 async def test_no_readable_text_returns_nulls(db, monkeypatch):
     calls = _mock_continuity(monkeypatch, {"isRenewal": True})
     p = await _policy(text="")
-    assert (await _post(p.id)).json() == EMPTY
+    assert _continuity_part((await _post(p.id)).json()) == EMPTY
     assert calls == []
 
 
 @pytest.mark.asyncio
 async def test_failed_reading_returns_nulls(db, monkeypatch):
     _mock_continuity(monkeypatch, {})  # the AI read failed / returned nothing
-    assert (await _post((await _policy()).id)).json() == EMPTY
+    assert _continuity_part((await _post((await _policy()).id)).json()) == EMPTY
+
+
+@pytest.mark.asyncio
+async def test_schedule_details_are_read_and_stored_for_the_analysis(db, monkeypatch):
+    _mock_continuity(monkeypatch, {"policyStartDate": "2026-04-01", "isRenewal": False, "renewalInformation": "Fresh"})
+    text = (
+        "HEALTH INSURANCE POLICY SCHEDULE\n"
+        "Insurance Company: Synthetic General Insurance Ltd\n"
+        "Policy Number: SYN/2026/001\n"
+        "Policy Holder: Synthetic Member\n"
+        "Policy Start Date: 2026-04-01\n"
+        "Policy End Date: 2027-03-31\n"
+        "Sum Insured: 500000\n"
+    )
+    p = await _policy(text=text)
+    data = (await _post(p.id)).json()
+    assert data["isPolicy"] is True
+    assert data["details"]["policyNumber"] == "SYN/2026/001"
+    assert data["details"]["policyHolder"] == "Synthetic Member"
+    assert data["details"]["policyStartDate"] == "2026-04-01"
+    assert data["details"]["policyEndDate"] == "2027-03-31"
+    assert data["details"]["coverageAmount"] == "500000"
+    assert data["isRenewal"] is False and data["startDate"] == "2026-04-01"
+
+    saved = await Policy.get(p.id)
+    assert saved.extracted_policy_json["policyNumber"] == "SYN/2026/001"
+    assert saved.policy_holder_name == "Synthetic Member"
+    assert saved.policy_name != "Uploaded Policy" or saved.policy_number == "SYN/2026/001"
+
+
+@pytest.mark.asyncio
+async def test_document_that_is_not_a_policy_is_reported(db, monkeypatch):
+    _mock_continuity(monkeypatch, {})
+    data = (await _post((await _policy(text="Grocery list: apples, bread, milk, eggs and more " * 3)).id)).json()
+    assert data["isPolicy"] is False
+    assert data["details"] == {}

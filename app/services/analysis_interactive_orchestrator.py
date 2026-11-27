@@ -5,8 +5,10 @@ import time
 import asyncio
 import copy
 from beanie import PydanticObjectId as ObjectId
+from pymongo.errors import DuplicateKeyError
 import json
 import re
+from app.services.analysis_persistence import finish_analysis_write
 from app.core.logging import logger, log_section
 from app.models.analysis_report import AnalysisReport
 from app.models.analysis_session import AnalysisSession, ClarificationQuestion, ClarificationAnswer
@@ -93,7 +95,7 @@ async def _report_stage(on_stage: Optional[Callable[[str], Awaitable[None]]], st
     try:
         await on_stage(stage)
     except Exception as e:
-        logger.warning(f"[Claim Analysis] Progress callback failed at stage '{stage}': {e}")
+        logger.warning(f"[Claim Analysis] Progress callback failed at stage '{stage}': {type(e).__name__}")
 
 
 def _parse_and_format_date(date_val):
@@ -599,9 +601,9 @@ async def _save_policy_answers(session: AnalysisSession, **fields) -> None:
         if pol_record:
             for key, value in fields.items():
                 setattr(pol_record, key, value)
-            await pol_record.save()
+            await finish_analysis_write(pol_record.save())
     except Exception as pe:
-        logger.error(f"[Clarification] Error saving policy answers {list(fields)}: {pe}")
+        logger.error(f"[Clarification] Error saving policy answers {list(fields)}: {type(pe).__name__}")
 
 
 def _as_datetime(d):
@@ -649,7 +651,7 @@ async def _ask_clarification(session: AnalysisSession, questions: list) -> dict:
             maxDate=q.get("maxDate"),
         ))
     session.status = "waiting_for_user"
-    await session.save()
+    await finish_analysis_write(session.save())
     return {
         "status": "needs_clarification",
         "sessionId": str(session.id),
@@ -763,6 +765,10 @@ async def _resolve_prescription_context(user_id: str, prescription_id: str) -> P
         try:
             if len(str(prescription_id)) == 24:
                 rx_doc = await Prescription.get(ObjectId(prescription_id))
+                if rx_doc is None:
+                    rx_doc = await Prescription.find_one(
+                        Prescription.grid_fs_file_id == prescription_id, Prescription.user_id == user_id,
+                    )
         except Exception:
             rx_doc = None
 
@@ -775,6 +781,8 @@ async def _resolve_prescription_context(user_id: str, prescription_id: str) -> P
         ctx.target_file_id = None
         return ctx
     if rx_doc:
+        if rx_doc.user_id != user_id or getattr(rx_doc, "is_deleted", False) is True:
+            raise FileNotFoundError("The prescription is no longer available. Please upload it again.")
         ctx.rx_doc = rx_doc
         if rx_doc.is_manual:
             ctx.is_manual = True
@@ -785,7 +793,7 @@ async def _resolve_prescription_context(user_id: str, prescription_id: str) -> P
 
 
 async def _load_prescription_text(ctx: PrescriptionContext, user_id: str) -> str:
-    """Extract (or read back manual) prescription text. Unchanged single-policy behaviour."""
+    """Use manual input or extract text from the uploaded document."""
     if ctx.is_manual and ctx.manual_text:
         logger.debug("[Claim Analysis] Prescription is self-entered manual text by user.")
         return clean_text(ctx.manual_text)
@@ -846,6 +854,10 @@ def _apply_manual_prescription_defaults(prescription_json: dict, rx_text: str) -
     return prescription_json
 
 
+# Name used by the durable analysis-job runner; same behaviour as above.
+_add_manual_prescription_context = _apply_manual_prescription_defaults
+
+
 async def _persist_prescription_extraction(
     ctx: PrescriptionContext,
     user_id: str,
@@ -859,26 +871,23 @@ async def _persist_prescription_extraction(
     """
     rx_doc = ctx.rx_doc
     if rx_doc:
-        rx_doc.extracted_prescription_text = rx_text or ""
-        rx_doc.extracted_prescription_json = prescription_json or {}
-        if ctx.is_manual:
-            rx_doc.is_manual = True
-        if prescription_json.get("patientName"):
-            rx_doc.patient_name = str(prescription_json.get("patientName"))
-        if prescription_json.get("doctorName"):
-            rx_doc.doctor_name = str(prescription_json.get("doctorName"))
-        if prescription_json.get("hospitalName"):
-            rx_doc.hospital_name = str(prescription_json.get("hospitalName"))
-        if prescription_json.get("diagnosis"):
-            rx_doc.diagnosis = str(prescription_json.get("diagnosis"))
-        if prescription_json.get("prescriptionNumber"):
-            rx_doc.prescription_number = str(prescription_json.get("prescriptionNumber"))
-        if prescription_json.get("visitDate") or prescription_json.get("consultationDate"):
-            rx_doc.visit_date = prescription_json.get("visitDate") or prescription_json.get("consultationDate")
-        rx_doc.processing_status = "completed"
-        await rx_doc.save()
+        facts = {key: str(prescription_json[key]) for key in (
+            "patientName", "doctorName", "hospitalName", "diagnosis", "prescriptionNumber",
+        ) if prescription_json.get(key)}
+        visit_date = prescription_json.get("visitDate") or prescription_json.get("consultationDate")
+        if visit_date:
+            facts["visitDate"] = visit_date
+        await finish_analysis_write(Prescription.get_motor_collection().update_one(
+            {"_id": rx_doc.id, "userId": user_id},
+            {"$set": {
+                "extractedPrescriptionText": rx_text or "",
+                "extractedPrescriptionJson": prescription_json or {},
+                "isManual": ctx.is_manual, "processingStatus": "completed", "updatedAt": datetime.now(),
+                **facts,
+            }},
+        ))
         logger.info(f"[Claim Analysis] Saved extracted prescription text & JSON to prescription {rx_doc.id}")
-        return None
+        return str(rx_doc.id) if str(rx_doc.id) != ctx.prescription_id else None
 
     if ctx.target_file_id:
         try:
@@ -897,12 +906,15 @@ async def _persist_prescription_extraction(
                 extracted_prescription_json=prescription_json or {},
                 processing_status="completed"
             )
-            await new_rx_doc.insert()
+            from app.services.storage.file_upload_service import FileUploadService
+
+            async with FileUploadService.hold_owned_reference(str(ctx.target_file_id), user_id):
+                await finish_analysis_write(new_rx_doc.insert())
             ctx.rx_doc = new_rx_doc
             logger.info(f"[Claim Analysis] Saved prescription {new_rx_doc.id}")
             return str(new_rx_doc.id)
         except Exception as rx_err:
-            logger.warning(f"[Claim Analysis] Could not save prescription record: {rx_err}")
+            logger.warning(f"[Claim Analysis] Could not save prescription record: {type(rx_err).__name__}")
     return None
 
 
@@ -999,7 +1011,7 @@ async def run_single_policy_analysis(
         # nothing is known about it yet. Now that the document has been read,
         # give it its real identity so every later screen can name it.
         apply_extracted_policy_identity(policy_doc, policy_json)
-        await policy_doc.save()
+        await finish_analysis_write(policy_doc.save())
         logger.info(f"[Claim Analysis] Cached extracted text for policy {policy_doc.id}")
 
     session.policy_json = policy_json
@@ -1018,7 +1030,7 @@ async def run_single_policy_analysis(
         session.extraction_time_ms = extraction_time_ms
         session.accumulated_processing_time_ms = extraction_time_ms
         session.status = "completed"
-        await session.save()
+        await finish_analysis_write(session.save())
 
         final_report = _build_invalid_document_report(
             validation=validation,
@@ -1038,7 +1050,7 @@ async def run_single_policy_analysis(
         stored = dict(policy_doc.extracted_policy_json or {})
         stored[CONTINUITY_KEY] = policy_json[CONTINUITY_KEY]
         policy_doc.extracted_policy_json = stored
-        await policy_doc.save()
+        await finish_analysis_write(policy_doc.save())
 
     # Waiting periods run from the inception date the user declared (first start,
     # before any renewals). The user's manual inputs are authoritative and not overridden by the document.
@@ -1114,7 +1126,7 @@ async def run_single_policy_analysis(
     session.extraction_time_ms = extraction_time_ms
     session.accumulated_processing_time_ms = extraction_time_ms
     session.status = "analyzing"
-    await session.save()
+    await finish_analysis_write(session.save())
 
     return await _run_llm_analysis(
         session, policy_json, prescription_json, br_results, background_tasks, on_stage=on_stage
@@ -1130,7 +1142,7 @@ async def start_analysis_session(
 ) -> dict:
     start_time = time.time()
     log_section("Claim Analysis Started")
-    logger.info(f"[Claim Analysis] Started session for User: {user_id}")
+    logger.info(f"[Claim Analysis] Started session")
 
     session = AnalysisSession(
         user_id=user_id,
@@ -1138,7 +1150,7 @@ async def start_analysis_session(
         prescription_id=prescription_id,
         status="extracting"
     )
-    await session.insert()
+    await finish_analysis_write(session.insert())
 
     tracker = AnalysisCostTracker(session_id=str(session.id))
     set_current_cost_tracker(tracker)
@@ -1214,9 +1226,12 @@ async def start_analysis_session(
         )
 
     except Exception as e:
-        logger.error(f"[Claim Analysis] Session {session.id} failed: {e}")
+        from app.core.telemetry import record_failure
+
+        record_failure("analysis")
+        logger.error(f"[Claim Analysis] Session {session.id} failed: {type(e).__name__}")
         session.status = "failed"
-        await session.save()
+        await finish_analysis_write(session.save())
         raise e
 
 def _clarification_history(session: AnalysisSession) -> list:
@@ -1308,13 +1323,13 @@ async def _run_llm_analysis(
     llm_start_time = time.time()
     
     session.round_count += 1
-    await session.save()
+    await finish_analysis_write(session.save())
 
     # Rounds: the first analysis plus follow-up rounds of clarification answers.
     if session.round_count > 5:
         logger.warning(f"[Claim Analysis] Session {session.id} exceeded max rounds. Forcing manual review.")
         session.status = "manual_review_required"
-        await session.save()
+        await finish_analysis_write(session.save())
         return _manual_review_result(
             policy_json, prescription_json, br_results,
             "The information provided was not enough to decide automatically. This case needs manual review.",
@@ -1335,9 +1350,7 @@ async def _run_llm_analysis(
         prescription_json=prescription_json,
         clarification_history=clarification_history,
         policy_json=session.policy_json or {},
-        policy_id=session.policy_id or "",
-        # Reports "evidence_retrieval" then "coverage_analysis" from inside, so
-        # the longest part of the pipeline is not one silent block.
+        # Reports the whole-policy clause search and coverage analysis stages.
         on_stage=lambda stage: _report_stage(on_stage, stage),
     )
 
@@ -1359,7 +1372,6 @@ async def _run_llm_analysis(
             prescription_json=prescription_json,
             clarification_history=clarification_history,
             policy_json=session.policy_json or {},
-            policy_id=session.policy_id or "",
             on_stage=lambda stage: _report_stage(on_stage, stage),
             extra_instruction=DECIDE_WITH_ANSWERS_INSTRUCTION,
         )
@@ -1414,12 +1426,12 @@ async def _run_llm_analysis(
                 filtered_questions.append(q_data)
         
         audit_log.generated_questions = filtered_questions
-        await audit_log.insert()
+        await finish_analysis_write(audit_log.insert())
 
         if not filtered_questions:
             logger.warning("[Claim Analysis] LLM returned duplicate or invalid questions. Forcing manual review.")
             session.status = "manual_review_required"
-            await session.save()
+            await finish_analysis_write(session.save())
             return _manual_review_result(
                 policy_json, prescription_json, br_results,
                 "Coverage could not be decided automatically from the information provided. This case needs manual review.",
@@ -1429,7 +1441,7 @@ async def _run_llm_analysis(
         tracker = get_current_cost_tracker()
         if tracker:
             session.cost_steps = tracker.to_dict_list()
-        await session.save()
+        await finish_analysis_write(session.save())
         
         return {
             "status": "needs_clarification",
@@ -1518,7 +1530,7 @@ async def _pause_for_decisive_questions(
 
         stored_analysis = json.loads(json.dumps(analysis_data, default=str))
     except Exception as e:
-        logger.warning(f"[Claim Analysis] Could not prepare verification questions: {e}")
+        logger.warning(f"[Claim Analysis] Could not prepare verification questions: {type(e).__name__}")
         return None
 
     client_questions = [client_question(dq) for dq in questions]
@@ -1544,10 +1556,10 @@ async def _pause_for_decisive_questions(
     tracker = get_current_cost_tracker()
     if tracker:
         session.cost_steps = tracker.to_dict_list()
-    await session.save()
+    await finish_analysis_write(session.save())
 
     audit_log.generated_questions = client_questions
-    await audit_log.insert()
+    await finish_analysis_write(audit_log.insert())
 
     logger.info(
         f"[Claim Analysis] {len(client_questions)} item detail(s) need verification; asking the user before the report."
@@ -1588,7 +1600,7 @@ async def _complete_from_decisive_answers(
     )
     if unresolved:
         logger.info(f"[Clarification] No stored outcome for {unresolved}; re-running the AI analysis with the answers.")
-        await session.save()
+        await finish_analysis_write(session.save())
         return None
     analysis_data["comparison"] = resolved
 
@@ -1645,9 +1657,9 @@ async def _complete_with_report(
     await _report_stage(on_stage, "report")
     session.accumulated_processing_time_ms = total_processing_time
     session.status = "completed" if next_action == "generate_report" else "manual_review_required"
-    await session.save()
+    await finish_analysis_write(session.save())
 
-    await audit_log.insert()
+    await finish_analysis_write(audit_log.insert())
 
     final_report = generate_report(
         policy_json=policy_json,
@@ -1662,6 +1674,7 @@ async def _complete_with_report(
         return final_report
 
     report = AnalysisReport(
+        id=session.id if session.durable_job else None,
         user_id=session.user_id,
         policy_id=session.policy_id,
         prescription_id=session.prescription_id,
@@ -1671,8 +1684,6 @@ async def _complete_with_report(
         model_version="2.5-flash",
         prompt_version="1.2.0",
         rule_engine_version="2.0.0-deterministic",
-        knowledge_base_version="1.0.0",
-        dataset_version="1.0.0",
         policy_text=session.policy_text,
         prescription_text=session.prescription_text,
         policy_json=policy_json,
@@ -1686,7 +1697,6 @@ async def _complete_with_report(
         summary=final_report.get("summary"),
         comparison=final_report.get("comparison"),
         processing_time_ms=total_processing_time,
-        reference_comparison=final_report.get("referenceComparison") or {},
         policy_continuity=final_report.get("policyContinuity") or {},
         major_terms=final_report.get("majorTerms") or [],
         financial_summary=final_report.get("financialSummary") or {},
@@ -1701,7 +1711,15 @@ async def _complete_with_report(
         parent_session_id=session.parent_session_id or "",
         error_message=error_reason
     )
-    await report.insert()
+    try:
+        await finish_analysis_write(report.insert())
+    except DuplicateKeyError:
+        if not session.durable_job:
+            raise
+        existing = await AnalysisReport.get(session.id)
+        if existing is None or existing.user_id != session.user_id or existing.session_id != str(session.id):
+            raise
+        report = existing
     log_section("Claim Decision Summary")
     logger.info(f"  - Report Number:   #{report.report_number} | ID: {report.id}")
     logger.info(f"  - Decision:        {report.overall_status} ({report.decision_type})")
@@ -1718,7 +1736,7 @@ async def _complete_with_report(
         tracker.print_summary_table(doc_summary=f"End-to-End Pipeline ({report.overall_status})")
     
     session.report_id = str(report.id)
-    await session.save()
+    await finish_analysis_write(session.save())
 
     if background_tasks:
         background_tasks.add_task(
@@ -1803,9 +1821,9 @@ async def _apply_confirmed_renewal(session: AnalysisSession) -> None:
                 pol_record.cover_restart_date = None
                 if start:
                     pol_record.inception_date = datetime(start.year, start.month, start.day)
-                await pol_record.save()
+                await finish_analysis_write(pol_record.save())
         except Exception as pe:
-            logger.error(f"[Clarification] Error saving renewed policy answer: {pe}")
+            logger.error(f"[Clarification] Error saving renewed policy answer: {type(pe).__name__}")
 
 
 
@@ -1815,14 +1833,18 @@ async def resume_analysis_session(
     answers: dict,
     background_tasks: Optional[BackgroundTasks] = None,
     on_stage: Optional[Callable[[str], Awaitable[None]]] = None,
+    recovering: bool = False,
 ) -> dict:
     log_section("Clarification Session")
     logger.info(f"[Clarification] Resuming session {session_id} with {len(answers)} user answers")
     session = await AnalysisSession.get(ObjectId(session_id))
-    if not session or session.user_id != user_id:
+    if not session or session.user_id != user_id or (session.durable_job and not recovering):
         raise ValueError("Session not found or unauthorized")
 
-    if session.status not in ("waiting_for_user", "needs_clarification"):
+    allowed_statuses = ("waiting_for_user", "needs_clarification", "reanalyzing", "completed", "manual_review_required") if recovering else (
+        "waiting_for_user", "needs_clarification",
+    )
+    if session.status not in allowed_statuses:
         logger.warning(f"[Clarification] Session {session_id} has unexpected status '{session.status}'")
         raise ValueError(f"Session is not waiting for user input (current status: {session.status})")
 
@@ -1832,7 +1854,10 @@ async def resume_analysis_session(
     set_current_cost_tracker(tracker)
 
     logger.debug(f"[Clarification] Storing {len(answers)} answers for session {session_id}")
+    previously_answered = {answer.question_id for answer in session.answers} if recovering else set()
     for q_id, answer_val in answers.items():
+        if q_id in previously_answered:
+            continue
         session.answers.append(ClarificationAnswer(
             questionId=q_id,
             answer=answer_val
@@ -1891,7 +1916,7 @@ async def resume_analysis_session(
         doc_start = _as_date(pj.get("policyStartDate"))
         if not picked:
             # Unreadable: the document's start date is used.
-            logger.warning(f"[Clarification] Policy start date answer not understood: {new_start_ans!r}")
+            logger.warning(f"[Clarification] Policy start date answer not understood")
             picked = doc_start
         else:
             picked = picked.date()
@@ -1938,10 +1963,10 @@ async def resume_analysis_session(
                                 pol_record.inception_date = chosen_parsed
                             if pol_record.extracted_policy_json:
                                 pol_record.extracted_policy_json["policyStartDate"] = chosen_iso_date
-                            await pol_record.save()
+                            await finish_analysis_write(pol_record.save())
                             logger.debug(f"[Clarification] Saved resolved policy start date {chosen_parsed} to Policy {pol_record.id}")
                 except Exception as pe:
-                    logger.error(f"[Clarification] Error updating policy start date in DB: {pe}")
+                    logger.error(f"[Clarification] Error updating policy start date in DB: {type(pe).__name__}")
 
     # Renewed path answers: the first start date and "renewed without a break?" (asked
     # together after New was corrected to Renewed), and the two conflict questions.
@@ -1964,11 +1989,11 @@ async def resume_analysis_session(
                 pj["declaredInceptionDate"] = pj["inceptionDate"] = picked.isoformat()
             else:
                 # Unreadable: the default set when Renewed was confirmed stays in place.
-                logger.warning(f"[Clarification] First start date answer not understood: {first_start_ans!r}")
+                logger.warning(f"[Clarification] First start date answer not understood")
         if break_ans:
             no_break = _no_break_from_answer(break_ans)
             if no_break is None:
-                logger.warning(f"[Clarification] Renewed-without-break answer not understood: {break_ans!r}")
+                logger.warning(f"[Clarification] Renewed-without-break answer not understood")
             else:
                 pj["continuousRenewal"] = no_break
         if break_conflict_ans and "document" in break_conflict_ans:
@@ -2069,7 +2094,7 @@ async def resume_analysis_session(
     br_results = enforce_business_rules(policy_json, prescription_json, policy_text=session.policy_text)
     session.business_rules = br_results
     session.status = "reanalyzing"
-    await session.save()
+    await finish_analysis_write(session.save())
 
     # Answers to the decisive questions of a held-back analysis are applied
     # from the outcomes stored with it: no further AI call is needed.
@@ -2090,7 +2115,7 @@ async def resume_analysis_session(
                 return completed
         else:
             session.pending_analysis = {}
-            await session.save()
+            await finish_analysis_write(session.save())
 
     logger.info(f"[Claim Analysis] Re-running AI analysis for session {session_id}")
     return await _run_llm_analysis(

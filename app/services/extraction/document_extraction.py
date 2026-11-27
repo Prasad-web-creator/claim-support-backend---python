@@ -8,15 +8,7 @@ import time
 import io
 import docx
 from app.core.logging import logger
-from app.services.pdf.pdf_extractor import (
-    extract_text_from_pdf_buffer,
-    is_scanned_pdf,
-    get_pdf_page_count
-)
-from app.services.ocr.ocr_engine import (
-    extract_text_from_image_bytes,
-    extract_text_from_scanned_pdf
-)
+from app.services.ocr.ocr_engine import extract_text_from_image_bytes, extract_text_from_pdf
 
 
 def _validate_extracted_text(text: str, doc_label: str = "Document") -> bool:
@@ -32,7 +24,7 @@ def _validate_extracted_text(text: str, doc_label: str = "Document") -> bool:
     if len(text.strip()) < 50:
         logger.warning(
             f"[DocExtractor] [DEBUG] [{doc_label}] Validation Failed: Text too short "
-            f"({len(text.strip())} chars < 50 threshold). Content: '{text.strip()}'"
+            f"({len(text.strip())} chars < 50 threshold)."
         )
         return False
         
@@ -75,7 +67,7 @@ async def extract_text_from_document(
     try:
         # Route 1: Image -> OCR
         if mime_type.startswith("image/"):
-            logger.debug(f"[Document] {doc_label} route: Image -> Gemini Flash Vision OCR")
+            logger.debug(f"[Document] {doc_label} route: Image -> local Tesseract OCR")
             text = await extract_text_from_image_bytes(buffer, mime_type, doc_label=doc_label)
             
         # Route 2: DOCX -> Python-docx
@@ -84,21 +76,11 @@ async def extract_text_from_document(
             doc = docx.Document(io.BytesIO(buffer))
             text = "\n".join([p.text for p in doc.paragraphs])
             
-        # Route 3: PDF -> PyMuPDF (text-based) or Gemini Flash Vision OCR (scanned)
+        # Route 3: Read native PDF text and OCR scanned pages locally, including mixed PDFs.
         elif mime_type == "application/pdf":
-            page_count = get_pdf_page_count(buffer)
-            logger.debug(f"[Document] {doc_label} route: PDF ({page_count} pages)")
-            
-            if is_scanned_pdf(buffer):
-                logger.debug(f"[Document] {doc_label} is scanned image PDF -> Routing to Gemini Flash Vision OCR")
-                text = await extract_text_from_scanned_pdf(buffer, doc_label=doc_label)
-            else:
-                logger.debug(f"[Document] {doc_label} is native text PDF -> Fast PyMuPDF extraction")
-                text = extract_text_from_pdf_buffer(buffer)
-                if not text or len(text.strip()) < 50:
-                    logger.debug(f"[Document] PyMuPDF extracted minimal text; falling back to Gemini Vision OCR")
-                    text = await extract_text_from_scanned_pdf(buffer, doc_label=doc_label)
-                    
+            logger.debug(f"[Document] {doc_label} route: PDF -> PyMuPDF and local Tesseract OCR")
+            text = await extract_text_from_pdf(buffer)
+
         # Route 4: Fallback for plain text or unknown
         else:
             logger.debug(f"[Document] {doc_label} route: Plaintext fallback")

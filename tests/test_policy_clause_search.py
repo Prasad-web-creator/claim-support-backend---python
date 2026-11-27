@@ -4,7 +4,10 @@ clauses reach the matching Coverage Decision card, and the decisive Not Covered
 clauses become the report's major terms.
 """
 
+import pytest
+
 from app.services.analysis_interactive_orchestrator import _apply_manual_prescription_defaults
+from app.services.coverage import policy_clause_search
 from app.services.coverage.policy_clause_search import (
     _clean_result,
     attach_policy_clauses,
@@ -48,6 +51,21 @@ def test_only_quotes_found_in_policy_are_kept():
         "Maternity / Newborn Not covered under this plan",
         AI_RESULT["items"][0]["clauses"][1]["quote"],
     ]
+
+
+@pytest.mark.asyncio
+async def test_clause_search_sees_billed_items_in_uploaded_prescription(monkeypatch):
+    async def fake_extract(*, system_prompt, user_content, **kwargs):
+        assert "separate estimate lines" in system_prompt
+        assert "Room rent (3 days x Rs. 4,500)" in user_content
+        return {"extractedJson": AI_RESULT}
+
+    monkeypatch.setattr(policy_clause_search, "extract_json_with_retry", fake_extract)
+    items = await policy_clause_search.search_policy_clauses(
+        POLICY_TEXT, {"diagnosis": "Maternity"}, {}, False,
+        prescription_text="Room rent (3 days x Rs. 4,500)",
+    )
+    assert len(items[0]["clauses"]) == 2
 
 
 def test_clauses_reach_card_and_become_major_terms():

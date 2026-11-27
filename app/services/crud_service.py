@@ -3,17 +3,46 @@ Generic CRUD Service — replaces crudControllerFactory.js.
 Handles generic create, read, update, delete operations for Models.
 """
 
-from datetime import datetime
+from contextlib import nullcontext
+from datetime import datetime, timezone
 from typing import TypeVar, Type, Any
 from beanie import Document, PydanticObjectId as ObjectId
 from pydantic import BaseModel
 
+from app.core.exceptions import ConflictError, ValidationError
 from app.core.logging import logger
-from app.models.activity_log import ActivityLog
 from app.models.analysis_report import AnalysisReport
 from app.models.stored_file import StoredFile
+from app.services.storage.file_upload_service import FileUploadService
+from app.utils.file_validators import PRESCRIPTION_MIME_TYPES
 
 T = TypeVar("T", bound=Document)
+
+_PRESCRIPTION_SOURCE_FIELDS = {
+    "gridFsFileId": ("grid_fs_file_id", ""),
+    "isManual": ("is_manual", False),
+    "extractedPrescriptionText": ("extracted_prescription_text", ""),
+}
+
+
+def _prescription_source_update(values: dict, stray_keys: dict) -> list[dict]:
+    changes = {}
+    for key, (legacy, default) in _PRESCRIPTION_SOURCE_FIELDS.items():
+        if key in values:
+            current = {"$ifNull": [f"${key}", f"${legacy}", default]}
+            changes[key] = {"$ne": [current, {"$literal": values[key]}]}
+
+    set_values = {key: {"$literal": value} for key, value in values.items()}
+    any_change = {"$or": list(changes.values())}
+    if "extractedPrescriptionJson" not in values:
+        set_values["extractedPrescriptionJson"] = {"$cond": [any_change, {}, "$extractedPrescriptionJson"]}
+    if "extractedPrescriptionText" not in values:
+        set_values["extractedPrescriptionText"] = {"$cond": [any_change, "", "$extractedPrescriptionText"]}
+
+    pipeline = [{"$set": set_values}]
+    if stray_keys:
+        pipeline.append({"$project": {key: 0 for key in stray_keys}})
+    return pipeline
 
 
 class CrudService:
@@ -35,26 +64,18 @@ class CrudService:
             user_id=user_id,
             created_by=user_id
         )
-        await doc.insert()
-        
-        # Link StoredFile if applicable
         file_id = data.get("gridFsFileId") or data.get("grid_fs_file_id")
-        if file_id:
-            from app.models.stored_file import StoredFile
-            try:
-                sf = await StoredFile.get(ObjectId(file_id))
-                if sf:
-                    sf.document_id = str(doc.id)
-                    await sf.save()
-            except Exception:
-                pass
-        
-        await ActivityLog(
-            user_id=user_id,
-            action=f"You uploaded the {self.entity_name.lower()}",
-            entity_type=self.entity_name,
-            entity_id=str(doc.id)
-        ).insert()
+        if self.entity_name == "Prescription":
+            if file_id and data.get("isManual"):
+                raise ValidationError("Choose one prescription input method.")
+            if data.get("extractedPrescriptionText") and not data.get("isManual"):
+                raise ValidationError("Only typed prescriptions can supply prescription text.")
+        reference = FileUploadService.hold_owned_reference(file_id, user_id) if file_id else nullcontext()
+        async with reference as stored_file:
+            self._validate_prescription_file(stored_file)
+            await doc.insert()
+            if stored_file:
+                await self._link_file(stored_file, doc)
         
         return doc
 
@@ -77,6 +98,8 @@ class CrudService:
             doc = await self.get_by_id(user_id, doc_id)
         except Exception:
             return None
+        if doc is None:
+            return None
             
         # A raw $set must use the key Mongo stores, which is the field's alias
         # (e.g. "inceptionDate"), never the Python name ("inception_date"): a value
@@ -95,23 +118,58 @@ class CrudService:
                 stray_keys[field_name] = ""
         if "updated_by" in fields_dict:
             update_data[fields_dict["updated_by"].alias or "updated_by"] = user_id
+        if "updated_at" in fields_dict:
+            update_data[fields_dict["updated_at"].alias or "updated_at"] = datetime.now(timezone.utc)
 
         update_ops = {"$set": update_data}
         if stray_keys:
             update_ops["$unset"] = stray_keys
-        await doc.update(update_ops)
-        
-        await ActivityLog(
-            user_id=user_id,
-            action=f"Updated {self.entity_name}",
-            entity_type=self.entity_name,
-            entity_id=str(doc.id)
-        ).insert()
+        file_id = update_data.get("gridFsFileId")
+        effective_file = update_data.get("gridFsFileId", getattr(doc, "grid_fs_file_id", None))
+        if self.entity_name == "Prescription":
+            is_manual = update_data.get("isManual", doc.is_manual)
+            if effective_file and is_manual:
+                raise ValidationError("Choose one prescription input method.")
+            if update_data.get("extractedPrescriptionText") and not is_manual:
+                raise ValidationError("Only typed prescriptions can supply prescription text.")
+        reference = FileUploadService.hold_owned_reference(file_id, user_id) if file_id else nullcontext()
+        async with reference as stored_file:
+            if file_id != getattr(doc, "grid_fs_file_id", None):
+                self._validate_prescription_file(stored_file)
+            if self.entity_name == "Prescription" and _PRESCRIPTION_SOURCE_FIELDS.keys() & update_data.keys():
+                # Compare with the committed source and invalidate atomically.
+                result = await self.model.get_motor_collection().update_one(
+                    {"_id": doc.id, "userId": user_id}, _prescription_source_update(update_data, stray_keys),
+                )
+                if not result.matched_count:
+                    return None
+            elif self.entity_name == "Policy" and "gridFsFileId" in update_data and file_id != doc.grid_fs_file_id:
+                cleared = {"extractedPolicyText": "", "extractedPolicyJson": {}}
+                result = await self.model.get_motor_collection().update_one(
+                    {"_id": doc.id, "userId": user_id, "gridFsFileId": doc.grid_fs_file_id or {"$in": ["", None]}},
+                    {**update_ops, "$set": {**update_data, **cleared}},
+                )
+                if not result.matched_count:
+                    raise ConflictError("The policy document changed. Reload the policy and try again.")
+            else:
+                await doc.update(update_ops)
+            if stored_file:
+                await self._link_file(stored_file, doc)
         
         # Fetch fresh doc
         return await self.get_by_id(user_id, doc_id)
 
-    async def delete(self, user_id: str, doc_id: str) -> bool:
+    @staticmethod
+    async def _link_file(stored_file: StoredFile, doc: T) -> None:
+        await StoredFile.get_motor_collection().update_one(
+            {"_id": stored_file.id}, {"$set": {"documentId": str(doc.id)}},
+        )
+
+    def _validate_prescription_file(self, stored_file: StoredFile | None) -> None:
+        if self.entity_name == "Prescription" and stored_file and stored_file.mime_type not in PRESCRIPTION_MIME_TYPES:
+            raise ValidationError("Upload a prescription as PDF, JPG or PNG.")
+
+    async def delete(self, user_id: str, doc_id: str, *, older_than: datetime | None = None) -> bool:
         """Soft delete a document, or hard delete if no soft delete field."""
         try:
             doc = await self.model.find_one(
@@ -123,7 +181,14 @@ class CrudService:
         if not doc:
             return False
             
-        await doc.delete()
+        if older_than:
+            result = await self.model.get_motor_collection().delete_one(
+                {"_id": doc.id, "userId": user_id, "updatedAt": {"$lt": older_than}}
+            )
+            if not result.deleted_count:
+                return False
+        else:
+            await doc.delete()
         
         # Cascade Hard Deletes
         if self.entity_name in ["Policy", "Prescription"]:
@@ -133,8 +198,6 @@ class CrudService:
             # Delete associated files from GridFS AND metadata. delete_file keeps
             # any file another policy/prescription still uses (uploads are
             # de-duplicated by content, so one file can back several records).
-            from app.services.storage.file_upload_service import FileUploadService
-
             candidate_ids = set()
             for sf in await StoredFile.find(
                 StoredFile.document_id == str(doc.id),
@@ -150,13 +213,6 @@ class CrudService:
                 except Exception:
                     pass
             
-        await ActivityLog(
-            user_id=user_id,
-            action=f"Permanently deleted {self.entity_name}",
-            entity_type=self.entity_name,
-            entity_id=str(doc.id)
-        ).insert()
-        
         return True
 
     async def delete_batch(self, user_id: str, doc_ids: list[str]) -> dict:

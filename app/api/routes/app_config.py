@@ -16,4 +16,11 @@ router = APIRouter(tags=["App Config"])
 async def get_app_config() -> dict:
     return {
         "supportEmail": settings.SUPPORT_EMAIL.strip() or None,
+        "maxFileSizeMb": settings.MAX_FILE_SIZE_MB,
+        "maxFileSizeBytes": settings.max_file_size_bytes,
+        "maxPoliciesPerAnalysis": settings.MAX_POLICIES_PER_ANALYSIS,
+        "googleClientId": settings.GOOGLE_CLIENT_ID.strip() or None,
+        "emailOtpEnabled": settings.EMAIL_OTP_PROVIDER != "disabled",
+        "otpLength": settings.OTP_LENGTH,
+        "analysisAgreementVersion": settings.ANALYSIS_AGREEMENT_VERSION,
     }

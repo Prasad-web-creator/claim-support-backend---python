@@ -8,6 +8,7 @@ from typing import Optional, Literal
 
 from beanie import Document, Indexed
 from pydantic import Field
+from pymongo import ASCENDING, IndexModel
 
 DOCUMENT_TYPES = Literal[
     "policy",
@@ -42,6 +43,7 @@ class StoredFile(Document):
     # ─── File Properties ──────────────────────────────────────────────────────
     mime_type: str = Field(alias="mimeType")
     file_size: int = Field(alias="fileSize")
+    stored_size: int | None = Field(default=None, alias="storedSize")
     sha256_hash: str = Field(alias="sha256Hash")
 
     # ─── Processing State ─────────────────────────────────────────────────────
@@ -62,6 +64,7 @@ class StoredFile(Document):
     class Settings:
         name = "storedfiles"
         use_state_management = True
+        indexes = [IndexModel([("sha256Hash", ASCENDING)]), IndexModel([("storageKey", ASCENDING)])]
 
     class Config:
         populate_by_name = True

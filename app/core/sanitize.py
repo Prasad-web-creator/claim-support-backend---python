@@ -1,6 +1,6 @@
 """Null-sanitising shared by the analysis document models.
 
-Persisted payloads (prescriptionJson, policyJson, referenceComparison, ...) come
+Persisted payloads (prescriptionJson, policyJson, ...) come
 straight from LLM extraction, so any field may arrive as None. The models
 replace those nulls with empty values rather than storing null, which keeps
 clients from having to null-check every field.
@@ -25,9 +25,6 @@ LIST_VALUED_KEYS = frozenset({
     "coveredTreatments", "excludedTreatments", "specialConditions",
     "waitingPeriods", "subLimits", "coPaymentRules", "riders", "coverages",
     "exclusions",
-    # referenceComparison
-    "featureComparisons", "detectedWaitingConditions",
-    "detectedPermanentExclusions", "actionableTakeaways",
     # report / session level
     "comparison", "policyClausesUsed", "prescriptionEvidence",
     "clarificationAnswersUsed", "errors", "questions", "options",

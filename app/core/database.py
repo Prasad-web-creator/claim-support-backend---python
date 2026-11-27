@@ -37,45 +37,19 @@ async def connect_to_mongodb() -> None:
         client_kwargs["tlsCAFile"] = certifi.where()
     _client = AsyncIOMotorClient(settings.MONGODB_URI, **client_kwargs)
 
-    # Get the database from the URI (defaults to 'claimsupport')
-    try:
-        db = _client.get_default_database(default="claimsupport")
-    except Exception:
-        db = _client["claimsupport"]
+    db = get_database()
 
     # Import all document models for Beanie initialization
     from app.models.user import User
     from app.models.policy import Policy
     from app.models.prescription import Prescription
     from app.models.analysis_report import AnalysisReport
-    from app.models.activity_log import ActivityLog
     from app.models.counter import Counter
     from app.models.stored_file import StoredFile
     from app.models.analysis_session import AnalysisSession
     from app.models.analysis_audit_log import AnalysisAuditLog
-    from app.models.knowledge_base import (
-        InsuranceCompany,
-        InsuranceProduct,
-        ProductVariant,
-        PolicyVersion,
-        PolicyClause,
-        CoverageRule,
-        PolicyEvidence,
-    )
     from app.models.multi_policy_session import MultiPolicyAnalysisSession
-    from app.models.rag_chunk import PolicyChunk
     from app.models.otp import OtpCode
-    from app.models.expert_review import (
-        ClaimCase,
-        ClaimAnalysisVersion,
-        ExpertReview,
-        ExpertCorrection,
-        ApprovedExpertCase,
-    )
-    from app.models.dataset_tuning import (
-        DatasetManifest,
-        EvaluationRun,
-    )
 
     await init_beanie(
         database=db,
@@ -85,27 +59,11 @@ async def connect_to_mongodb() -> None:
             Policy,
             Prescription,
             AnalysisReport,
-            ActivityLog,
             Counter,
             StoredFile,
             AnalysisSession,
             MultiPolicyAnalysisSession,
             AnalysisAuditLog,
-            InsuranceCompany,
-            InsuranceProduct,
-            ProductVariant,
-            PolicyVersion,
-            PolicyClause,
-            CoverageRule,
-            PolicyEvidence,
-            PolicyChunk,
-            ClaimCase,
-            ClaimAnalysisVersion,
-            ExpertReview,
-            ExpertCorrection,
-            ApprovedExpertCase,
-            DatasetManifest,
-            EvaluationRun,
         ],
     )
 
@@ -144,10 +102,10 @@ def get_database():
     """Get the Motor database instance."""
     if _client is None:
         raise RuntimeError("MongoDB is not connected. Call connect_to_mongodb() first.")
-    db = _client.get_default_database()
-    if db is None:
-        db = _client["claimsupport"]
-    return db
+    database_name = get_settings().MONGODB_DATABASE
+    if database_name:
+        return _client[database_name]
+    return _client.get_default_database(default="claimsupport")
 
 
 def get_gridfs_bucket() -> AsyncIOMotorGridFSBucket:

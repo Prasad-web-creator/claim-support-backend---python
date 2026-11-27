@@ -1,66 +1,55 @@
-"""
-Upload routes — migrated from uploadController.js.
-"""
+"""Authenticated GridFS uploads and downloads."""
 
-import math
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+import asyncio
+
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
-from app.middleware.auth import get_current_user
-from app.middleware.upload_validation import validate_upload
-from app.services.storage.file_upload_service import FileUploadService
-from app.utils.file_validators import detect_mime_from_magic_bytes
 from app.core.config import get_settings
+from app.middleware.auth import get_current_user
+from app.middleware.upload_validation import LimitedUploadRoute, size_error, validate_upload
 from app.schemas.upload import UploadResponse
-from app.models.stored_file import StoredFile
+from app.services.pdf.pdf_extractor import is_scanned_pdf
+from app.services.storage.file_upload_service import FileUploadService
+from app.utils.file_validators import PRESCRIPTION_MIME_TYPES, detect_mime_from_magic_bytes
 
-router = APIRouter(prefix="/upload", tags=["Upload"])
+router = APIRouter(prefix="/upload", tags=["Upload"], route_class=LimitedUploadRoute)
+_upload_workers = asyncio.Semaphore(2)
 
 
 @router.post("", response_model=UploadResponse)
 async def upload_file(
     file: UploadFile = Depends(validate_upload),
     documentType: str = Form("claim-document"),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    """Upload a file to GridFS."""
+    """Validate and store a document."""
     settings = get_settings()
-    
-    # Read file buffer
-    buffer = await file.read()
-    
-    # Validate size
-    if len(buffer) > settings.max_file_size_bytes:
-        raise HTTPException(status_code=400, detail=f"File exceeds maximum size of {settings.MAX_FILE_SIZE_MB}MB")
-        
-    # Validate magic bytes
-    actual_mime = detect_mime_from_magic_bytes(buffer)
-    if not actual_mime:
-        raise HTTPException(status_code=400, detail="Could not determine true file type. Possible spoofing.")
-        
-    if actual_mime not in settings.allowed_mime_types_list:
-         raise HTTPException(status_code=400, detail="File content does not match allowed types.")
-         
-    # Detect if image-based (scanned PDF or image)
-    is_image_based = False
-    if actual_mime.startswith("image/"):
-        is_image_based = True
-    elif actual_mime == "application/pdf":
-        try:
-            from app.services.pdf.pdf_extractor import is_scanned_pdf
-            is_image_based = is_scanned_pdf(buffer)
-        except Exception:
-            is_image_based = False
+    async with _upload_workers:
+        buffer = await file.read(settings.max_file_size_bytes + 1)
+        if len(buffer) > settings.max_file_size_bytes:
+            raise HTTPException(status_code=413, detail=size_error())
+        actual_mime = detect_mime_from_magic_bytes(buffer)
+        if actual_mime not in settings.allowed_mime_types_list:
+            raise HTTPException(status_code=400, detail="File content does not match an allowed file type.")
+        if documentType == "prescription" and actual_mime not in PRESCRIPTION_MIME_TYPES:
+            raise HTTPException(status_code=422, detail="Upload a prescription as PDF, JPG or PNG.")
 
-    # Upload
-    result = await FileUploadService.upload_file(
-        buffer=buffer,
-        original_filename=file.filename,
-        mime_type=actual_mime,
-        document_type=documentType,
-        user_id=current_user["id"]
-    )
-    
+        is_image_based = actual_mime.startswith("image/")
+        if actual_mime == "application/pdf":
+            try:
+                is_image_based = await run_in_threadpool(is_scanned_pdf, buffer)
+            except (RuntimeError, ValueError):
+                raise HTTPException(status_code=422, detail="This PDF could not be opened.") from None
+
+        result = await FileUploadService.upload_file(
+            buffer=buffer,
+            original_filename=file.filename,
+            mime_type=actual_mime,
+            document_type=documentType,
+            user_id=current_user["id"],
+        )
     return UploadResponse(
         message="File uploaded successfully",
         fileId=result["storedFileId"],
@@ -68,35 +57,24 @@ async def upload_file(
         originalName=file.filename,
         contentType=actual_mime,
         size=len(buffer),
-        isImageBased=is_image_based
+        isImageBased=is_image_based,
     )
+
 
 @router.get("/{file_id}")
 async def stream_file(file_id: str, current_user: dict = Depends(get_current_user)):
-    """Stream a file from GridFS."""
-    from beanie import PydanticObjectId as ObjectId
-    
+    stored_file = await FileUploadService.get_owned_file(file_id, current_user["id"])
     try:
-        stored_file = await StoredFile.get(ObjectId(file_id))
-        if not stored_file or stored_file.is_deleted or stored_file.user_id != current_user["id"]:
-            raise HTTPException(status_code=404, detail="File not found")
-            
-        stream_generator = await FileUploadService.get_file_stream(stored_file.storage_key)
-        return StreamingResponse(stream_generator, media_type=stored_file.mime_type)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="File content not found in storage")
-    except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(status_code=500, detail=str(e))
+        stream = await FileUploadService.get_file_stream(stored_file.storage_key)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="File content not found in storage") from exc
+    return StreamingResponse(
+        stream, media_type=stored_file.mime_type,
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
 
 @router.delete("/{file_id}")
 async def delete_file(file_id: str, current_user: dict = Depends(get_current_user)):
-    """Delete a file from GridFS (rollback support)."""
-    try:
-        await FileUploadService.delete_file(file_id, current_user["id"])
-        return {"success": True, "message": "File deleted"}
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    await FileUploadService.delete_file(file_id, current_user["id"])
+    return {"success": True, "message": "File deleted"}

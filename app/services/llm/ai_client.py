@@ -1,7 +1,4 @@
-"""
-AI Client — migrated from aiClient.js and multimodalAiClient.js.
-Provider-agnostic LLM client using Google Gemini. All Groq code removed.
-"""
+"""Google Gemini client for structured AI analysis."""
 
 import asyncio
 import json
@@ -9,7 +6,7 @@ import re
 import time
 import random
 import contextvars
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional, List
 
 from google import genai
@@ -27,8 +24,6 @@ PRICING_TABLE = {
     "pro": {"input": 1.25, "output": 5.00},          # gemini-pro
 }
 
-
-import contextvars
 
 _current_cost_tracker: contextvars.ContextVar[Optional["AnalysisCostTracker"]] = contextvars.ContextVar(
     "_current_cost_tracker", default=None
@@ -197,11 +192,11 @@ _llm_semaphore: Optional[asyncio.Semaphore] = None
 
 def get_ai_client() -> genai.Client:
     global _global_client
+    api_key = get_settings().GEMINI_API_KEY.strip()
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is required for Gemini analysis.")
     if _global_client is None:
-        settings = get_settings()
-        if not settings.GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY is not defined in environment variables.")
-        _global_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        _global_client = genai.Client(api_key=api_key)
     return _global_client
 
 
@@ -217,6 +212,14 @@ def get_llm_semaphore() -> asyncio.Semaphore:
     if _llm_semaphore is None:
         _llm_semaphore = asyncio.Semaphore(get_settings().AI_MAX_CONCURRENT_REQUESTS)
     return _llm_semaphore
+
+
+async def _back_off(attempt: int, error: Exception) -> None:
+    delay_ms = 2**attempt * 1000 + random.random() * 1000
+    if "429" in str(error) or "503" in str(error):
+        delay_ms = max(delay_ms, 8000)
+    logger.warning(f"[AI Client] Backing off for {int(delay_ms)}ms...")
+    await asyncio.sleep(delay_ms / 1000)
 
 
 async def extract_json_with_retry(
@@ -243,8 +246,7 @@ async def extract_json_with_retry(
         model_name = settings.AI_MODEL
 
     start_time = time.time()
-    retry_count = 0
-    max_retries = 6  # Increased to handle transient 503 surges
+    max_attempts = settings.AI_MAX_ATTEMPTS
 
     # Enforce "JSON" in prompt to help guide the model
     enforced_prompt = system_prompt
@@ -254,7 +256,7 @@ async def extract_json_with_retry(
     client = get_ai_client()
     last_error: Exception | None = None
 
-    while retry_count <= max_retries:
+    for retry_count in range(max_attempts):
         try:
             current_prompt = enforced_prompt
             if retry_count > 0:
@@ -329,248 +331,11 @@ async def extract_json_with_retry(
 
         except Exception as error:
             last_error = error
-            retry_count += 1
-            logger.error(f"[AI Client] Attempt {retry_count} failed: {type(error).__name__}: {error}")
-
-            if retry_count <= max_retries:
-                # Exponential backoff with jitter
-                delay_ms = (2**retry_count * 1000) + (random.random() * 1000)
-
-                # Extended backoff for rate limit (429) and service unavailable (503)
-                if "429" in str(error) or "503" in str(error):
-                    delay_ms = max(delay_ms, 8000)
-
-                logger.warning(f"[AI Client] Backing off for {int(delay_ms)}ms...")
-                await asyncio.sleep(delay_ms / 1000)
+            attempt = retry_count + 1
+            logger.error(f"[AI Client] Attempt {attempt}/{max_attempts} failed: {type(error).__name__}: {error}")
+            if attempt < max_attempts:
+                await _back_off(attempt, error)
 
     raise ValueError(
-        f"Extraction failed after {max_retries} retries. Last error: {last_error}"
+        f"Extraction failed after {max_attempts} attempts. Last error: {last_error}"
     )
-
-
-async def extract_json_multimodal(
-    system_prompt: str,
-    text_content: str = "",
-    inline_parts: list[dict] | None = None,
-    model_name: str | None = None,
-    max_tokens: int = 8192,
-    operation_name: str = "Multimodal AI JSON Extraction",
-) -> dict:
-    """
-    Sends a multimodal request to Gemini supporting inline binary data (images, PDFs).
-
-    Args:
-        system_prompt: System instruction text
-        text_content: Additional text to include in the user turn
-        inline_parts: List of {"mimeType": str, "data": bytes} dicts
-        model_name: Gemini model to use
-        max_tokens: Maximum output tokens
-
-    Returns:
-        Same structure as extract_json_with_retry
-    """
-    settings = get_settings()
-    if model_name is None:
-        model_name = settings.AI_VISION_MODEL or settings.AI_MODEL
-
-    if inline_parts is None:
-        inline_parts = []
-
-    start_time = time.time()
-    retry_count = 0
-    max_retries = 6  # Increased to handle transient 503 surges
-
-    enforced_prompt = system_prompt
-    if "json" not in enforced_prompt.lower():
-        enforced_prompt += "\n\nYou MUST return your answer in valid JSON format."
-
-    client = get_ai_client()
-    last_error: Exception | None = None
-
-    while retry_count <= max_retries:
-        try:
-            current_prompt = enforced_prompt
-            if retry_count > 0:
-                current_prompt += "\n\nCRITICAL RETRY INSTRUCTION: Your previous response was invalid. Return ONLY valid JSON. No markdown, no explanations."
-                if last_error:
-                    current_prompt += f"\n\nThe parser failed with this error: {last_error}. Fix the JSON structure."
-
-            # Build content parts
-            contents = []
-            for part in inline_parts:
-                import base64
-                contents.append(
-                    types.Part.from_bytes(
-                        data=part["data"],
-                        mime_type=part["mimeType"],
-                    )
-                )
-
-            if text_content and text_content.strip():
-                contents.append(types.Part.from_text(text=text_content))
-
-            async with get_llm_semaphore():
-                response = await asyncio.wait_for(
-                    client.aio.models.generate_content(
-                        model=model_name,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            system_instruction=current_prompt,
-                            response_mime_type="application/json",
-                            temperature=0.1,
-                            max_output_tokens=max_tokens,
-                        ),
-                    ),
-                    timeout=180.0,
-                )
-
-            content = response.text
-            usage = response.usage_metadata
-
-            prompt_toks = getattr(usage, "prompt_token_count", 0) if usage else 0
-            comp_toks = getattr(usage, "candidates_token_count", 0) if usage else 0
-            total_toks = getattr(usage, "total_token_count", 0) if usage else 0
-            cost_info = calculate_gemini_cost(prompt_toks, comp_toks, model_name=model_name)
-
-            tracker = get_current_cost_tracker()
-            if tracker:
-                tracker.record_step(
-                    operation=operation_name,
-                    input_tokens=prompt_toks,
-                    output_tokens=comp_toks,
-                    cost_usd=cost_info["costUsd"],
-                    cost_inr=cost_info["costInr"],
-                    engine=model_name or "Gemini",
-                )
-
-            extracted_json = parse_ai_json_response(content)
-            processing_time_ms = int((time.time() - start_time) * 1000)
-            logger.info(
-                f"[AI] {operation_name} completed in {processing_time_ms}ms ({total_toks} tokens)"
-            )
-
-            return {
-                "extractedJson": extracted_json,
-                "tokens": {
-                    "promptTokens": prompt_toks,
-                    "completionTokens": comp_toks,
-                    "totalTokens": total_toks,
-                    "costUsd": cost_info["costUsd"],
-                    "costInr": cost_info["costInr"],
-                },
-                "retryCount": retry_count,
-                "processingTimeMs": processing_time_ms,
-            }
-
-        except Exception as error:
-            last_error = error
-            logger.error(f"[MultimodalAI] Attempt {retry_count + 1} failed: {type(error).__name__}: {error}")
-            retry_count += 1
-
-            if retry_count <= max_retries:
-                delay_ms = (2**retry_count * 1000) + (random.random() * 1000)
-                # Extended backoff for rate limit (429) and service unavailable (503)
-                if "429" in str(error) or "503" in str(error):
-                    delay_ms = max(delay_ms, 8000)
-
-                logger.warning(f"[MultimodalAI] Backing off for {int(delay_ms)}ms...")
-                await asyncio.sleep(delay_ms / 1000)
-
-    raise ValueError(
-        f"Multimodal extraction failed after {max_retries} retries. Last error: {last_error}"
-    )
-
-
-async def extract_text_multimodal(
-    system_prompt: str,
-    text_content: str = "",
-    inline_parts: list[dict] | None = None,
-    model_name: str | None = None,
-    max_tokens: int = 32768,
-    operation_name: str = "Gemini Vision OCR",
-) -> str:
-    """
-    Direct multimodal text generation from Gemini (supports images, PDFs).
-    Returns raw transcribed text directly without JSON parsing overhead.
-    """
-    settings = get_settings()
-    if model_name is None:
-        model_name = settings.AI_VISION_MODEL or settings.AI_MODEL
-
-    if inline_parts is None:
-        inline_parts = []
-
-    retry_count = 0
-    max_retries = 3
-
-    client = get_ai_client()
-    last_error: Exception | None = None
-
-    while retry_count <= max_retries:
-        try:
-            contents = []
-            for part in inline_parts:
-                contents.append(
-                    types.Part.from_bytes(
-                        data=part["data"],
-                        mime_type=part["mimeType"],
-                    )
-                )
-
-            if text_content and text_content.strip():
-                contents.append(types.Part.from_text(text=text_content))
-
-            async with get_llm_semaphore():
-                response = await asyncio.wait_for(
-                    client.aio.models.generate_content(
-                        model=model_name,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_prompt,
-                            temperature=0.1,
-                            max_output_tokens=max_tokens,
-                        ),
-                    ),
-                    timeout=180.0,
-                )
-
-            usage = response.usage_metadata
-
-            prompt_toks = getattr(usage, "prompt_token_count", 0) if usage else 0
-            comp_toks = getattr(usage, "candidates_token_count", 0) if usage else 0
-            cost_info = calculate_gemini_cost(prompt_toks, comp_toks, model_name=model_name)
-
-            tracker = get_current_cost_tracker()
-            if tracker:
-                tracker.record_step(
-                    operation=operation_name,
-                    input_tokens=prompt_toks,
-                    output_tokens=comp_toks,
-                    cost_usd=cost_info["costUsd"],
-                    cost_inr=cost_info["costInr"],
-                    engine=model_name or "Gemini",
-                )
-
-            logger.info(
-                f"[AI OCR] {operation_name} completed ({prompt_toks + comp_toks} tokens)"
-            )
-            text = response.text or ""
-            return text.strip()
-
-        except Exception as error:
-            last_error = error
-            logger.error(f"[MultimodalTextAI] Attempt {retry_count + 1} failed: {type(error).__name__}: {error}")
-            retry_count += 1
-
-            if retry_count <= max_retries:
-                delay_ms = (2**retry_count * 1000) + (random.random() * 1000)
-                if "429" in str(error) or "503" in str(error):
-                    delay_ms = max(delay_ms, 6000)
-
-                logger.warning(f"[MultimodalTextAI] Backing off for {int(delay_ms)}ms...")
-                await asyncio.sleep(delay_ms / 1000)
-
-    raise ValueError(
-        f"Multimodal text extraction failed after {max_retries} retries. Last error: {last_error}"
-    )
-

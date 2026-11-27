@@ -3,10 +3,13 @@ FastAPI application entry point.
 Replaces server.js and app.js.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from slowapi import _rate_limit_exceeded_handler
 
@@ -14,7 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import get_settings
-from app.core.database import connect_to_mongodb, close_mongodb_connection
+from app.core.database import connect_to_mongodb, close_mongodb_connection, get_database
 from app.core.exceptions import (
     AppError,
     app_error_handler,
@@ -23,69 +26,54 @@ from app.core.exceptions import (
     generic_exception_handler,
 )
 from app.core.logging import logger
+from app.core.telemetry import configure_telemetry, record_failure
 from app.middleware.request_id import RequestIdMiddleware
 from app.middleware.rate_limiter import limiter
 from app.api.router import api_router
 
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from datetime import timezone as dt_timezone
-
-from app.models.activity_log import ActivityLog
-from app.models.analysis_audit_log import AnalysisAuditLog
-from app.models.analysis_report import AnalysisReport
-from app.models.analysis_session import AnalysisSession
-from app.models.policy import Policy
-from app.models.prescription import Prescription
-from app.models.stored_file import StoredFile
-from app.models.multi_policy_session import MultiPolicyAnalysisSession
-
-from app.services.ttl_service import ensure_ttl_indexes
-from app.services.cleanup_service import run_cleanup
-
-scheduler = AsyncIOScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle events: startup and shutdown."""
     settings = get_settings()
-    
+    app.state.ready = False
+    if not settings.GEMINI_API_KEY.strip():
+        raise RuntimeError("GEMINI_API_KEY is required to start the API.")
+
     # Startup
     logger.info(f"Starting Claim Support API in {settings.ENVIRONMENT} mode")
-    logger.info(f"Data retention enabled: {settings.DATA_CLEANUP_DAYS} days ({settings.ttl_seconds} seconds)")
+    configure_telemetry(settings)
     await connect_to_mongodb()
-    
-    # Initialize / Seed Knowledge Base if needed
+    scheduler = AsyncIOScheduler()
+    worker = None
     try:
-        from app.services.knowledge_base.policy_knowledge_service import PolicyKnowledgeService
-        await PolicyKnowledgeService.seed_knowledge_base()
-    except Exception as e:
-        logger.warning(f"Knowledge Base initialization notice: {e}")
-    
-    # Ensure TTL Indexes on all non-permanent models
-    models = [
-        Policy, Prescription, AnalysisReport, AnalysisSession, 
-        MultiPolicyAnalysisSession, AnalysisAuditLog, ActivityLog, StoredFile
-    ]
-    await ensure_ttl_indexes(models)
-    
-    # Start Background Cleanup Scheduler (UTC Midnight)
-    scheduler.add_job(
-        run_cleanup, 
-        CronTrigger(hour=0, minute=0, timezone=dt_timezone.utc), 
-        id="daily_cleanup", 
-        replace_existing=True
-    )
-    scheduler.start()
-    logger.info("Started background APScheduler for daily GridFS cleanup (UTC 00:00).")
-    
-    yield
-    
-    # Shutdown
-    logger.info("Shutting down...")
-    scheduler.shutdown()
-    await close_mongodb_connection()
+        from app.services.analysis_jobs import (
+            initialize_analysis_jobs, start_analysis_job_worker, stop_analysis_job_worker,
+        )
+        from app.services.maintenance import run_due_maintenance
+
+        await initialize_analysis_jobs()
+        worker = start_analysis_job_worker()
+        app.state.analysis_worker = worker
+        if settings.ORPHAN_CLEANUP_ENABLED or settings.STORAGE_MONITOR_ENABLED or settings.DOCUMENT_RETENTION_DAYS:
+            scheduler.add_job(
+                run_due_maintenance,
+                "interval",
+                minutes=settings.MAINTENANCE_CHECK_INTERVAL_MINUTES,
+                next_run_time=datetime.now(timezone.utc) + timedelta(seconds=10),
+            )
+            scheduler.start()
+        app.state.ready = True
+        yield
+    finally:
+        app.state.ready = False
+        if scheduler.running:
+            scheduler.shutdown()
+        if worker is not None:
+            await stop_analysis_job_worker(worker)
+        await close_mongodb_connection()
 
 
 def create_app() -> FastAPI:
@@ -95,11 +83,21 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Claim Support API",
         version="2.0.0",
-        description="AI-powered medical insurance claim analysis",
+        description="Medical insurance claim analysis",
         lifespan=lifespan,
         docs_url="/api/docs" if not settings.is_production else None,
         redoc_url="/api/redoc" if not settings.is_production else None,
     )
+
+    @app.middleware("http")
+    async def report_operation_failure(request, call_next):
+        response = await call_next(request)
+        route = getattr(request.scope.get("route"), "path", "")
+        if route.startswith("/api/auth/") and response.status_code >= 400:
+            record_failure("authentication")
+        elif route.startswith("/api/analysis/") and response.status_code >= 500:
+            record_failure("analysis")
+        return response
     
     # ─── Middleware ──────────────────────────────────────────────────────────
     
@@ -140,7 +138,24 @@ def create_app() -> FastAPI:
             "status": "healthy",
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-        
+
+    @app.get("/ready", tags=["Health"])
+    async def readiness_check():
+        database_ready = False
+        worker = getattr(app.state, "analysis_worker", None)
+        if getattr(app.state, "ready", False) and worker is not None and not worker.done():
+            try:
+                await asyncio.wait_for(get_database().command("ping"), timeout=3)
+                database_ready = True
+            except Exception:
+                pass
+        model_configured = bool(settings.GEMINI_API_KEY.strip())
+        ready = database_ready and model_configured
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"ready": ready, "database": database_ready, "model": model_configured},
+        )
+
     return app
 
 

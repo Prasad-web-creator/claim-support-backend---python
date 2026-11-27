@@ -1,13 +1,10 @@
-"""Coverage decisions and report card formatting."""
+import json
 
-from app.core.config import get_settings
 from app.core.logging import logger
-from app.services.coverage.gemini_triage import triage_unresolved
-from app.services.coverage.policy_evidence import policy_chunks, ranked_clauses
-from app.services.coverage.verification import NEEDS_VERIFICATION
-from app.services.rule_engine.adjudication import claim_items, decide_items
-from app.services.rule_engine.catalog import load_catalog
+from app.services.llm.ai_client import extract_json_with_retry
 
+from app.services.coverage.coverage_prompt import COVERAGE_ANALYSIS_SYSTEM_PROMPT
+from app.services.coverage.verification import NEEDS_VERIFICATION
 
 async def analyze_coverage(
     policy_text: str,
@@ -16,83 +13,450 @@ async def analyze_coverage(
     prescription_json: dict,
     clarification_history: list = None,
     policy_json: dict = None,
-    policy_id: str = None,
     on_stage=None,
     extra_instruction: str = "",
 ) -> dict:
-    """Apply reviewed rules and return the existing interactive analysis contract."""
-    async def stage(name: str) -> None:
-        if on_stage is not None:
-            try:
-                await on_stage(name)
-            except Exception:
-                logger.warning("[Coverage] Progress update failed for stage {}", name)
+    """`on_stage`, when given, is awaited as each real phase of this analysis
+    begins, so callers can report progress that matches the work done."""
+    logger.info("[AI Analysis] Evaluating coverage and generating explanation with Gemini...")
 
-    policy = policy_json or {}
-    prescription = prescription_json or {}
-    checks = business_rule_results or {}
-    if policy and prescription and not checks:
-        from app.services.coverage.business_rules import enforce_business_rules
+    async def _stage(name: str) -> None:
+        # Progress reporting must never be able to break an analysis.
+        if on_stage is None:
+            return
+        try:
+            await on_stage(name)
+        except Exception as stage_err:
+            logger.warning(f"[AI Analysis] Progress callback failed at '{name}': {stage_err}")
 
-        checks = enforce_business_rules(policy, prescription, policy_text=policy_text)
+    from datetime import datetime
+    today_str = datetime.now().strftime("%Y-%m-%d")
 
-    await stage("evidence_retrieval")
-    catalog = load_catalog()
-    items = claim_items(prescription)
-    settings = get_settings()
-    evidence = ranked_clauses(
-        policy_chunks(policy_text, policy, policy_id or ""),
-        (item["item"] for item in items),
-        settings.RAG_TOP_K,
+    # Determine prescription source so the LLM applies the correct validation path
+    is_manual_prescription = bool(
+        prescription_json and (
+            prescription_json.get("isManual")
+            or prescription_json.get("prescriptionSource") == "Self-entered Prescription"
+            or prescription_json.get("manualText")
+        )
+    )
+    source_label = (
+        "Self-entered Prescription (Manual Text — prospective query for current sudden illness / symptoms before or during clinic/hospital visit)"
+        if is_manual_prescription
+        else "Uploaded Prescription (PDF / Image / OCR — standard extracted document)"
     )
 
-    await stage("coverage_analysis")
-    comparison, questions, unresolved, policy_rules_id = decide_items(
-        catalog, policy_text, policy, prescription, checks, clarification_history or [],
+    from app.services.coverage.policy_clause_search import (
+        MAX_POLICY_CHARS,
+        attach_policy_clauses,
+        comparison_from_search,
+        format_for_prompt,
+        search_policy_clauses,
     )
-    if questions:
-        return {"next_action": "ask_questions", "confidence": 0, "questions": questions}
 
-    manual = not comparison or any(item["coverageStatus"] == "Manual Review" for item in comparison)
-    statuses = {item["coverageStatus"] for item in comparison}
-    overall_status = "Manual Review Required" if manual else (
-        next(iter(statuses)) if len(statuses) == 1 else "Partially Covered"
+    prescription_block = _prescription_text_block(prescription_text, is_manual_prescription)
+    await _stage("evidence_retrieval")
+    clause_search_items = await search_policy_clauses(
+        policy_text, prescription_json or {}, policy_json or {}, is_manual_prescription,
+        prescription_text=prescription_block if prescription_text else "",
     )
-    summary = (
-        "One or more items require manual review before coverage can be confirmed."
-        if manual else "Coverage was evaluated using the policy's verified terms and eligibility facts."
-    )
-    clauses = [clause for item in comparison for clause in item.get("policyClauses", ())]
-    next_steps = []
-    if manual:
-        advice = await triage_unresolved(unresolved) if unresolved else None
-        next_steps.append(advice or "Ask the insurer to confirm coverage using the policy wording and applicable schedule.")
 
-    result = {
-        "next_action": "manual_review" if manual else "generate_report",
-        "confidence": 0 if manual else 100,
-        "retrieved_evidence": evidence,
-        "analysis": {
-            "summary": summary,
-            "overallStatus": overall_status,
-            "comparison": comparison,
-            "retrieved_evidence": evidence,
-            "policyClausesUsed": clauses,
-            "nextSteps": next_steps,
-            "ruleAudit": {
-                "catalogVersion": catalog.version,
-                "policyRulesId": policy_rules_id,
-                "itemRuleVersions": {
-                    item["ruleId"]: item["ruleVersion"] for item in comparison if item.get("ruleId")
-                },
-                "manualReviewRequired": manual,
-                "prescriptionConfirmed": not prescription.get("_ocrReviewRequired"),
-            },
-        },
-    }
-    if manual:
-        result["reason"] = summary
-    return result
+    # The complete policy wording, so nothing the policy says can be missed.
+    full_policy_text = policy_text or ""
+    if len(full_policy_text) > MAX_POLICY_CHARS:
+        logger.warning(
+            f"[AI Analysis] Policy text is {len(full_policy_text)} characters; only the first "
+            f"{MAX_POLICY_CHARS} are sent to the AI."
+        )
+        full_policy_text = full_policy_text[:MAX_POLICY_CHARS]
+
+    # Build near-match clarification block for the prompt
+    near_matches = business_rule_results.get("nearMatchClarifications", [])
+    near_match_block = ""
+    if near_matches:
+        near_match_block = """
+==================================================
+
+NEAR-MATCH CLARIFICATIONS REQUIRED
+(The business rule engine detected approximate matches that need user confirmation.
+ You MUST ask the user these questions via 'ask_questions' before making a final decision.
+ Use the exact question text provided below — do not rewrite or skip them.)
+
+"""
+        for nm in near_matches:
+            near_match_block += (
+                f"• Field: {nm.get('field')}\n"
+                f"  Prescription value: \"{nm.get('prescriptionValue')}\"\n"
+                f"  Policy value:        \"{nm.get('policyValue')}\"\n"
+                f"  Question to ask:     {nm.get('question')}\n\n"
+            )
+
+    # Applicable Policy metadata summary
+    pol_summary_lines = []
+    if policy_json:
+        if policy_json.get("insuranceCompany"):
+            pol_summary_lines.append(f"• Insurer: {policy_json.get('insuranceCompany')}")
+        if policy_json.get("policyName"):
+            pol_summary_lines.append(f"• Product: {policy_json.get('policyName')}")
+        if policy_json.get("policyType"):
+            pol_summary_lines.append(f"• Variant/Plan: {policy_json.get('policyType')}")
+        if policy_json.get("coverageAmount"):
+            pol_summary_lines.append(f"• Sum Insured: ₹{policy_json.get('coverageAmount'):,}")
+        if policy_json.get("policyStartDate"):
+            pol_summary_lines.append(f"• Policy Start: {policy_json.get('policyStartDate')}")
+        if policy_json.get("policyEndDate"):
+            pol_summary_lines.append(f"• Policy Expiry: {policy_json.get('policyEndDate')}")
+        if policy_json.get("waitingPeriodStartDate"):
+            pol_summary_lines.append(
+                f"• Waiting periods count from: {policy_json.get('waitingPeriodStartDate')} "
+                f"({policy_json.get('waitingPeriodBasis') or 'declared start of continuous cover'})"
+            )
+    applicable_policy_str = "\n".join(pol_summary_lines) if pol_summary_lines else "Standard Active Policy Document"
+
+    manual_note = ""
+    if is_manual_prescription:
+        manual_note = """
+• SELF-ENTERED CHECK: The person typed this text to check, before going to hospital, whether it would be covered
+  if treated TODAY. Use today's date as the treatment date. There is no patient name, admission date, doctor or
+  hospital — do not validate them and do not ask for them. Do NOT ask questions: next_action MUST be
+  "generate_report" (or "manual_review" only if the policy text cannot support any decision).
+  When a policy clause makes an item's coverage depend on ONE fact this text does not give (for example eye power
+  in dioptres, BMI, accident vs illness, alcohol vs another cause, cosmetic vs reconstructive, or WHICH insured
+  member is the patient when the policy's terms differ between members), give that item the status
+  "Needs Verification" with its "verificationCondition", "verificationClause" and "decisiveQuestion", exactly as
+  described in the NEEDS VERIFICATION section. The app asks that question itself."""
+
+    # Build the prompt
+    user_prompt = f"""
+CURRENT CLAIM
+• Evaluation Date: {today_str}
+• Prescription Source: {source_label}{manual_note}
+{_claim_facts_block(prescription_json)}
+
+==================================================
+
+PRESCRIPTION (FULL TEXT OF THE DOCTOR'S DOCUMENT — THE AUTHORITY FOR WHAT WAS PRESCRIBED)
+(The extracted fields above are a summary. Read this text for every test, scan, procedure, consultation,
+ hospital service, room category, cost estimate and history line it contains.)
+
+{prescription_block}
+
+==================================================
+
+APPLICABLE POLICY
+{applicable_policy_str}
+
+==================================================
+
+POLICY CLAUSE SEARCH (ENTIRE POLICY TEXT, EXACT QUOTES)
+(Every passage of the policy that mentions each item or a related term, plus the general clauses that govern it.
+ Every quote has been verified to appear in the policy. Base each item's coverageStatusReason and policyEvidence on
+ these clauses and quote them exactly. When an item is not named in the policy, explain the decision from the
+ governing clauses listed here.)
+
+{format_for_prompt(clause_search_items)}
+
+==================================================
+
+APP CHECKS (POLICY PERIOD & INSURED MEMBER ONLY)
+(These checks cover ONLY whether the policy is active on the treatment date and whether the patient is an
+insured member of this policy. When one of them FAILED, every item is Not Covered for that reason.
+They do NOT decide exclusions, waiting periods, benefits, sub-limits, co-payment, room rent or hospitalisation
+requirements: YOU decide those, only from THIS policy's wording, including every exception it states.)
+
+{json.dumps(_app_checks_for_prompt(business_rule_results), indent=2, default=str)}
+
+==================================================
+
+COVER DURATION (computed by the app — use these numbers, do not recalculate)
+{_cover_duration_block(business_rule_results)}
+
+==================================================
+
+FULL POLICY TEXT (THE COMPLETE WORDING OF THIS POLICY — THE ONLY SOURCE FOR COVERAGE DECISIONS)
+(Read every section that can affect each item: schedule and table of benefits, definitions, benefits, waiting periods,
+ exclusions and their exceptions, sub-limits, co-payment, conditions and annexures.)
+
+{full_policy_text}
+
+==================================================
+
+CRITICAL ADJUDICATION INSTRUCTIONS:
+1. Decide every item ONLY from THIS policy's own wording: the FULL POLICY TEXT (the authority), helped by the
+   POLICY CLAUSE SEARCH and the RETRIEVED POLICY EVIDENCE.
+   Never apply a general or "statutory" exclusion, waiting period, benefit or limit that this policy does not state.
+2. A FAILED app check (policy not active on the treatment date, patient not an insured member) makes every item
+   Not Covered for that reason. Nothing else in the app checks decides coverage.
+3. Exclusions: read each exclusion with its exceptions ("unless", "except", "other than", thresholds). If an exception
+   may apply and the fact is not given, use "Needs Verification" with a decisive question.
+   Before marking an item Covered, also check the exclusions and conditions that depend on the CAUSE, PURPOSE or
+   PERSON even when they do not name the item (alcohol / substance use, accident-only benefits, self-injury,
+   sports, cosmetic purpose, a pre-existing disease declared for one insured member). Never assume the cause from
+   the diagnosis name, and never assume who the patient is.
+4. Waiting periods: use THIS policy's own waiting-period list, durations and exceptions (for example "unless arising
+   due to an Accident"), measured with the COVER DURATION numbers above.
+5. Co-payment, deductibles, sub-limits and room rent: apply them only as THIS policy states them, including their
+   conditions (for example a co-payment that applies only from a stated age at entry).
+6. Do not invent coverage terms or assume benefits not supported by the policy text.
+7. If the policy text is insufficient to decide an item, set "next_action": "manual_review".
+8. In reasons, never call anything "statutory", "permanently excluded by law" or "non-payable" in general terms:
+   always state what THIS policy says, quoting its clause.
+9. Report EVERY non-medicine item the PRESCRIPTION documents as its own "comparison" entry: each lab test, scan,
+   procedure, anaesthesia, surgeon / anaesthetist fees, consultation, room / nursing, operation theatre, equipment
+   and consumables (merge true duplicates only). Do not fold tests or hospital services into the diagnosis card.
+   When the prescription has a cost estimate table, report ONE item per line of that table, in its order and with
+   its wording, so the items' prescriptionCost add up to the estimate total. A billed line such as "Medicines & IV
+   fluids" during the admission is a hospital-service line and IS reported (individual medicines are not).
+   ALWAYS also report the documented diagnosis as the FIRST item (itemType "Diagnosis", prescriptionCost null): its
+   reason carries the waiting-period day count, the pre-existing disease check and every cause / purpose / person
+   exclusion you checked.
+   For each comparison item, include the governing section number as printed and a verbatim policy excerpt in
+   policyEvidence. If no exact wording is available, give the documented basis for the decision without inventing a quote.
+10. Costs: when the prescription gives a cost estimate, put each line's amount in that item's "prescriptionCost"
+   and fill "estimatedPayableAmount" / "estimatedPatientPayable" from THIS policy's limits. When it states a room
+   category or charge per day, compare it with this policy's room-rent limit in that item's "financialDecision"
+   (within limit, or the proportionate deduction the policy states). Never invent an amount.
+11. Return, inside "analysis", a "financialSummary" object:
+   {{"estimatedTotalCost": number|null, "estimatedPayableAmount": number|null, "estimatedPatientPayable": number|null,
+     "roomRentCheck": "", "notes": ""}}
+   and a "nextSteps" array of short actions for the policyholder (documents to keep or obtain, pre-authorisation,
+   items whose admissibility depends on the final itemised bill). Amounts come ONLY from the prescription.
+12. History facts in the prescription (alcohol, smoking, previous illness) only matter when THIS policy has a clause
+   that depends on them AND the prescription links them to this illness. When you checked such a clause and it does
+   not apply, say so in one line in the reason (e.g. "Occasional alcohol use is recorded, but nothing links it to
+   this illness, so the alcohol exclusion (D.12) does not apply").
+13. "Partially Covered" means a co-payment, deductible, room-rent deduction or sub-limit of THIS policy reduces the
+   payment by a stated amount. When an item is admissible but some of its contents MAY be non-payable (for example
+   items in a non-payable list / annexure) and only the final itemised bill can show which, keep it "Covered", keep
+   its full estimate as payable, and say "subject to the itemised bill" in its financialDecision. Never give a
+   Covered or Partially Covered item an estimatedPayableAmount of 0.
+14. "summary": two or three plain sentences with the final position only. Never think aloud, correct yourself or
+   mention a deduction that does not apply. Item names carry no amounts (put amounts in prescriptionCost).
+
+=================================================={near_match_block}
+
+PREVIOUS CLARIFICATION HISTORY
+(Use this to avoid asking duplicate questions. If a question is answered here, DO NOT ask it again.)
+
+{json.dumps(clarification_history or [], indent=2, default=str)}
+"""
+    if extra_instruction:
+        user_prompt += f"\n==================================================\n{extra_instruction}\n"
+
+    await _stage("coverage_analysis")
+    try:
+        # Increase token limit as analysis outputs can be quite large (up to 8000 tokens)
+        result = await extract_json_with_retry(
+            system_prompt=COVERAGE_ANALYSIS_SYSTEM_PROMPT,
+            user_content=user_prompt,
+            max_tokens=16384,
+            operation_name="Coverage Analysis",
+        )
+
+        extracted = result["extractedJson"]
+
+        # Self-entered checks are answered from the text, today's date and the policy alone.
+        if is_manual_prescription and extracted.get("next_action") == "ask_questions":
+            logger.info("[AI Analysis] Self-entered check returned questions; requesting the report directly.")
+            result = await extract_json_with_retry(
+                system_prompt=COVERAGE_ANALYSIS_SYSTEM_PROMPT,
+                user_content=user_prompt + (
+                    "\n\nSELF-ENTERED CHECK: questions are not allowed. Return next_action \"generate_report\" "
+                    "with the full analysis now, evaluated for treatment today."
+                ),
+                max_tokens=16384,
+                operation_name="Coverage Analysis",
+            )
+            extracted = result["extractedJson"]
+
+        timing = result.get("timing", {})
+        tokens = result.get("tokens", {})
+
+        logger.info(
+            f"[AI Analysis] Coverage analysis completed in {timing.get('llmProcessingSec', 0)}s "
+            f"({tokens.get('totalTokens', 0)} tokens)"
+        )
+
+        # Parse next_action
+        next_action = extracted.get("next_action")
+        confidence = extracted.get("confidence", 0)
+
+        # Append raw tokens and timing to the extracted dict so it can be used for audit logging later
+        extracted["_llm_metrics"] = {
+            "timing": timing,
+            "tokens": tokens
+        }
+
+        if next_action == "ask_questions":
+            return extracted
+
+        if next_action == "manual_review":
+            return extracted
+
+        # If complete, it should be in extracted["analysis"] or directly in extracted (fallback)
+        analysis_data = extracted.get("analysis", extracted)
+        analysis_data["policyClauseSearch"] = clause_search_items
+
+        # 1. Fallback item population if LLM returned empty comparison
+        if not analysis_data.get("comparison") or len(analysis_data["comparison"]) == 0:
+            analysis_data["comparison"] = (
+                comparison_from_search(clause_search_items) or _generate_fallback_comparison(prescription_json)
+            )
+        attach_policy_clauses(analysis_data["comparison"], clause_search_items)
+
+        # 2. Status normalization for backward compatibility
+        for item in analysis_data.get("comparison", []):
+            status_val = str(item.get("coverageStatus", "")).lower()
+            if "not covered" in status_val or "rejected" in status_val:
+                item["isCovered"] = False
+            elif "covered" in status_val or "approved" in status_val or "conditionally" in status_val:
+                item["isCovered"] = True
+            else:
+                item["isCovered"] = False # Default conservative
+
+            # Map backward compatible fields for frontend UI table (status, cost, reason)
+            item["status"] = item.get("coverageStatus") or item.get("status") or ""
+
+            # Cost mapping: try prescriptionCost first, then cost, fallback to 0
+            prescription_cost = item.get("prescriptionCost")
+            cost_val = item.get("cost")
+            if isinstance(prescription_cost, (int, float)):
+                item["cost"] = prescription_cost
+            elif isinstance(cost_val, (int, float)):
+                item["cost"] = cost_val
+            else:
+                item["cost"] = 0
+
+            # Reason mapping
+            item["reason"] = item.get("explanation") or item.get("reason") or ""
+
+        # Enforce Business Rules & Hard Demographic Eligibility Gates
+        try:
+            biz_rules = business_rule_results if isinstance(business_rule_results, dict) else {}
+            if policy_json and not biz_rules.get("rules"):
+                from app.services.coverage.business_rules import enforce_business_rules
+                biz_rules = enforce_business_rules(policy_json, prescription_json, policy_text=policy_text)
+
+            det_res = biz_rules.get("deterministicResult")
+            if det_res:
+                det_status = det_res.get("status")
+                det_reason = det_res.get("reasonCode", "")
+                blocker_list = det_res.get("blockers") or biz_rules.get("blockers", [])
+                blocker_reasons = " | ".join(blocker_list) if blocker_list else det_reason
+
+                if det_status in ("NOT_COVERED", "NOT_CURRENTLY_COVERED"):
+                    status_title = det_reason.replace("_", " ").title() if det_reason else "Policy Eligibility Failure"
+                    analysis_data["overallStatus"] = f"Rejected - {status_title}"
+                    analysis_data["summary"] = f"Claim Rejected: Deterministic evaluation returned {det_status} ({det_reason}). {blocker_reasons}"
+                    logger.info(f"[AI Analysis] Rule check result: {det_status} ({det_reason})")
+
+                    comp_items = analysis_data.get("comparison") or _generate_fallback_comparison(prescription_json, policy_json)
+                    formatted_comp = []
+                    for item in comp_items:
+                        formatted_item = _format_item_card(
+                            item=item,
+                            policy_json=policy_json,
+                            prescription_json=prescription_json,
+                            override_status="Not Covered",
+                            reason_code=det_reason,
+                            blockers=blocker_list,
+                        )
+                        formatted_comp.append(formatted_item)
+                    analysis_data["comparison"] = formatted_comp
+
+                elif det_status == "PARTIALLY_COVERED":
+                    analysis_data["overallStatus"] = "Partially Covered - Sub-Limit Applied"
+                    comp_items = analysis_data.get("comparison") or _generate_fallback_comparison(prescription_json, policy_json)
+                    formatted_comp = []
+                    for item in comp_items:
+                        target_status = "Partially Covered" if item.get("coverageStatus") == "Covered" else None
+                        formatted_item = _format_item_card(
+                            item=item,
+                            policy_json=policy_json,
+                            prescription_json=prescription_json,
+                            override_status=target_status,
+                            reason_code=det_reason or "LIMIT_EXCEEDED",
+                            blockers=blocker_list,
+                        )
+                        formatted_comp.append(formatted_item)
+                    analysis_data["comparison"] = formatted_comp
+
+                elif det_status == "MANUAL_REVIEW" or det_res.get("manualReviewRequired"):
+                    analysis_data["overallStatus"] = "Manual Review Required"
+                    extracted["next_action"] = "manual_review"
+
+            elif not biz_rules.get("overallEligible", True):
+                blocker_reasons = " | ".join(biz_rules.get("blockers", []))
+                logger.warning(f"[AI Analysis] Eligibility check failed: {blocker_reasons}")
+                analysis_data["overallStatus"] = "Rejected - Policy Eligibility Failure"
+                analysis_data["summary"] = f"Claim Rejected: Policy eligibility failed because {blocker_reasons}."
+
+                if "policyEligibility" in analysis_data and isinstance(analysis_data["policyEligibility"], dict):
+                    analysis_data["policyEligibility"]["explanation"] = blocker_reasons
+                    if "age" in blocker_reasons.lower():
+                        analysis_data["policyEligibility"]["ageEligible"] = False
+                    if "gender" in blocker_reasons.lower() or "name" in blocker_reasons.lower():
+                        analysis_data["policyEligibility"]["classEligible"] = False
+                    if "date" in blocker_reasons.lower() or "expir" in blocker_reasons.lower():
+                        analysis_data["policyEligibility"]["periodEligible"] = False
+
+                comp_items = analysis_data.get("comparison") or _generate_fallback_comparison(prescription_json, policy_json)
+                formatted_comp = []
+                for item in comp_items:
+                    formatted_item = _format_item_card(
+                        item=item,
+                        policy_json=policy_json,
+                        prescription_json=prescription_json,
+                        override_status="Not Covered",
+                        reason_code="ELIGIBILITY_FAILED",
+                        blockers=biz_rules.get("blockers", []),
+                    )
+                    formatted_comp.append(formatted_item)
+                analysis_data["comparison"] = formatted_comp
+            else:
+                # Format all items to guarantee 4-part structure for every card
+                comp_items = analysis_data.get("comparison") or []
+                formatted_comp = []
+                for item in comp_items:
+                    formatted_item = _format_item_card(
+                        item=item,
+                        policy_json=policy_json,
+                        prescription_json=prescription_json,
+                    )
+                    formatted_comp.append(formatted_item)
+                if formatted_comp:
+                    analysis_data["comparison"] = formatted_comp
+        except Exception as e:
+            logger.error(f"[AI Analysis] Rules evaluation check error: {e}")
+
+        # 3. Add backward-compatible fields for the frontend
+        return {
+            "next_action": "generate_report",
+            "confidence": confidence,
+            "analysis": analysis_data,
+            "_llm_metrics": extracted["_llm_metrics"]
+        }
+
+    except Exception as e:
+        logger.error(f"[Coverage Analysis] Failed: {e}")
+        # Return a safe fallback object so the pipeline doesn't completely crash if just AI fails
+        return {
+            "next_action": "manual_review",
+            "confidence": 0,
+            "reason": f"Coverage analysis failed due to an error: {e}",
+            "analysis": {
+                "summary": f"Coverage analysis failed due to an error: {e}",
+                "comparison": _generate_fallback_comparison(prescription_json, policy_json),
+                "reasoning": "AI analysis service encountered an error.",
+                "documentValidity": {
+                    "prescriptionValid": True,
+                    "policyValid": True,
+                    "injectionAttemptDetected": False,
+                    "injectionAttemptDetails": "",
+                    "detectedDocumentTypeIfInvalid": ""
+                }
+            }
+        }
 
 
 MAX_PRESCRIPTION_CHARS = 20000
@@ -307,12 +671,12 @@ def _format_item_card(
     # Determine status reason, policy evidence, and financial status
     # Undecided: the automated analysis could not reach a decision for this item
     if final_status == "Manual Review":
-        status_reason = item.get("coverageStatusReason") or item.get("explanation") or (
+        status_reason = (
             f"Coverage for {item_name} could not be confirmed automatically from the policy and prescription. "
             f"This item has been referred for manual review."
         )
-        policy_evidence = item.get("policyEvidence") or f"Period of Insurance : {period_str}. Decision pending manual review."
-        financial_status = item.get("financialDecision") or "Payable amount will be confirmed after manual review."
+        policy_evidence = f"Period of Insurance : {period_str}. Decision pending manual review."
+        financial_status = "Payable amount will be confirmed after manual review."
 
     # Depends on one fact the documents do not give (e.g. dioptres, BMI, cause of injury)
     elif final_status == NEEDS_VERIFICATION:

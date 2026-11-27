@@ -7,6 +7,7 @@ from typing import Optional
 
 from beanie import Document, Indexed
 from pydantic import Field
+from pymongo import ASCENDING, IndexModel
 
 
 class User(Document):
@@ -15,10 +16,9 @@ class User(Document):
     name: str
     email: Indexed(str, unique=True)  # type: ignore[valid-type]
     phone: Optional[Indexed(str)] = None  # type: ignore[valid-type]
-    # Set to True once an OTP sent to that contact has been entered correctly.
-    # None = account created before verification was tracked (see auth routes for how that is read).
+    # None indicates an account created before email verification was tracked.
     email_verified: Optional[bool] = Field(default=None, alias="emailVerified")
-    phone_verified: Optional[bool] = Field(default=None, alias="phoneVerified")
+    google_subject: Optional[str] = Field(default=None, alias="googleSubject")
     refresh_token: Optional[str] = Field(default=None, alias="refreshToken")
     refresh_token_expiry: Optional[datetime] = Field(default=None, alias="refreshTokenExpiry")
 
@@ -30,6 +30,14 @@ class User(Document):
     class Settings:
         name = "users"
         use_state_management = True
+        indexes = [
+            IndexModel([("refreshToken", ASCENDING)], sparse=True),
+            IndexModel(
+                [("googleSubject", ASCENDING)],
+                unique=True,
+                partialFilterExpression={"googleSubject": {"$type": "string"}},
+            ),
+        ]
 
     class Config:
         populate_by_name = True

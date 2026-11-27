@@ -1,19 +1,7 @@
-"""
-File validators — magic byte detection, MIME type validation, structural validation.
-Migrated from uploadValidation.js and advancedFileValidator.js.
-"""
-
-import fitz  # PyMuPDF
+"""Validate upload extensions and detect file types from magic bytes."""
 
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".docx"}
-
-ALLOWED_MIME_TYPES = {
-    "application/pdf",
-    "image/png",
-    "image/jpeg",
-    "image/jpg",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-}
+PRESCRIPTION_MIME_TYPES = {"application/pdf", "image/jpeg", "image/jpg", "image/png"}
 
 
 def detect_mime_from_magic_bytes(buffer: bytes) -> str | None:
@@ -46,35 +34,3 @@ def validate_file_extension(filename: str) -> bool:
 
     ext = os.path.splitext(filename)[1].lower()
     return ext in ALLOWED_EXTENSIONS
-
-
-def validate_file_structure(file_path: str, mime_type: str) -> bool:
-    """
-    Perform deep structural validation of the file.
-    Raises an error if the file is structurally invalid.
-    """
-    try:
-        if mime_type == "application/pdf":
-            doc = fitz.open(file_path)
-            try:
-                if doc.is_encrypted:
-                    raise ValueError("PDF is encrypted or password protected")
-                if doc.page_count == 0:
-                    raise ValueError("PDF has no pages")
-            finally:
-                doc.close()
-
-        elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-            from docx import Document
-
-            doc = Document(file_path)
-            if not doc.paragraphs:
-                raise ValueError("DOCX has no content")
-
-        # Image validation is covered by magic bytes check
-        return True
-
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(f"Structural validation failed: {e}")

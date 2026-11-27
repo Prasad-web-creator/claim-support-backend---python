@@ -22,6 +22,11 @@ def create_crud_router(
     prefix = prefix_override if prefix_override else f"/{entity_name.lower()}s"
     router = APIRouter(prefix=prefix, tags=[entity_name])
     service = CrudService(model_class, entity_name, searchable_fields)
+    consent_required = entity_name in {"Prescription", "Policy"}
+
+    def require_document_source(changes: dict) -> None:
+        if entity_name == "Policy" and changes.get("extractedPolicyText"):
+            raise HTTPException(status_code=422, detail="Upload the original policy document for extraction.")
     
     def _serialize(result):
         d = result.dict(by_alias=True)
@@ -36,7 +41,21 @@ def create_crud_router(
         current_user: dict = Depends(get_current_user)
     ):
         """Create a new entity."""
-        result = await service.create(current_user["id"], data.dict(exclude_unset=True))
+        changes = data.dict(exclude_unset=True)
+        is_typed_prescription = (
+            entity_name == "Prescription"
+            and changes.get("isManual") is True
+            and bool((changes.get("extractedPrescriptionText") or "").strip())
+            and not any(changes.get(key) for key in ("gridFsFileId", "mimeType", "fileSize"))
+        )
+        if consent_required and not is_typed_prescription:
+            from app.services.analysis_jobs import require_analysis_consent
+
+            await require_analysis_consent(
+                current_user["id"], request.headers.get("X-Analysis-Job-Id"), require_job=True
+            )
+        require_document_source(changes)
+        result = await service.create(current_user["id"], changes)
         return _serialize(result)
 
     @router.get("")
@@ -80,7 +99,18 @@ def create_crud_router(
         current_user: dict = Depends(get_current_user)
     ):
         """Update an entity."""
-        result = await service.update(current_user["id"], entity_id, data.dict(exclude_unset=True))
+        changes = data.dict(exclude_unset=True)
+        if consent_required and changes.keys() & {
+            "gridFsFileId", "policyDocumentPath", "prescriptionPath",
+            "extractedPrescriptionText", "extractedPrescriptionJson", "extractedPolicyText", "isManual",
+        }:
+            from app.services.analysis_jobs import require_analysis_consent
+
+            await require_analysis_consent(
+                current_user["id"], request.headers.get("X-Analysis-Job-Id"), require_job=True
+            )
+        require_document_source(changes)
+        result = await service.update(current_user["id"], entity_id, changes)
         if not result:
              raise HTTPException(status_code=404, detail=f"{entity_name} not found")
         return _serialize(result)

@@ -7,11 +7,6 @@ from pydantic import Field, BaseModel, field_validator
 from app.core.sanitize import sanitize_nulls as _sanitize_nulls
 
 
-class ClarificationOption(BaseModel):
-    label: str = ""
-    value: str = ""
-
-
 class ClarificationQuestion(BaseModel):
     id: str = Field(alias="id") # The stable question ID (e.g., hospitalization)
     title: str = ""
@@ -43,6 +38,7 @@ class AnalysisSession(Document):
     # Set only when this session is one policy of a multi-policy parent session.
     # Empty string for every classic single-policy session (including historical ones).
     parent_session_id: Optional[str] = Field(default="", alias="parentSessionId")
+    durable_job: bool = Field(default=False, alias="durableJob")
 
     status: str = Field(default="created") # created | extracting_documents | analyzing | waiting_for_user | reanalyzing | completed | failed | manual_review_required | cancelled | expired
     

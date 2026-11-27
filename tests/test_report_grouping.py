@@ -14,7 +14,7 @@ from tests.conftest import VALID_POLICY_JSON, VALID_RX_JSON
 
 from app.models.analysis_report import AnalysisReport
 from app.models.multi_policy_session import MultiPolicyAnalysisSession, PolicyAnalysisEntry
-from app.services.report_grouping import list_report_groups, delete_report_group
+from app.services.report_grouping import delete_report_group, get_report_group, list_report_groups
 
 USER = "user-1"
 OTHER_USER = "user-2"
@@ -88,6 +88,25 @@ async def test_single_policy_report_is_its_own_group(db):
     assert row["policyName"] == "Policy X"
     assert row["policyNumber"] == "POL-123"
     assert row["reportLabel"].startswith("CR-")
+
+
+async def test_get_group_only_returns_owned_history_groups(db):
+    single = await _make_report(omit_parent_field=True)
+    parent = await _make_session([])
+    linked = await _make_report(parent_session_id=str(parent.id))
+    parent.policy_analyses = [
+        PolicyAnalysisEntry(policyId="policy-x", status="completed", reportId=str(linked.id))
+    ]
+    await parent.save()
+
+    single_group = await get_report_group(USER, str(single.id))
+    multi_group = await get_report_group(USER, str(parent.id))
+    assert single_group["reportIds"] == [str(single.id)]
+    assert multi_group["reportIds"] == [str(linked.id)]
+    assert await get_report_group(USER, str(linked.id)) is None
+    assert await get_report_group(OTHER_USER, str(parent.id)) is None
+    assert await get_report_group(OTHER_USER, str(single.id)) is None
+    assert await get_report_group(USER, "invalid-id") is None
 
 
 # ──────────────────────────────────────────────────────────────────────────────

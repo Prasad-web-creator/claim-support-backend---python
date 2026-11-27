@@ -1,89 +1,56 @@
-import asyncio
-import time
-from datetime import datetime, timezone
-from beanie import Document
-from pymongo import ASCENDING
-from motor.motor_asyncio import AsyncIOMotorGridFSBucket
-from app.core.logging import logger
+"""Remove unreferenced GridFS objects after a configurable grace period."""
+
+from datetime import datetime, timedelta, timezone
+from math import floor
+
+from gridfs.errors import NoFile
+
 from app.core.config import get_settings
-from app.core.database import get_database
+from app.core.database import get_database, get_gridfs_bucket
+from app.core.logging import logger
+from app.services.storage.file_lease import hold_file_lease
+from app.services.storage.file_upload_service import GRIDFS_STORAGE_SCHEMA, file_lease_key, has_physical_reference
 
-async def run_cleanup():
-    """
-    Background job to clean up GridFS orphaned files and any legacy documents missed by TTL.
-    Applies the mass-deletion threshold to abort if too many records are slated for deletion.
-    """
+
+async def run_cleanup() -> dict[str, int | bool]:
     settings = get_settings()
-    logger.info("[Cleanup Service] Starting daily background cleanup job")
-    start_time = time.time()
-    
-    if settings.DATA_CLEANUP_DRY_RUN:
-        logger.warning("[Cleanup Service] DRY RUN MODE ENABLED. No actual deletions will occur.")
+    result = {"candidates": 0, "deleted": 0, "aborted": False, "dry_run": settings.DATA_CLEANUP_DRY_RUN}
+    if not settings.ORPHAN_CLEANUP_ENABLED:
+        return result
 
-    # Get the db name from URI or use default
-    db = get_database()
-    
-    fs = AsyncIOMotorGridFSBucket(db, bucket_name="fs")
-    
-    # 1. Clean up GridFS Orphaned Files
-    # An orphaned file is in `fs.files` but its `_id` is not referenced in any StoredFile.
-    try:
-        from app.models.stored_file import StoredFile
-        
-        # Get all file IDs from GridFS
-        cursor = db.fs.files.find({}, {"_id": 1})
-        gridfs_file_ids = [doc["_id"] async for doc in cursor]
-        
-        # Get all file IDs referenced by StoredFiles
-        stored_files_cursor = StoredFile.find({}, projection_model=None).project({"_id": 1, "storageKey": 1})
-        referenced_ids = []
-        async for sf in stored_files_cursor:
-            # Note: stored_file's storageKey is string representation of GridFS ObjectId
-            if sf.storage_key:
-                try:
-                    from bson import ObjectId
-                    referenced_ids.append(ObjectId(sf.storage_key))
-                except Exception:
-                    pass
-                    
-        # Find the difference
-        orphaned_ids = set(gridfs_file_ids) - set(referenced_ids)
-        total_orphaned = len(orphaned_ids)
-        
-        if total_orphaned > 0:
-            logger.info(f"[Cleanup Service] Found {total_orphaned} orphaned GridFS files.")
-            
-            # Apply safety threshold: if more than 5% of all files are orphaned AND it exceeds 100 files, log a warning
-            if len(gridfs_file_ids) > 0 and (total_orphaned / len(gridfs_file_ids)) > settings.DATA_CLEANUP_MAX_PERCENTAGE:
-                if total_orphaned > settings.DATA_CLEANUP_MAX_COUNT:
-                    logger.critical(f"[Cleanup Service] ABORTING GridFS cleanup: {total_orphaned} orphaned files exceeds absolute maximum of {settings.DATA_CLEANUP_MAX_COUNT}")
-                    orphaned_ids = []
-                else:
-                    logger.warning(f"[Cleanup Service] GridFS orphaned files exceeds {settings.DATA_CLEANUP_MAX_PERCENTAGE*100}% of total files. Proceeding since it's under max count.")
+    files = get_database()["fs.files"]
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.ORPHAN_CLEANUP_GRACE_HOURS)
+    total_files = await files.estimated_document_count()
+    limit = min(
+        settings.DATA_CLEANUP_MAX_COUNT,
+        max(1, floor(total_files * settings.DATA_CLEANUP_MAX_PERCENTAGE)),
+    )
+    candidates = []
+    # A legacy StoredFile row may already have expired while its policy still
+    # points at the missing row. Those unknown mappings require reconciliation.
+    async for record in files.find(
+        {"uploadDate": {"$lt": cutoff}, "metadata.storageSchema": GRIDFS_STORAGE_SCHEMA},
+        {"filename": 1, "metadata.sha256": 1},
+    ):
+        keys = [record["_id"], str(record["_id"]), record["filename"]]
+        if await has_physical_reference(keys):
+            continue
+        candidates.append((record, keys))
+        if len(candidates) > limit:
+            logger.warning("GridFS orphan cleanup exceeded the safety limit ({})", limit)
+            return {**result, "candidates": len(candidates), "aborted": True}
 
-            deleted_count = 0
-            for file_id in orphaned_ids:
-                if not settings.DATA_CLEANUP_DRY_RUN:
+    result["candidates"] = len(candidates)
+    if not settings.DATA_CLEANUP_DRY_RUN:
+        for record, keys in candidates:
+            digest = (record.get("metadata") or {}).get("sha256")
+            async with hold_file_lease(file_lease_key(record["filename"], digest)) as renew:
+                if not await has_physical_reference(keys):
+                    await renew()
                     try:
-                        await fs.delete(file_id)
-                        deleted_count += 1
-                    except Exception as e:
-                        logger.error(f"[Cleanup Service] Failed to delete orphaned file {file_id}: {e}")
-                else:
-                    logger.info(f"[Cleanup Service] [DRY RUN] Would delete GridFS file: {file_id}")
-                    deleted_count += 1
-            
-            logger.info(f"[Cleanup Service] GridFS cleanup complete. Deleted {deleted_count} files.")
-        else:
-            logger.info("[Cleanup Service] No orphaned GridFS files found.")
-            
-    except Exception as e:
-        logger.error(f"[Cleanup Service] Error during GridFS cleanup: {e}")
-
-    duration = time.time() - start_time
-    logger.info(f"[Cleanup Service] Cleanup completed in {duration:.2f} seconds.")
-    
-    return {
-        "duration": duration,
-        "dry_run": settings.DATA_CLEANUP_DRY_RUN
-    }
+                        await get_gridfs_bucket().delete(record["_id"])
+                        result["deleted"] += 1
+                    except NoFile:
+                        continue
+    logger.info("GridFS orphan cleanup completed {}", result)
+    return result

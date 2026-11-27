@@ -1,0 +1,15 @@
+# Security and privacy audit
+
+This review covers the repository implementation and local regression tests. It uses synthetic data and mocked external providers. Confirm the operational controls against the deployed environment before processing real documents.
+
+| Area | Repository controls | Evidence and remaining verification |
+| --- | --- | --- |
+| OTP authentication | Cryptographically random codes, a five-minute default expiry, keyed code hashes, single-use verification, cooldowns, and attempt and request limits. Gmail uses OAuth and HTTPS. SMTP remains configurable. | Local tests cover wrong, expired, and reused codes, configured providers, and Gmail failure redaction. Verify deliverability and sender ownership in staging. |
+| Google Sign-In and sessions | The server validates Google ID token signature, issuer, configured audience, expiry, and verified email. Account linkage follows Google email authority and account proof. Refresh tokens are high-entropy, hashed for new sessions, and rotated atomically. | Local tests cover claim rejection, Google link behavior, concurrent refreshes, and legacy refresh migration. Verify production signing fingerprints and OAuth client IDs. |
+| Document access | The upload, retrieval, policy, and analysis paths use the signed-in user's identity for ownership checks. User consent is recorded for analysis, and jobs store status in MongoDB. | Run the repository cross-user tests and repeat against staging with two synthetic accounts. Compare automatic deletion, backup retention, and user-requested deletion on the deployed database and storage. |
+| Cloud transfers and logs | Gmail receives delivery metadata and the OTP email. Google Gemini receives prescription and policy text for analysis. Telemetry uses an allowlist and suppresses default personal data. | Go through the failure paths in staging and inspect Render and enabled Sentry output with synthetic markers. Confirm actual TLS and network routing for every deployed connection. |
+| Credentials | Runtime secrets come from backend environment variables. Gmail requests the send-only scope. Google Sign-In uses a separate expected audience. | Confirm deployment secret access, rotation, account recovery, and the authorization of the Gmail sender. Free service plans do not establish specific availability or data residency guarantees. |
+
+Ordinary sign-out clears the refresh token. Previously issued access tokens can remain usable on ordinary authenticated APIs until their configured expiration. For privileged routes, removing the role takes effect at the next authorization check. Legacy plaintext refresh tokens remain eligible for migration until their expiry or rotation. Treat any pre-migration database snapshot as sensitive.
+
+The organization still needs to approve the privacy notice, processing purposes, vendors and regions, schedules for retention and backup expiry, and user request handling. The repository controls provide evidence for those decisions. A deployment and legal review are required to establish compliance with applicable requirements.

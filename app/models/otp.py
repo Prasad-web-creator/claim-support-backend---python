@@ -10,13 +10,16 @@ from pydantic import Field
 
 
 class OtpCode(Document):
-    """A pending OTP for one destination (phone number or email), channel and purpose."""
+    """A pending email OTP for a given destination and purpose."""
 
-    channel: str  # sms | email
-    target: str  # 10-digit phone number, or lower-cased email address
-    purpose: str  # login | register | verify
-    code_hash: str
+    channel: str = "email"
+    target: str
+    purpose: str
+    code_hash: str | None = None
     attempts: int = 0
+    generation: str | None = None
+    state: str | None = None
+    valid_until: datetime | None = None
     expires_at: datetime
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

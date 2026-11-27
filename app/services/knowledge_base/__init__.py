@@ -1,3 +1,0 @@
-"""
-Knowledge Base Services Package.
-"""

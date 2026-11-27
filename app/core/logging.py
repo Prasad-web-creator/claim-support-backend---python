@@ -5,6 +5,7 @@ Console-only logging (no log files generated on disk).
 
 import sys
 from loguru import logger
+from app.core.config import get_settings
 
 # Remove the default handler so we can configure our own
 logger.remove()
@@ -13,8 +14,10 @@ logger.remove()
 logger.add(
     sys.stderr,
     format="[{time:YYYY-MM-DD HH:mm:ss}] {level}: {message}",
-    level="INFO",
-    colorize=True,
+    level=get_settings().LOG_LEVEL,
+    colorize=False,
+    diagnose=False,
+    backtrace=False,
 )
 
 

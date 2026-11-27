@@ -3,13 +3,14 @@ Analysis routes — migrated from analysisController.js.
 """
 
 import math
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Header
 from typing import Optional, List, Any
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, StrictBool, model_validator
 
 from app.middleware.auth import get_current_user
 from app.middleware.rate_limiter import limiter
 from app.services.analysis_interactive_orchestrator import start_analysis_session, resume_analysis_session
+from app.services.analysis_orchestrator import public_analysis_error
 from app.services.multi_policy_orchestrator import (
     create_multi_policy_session,
     schedule_multi_policy_analysis,
@@ -18,12 +19,23 @@ from app.services.multi_policy_orchestrator import (
     retry_policy_analysis,
     get_multi_policy_session,
 )
-from app.services.report_grouping import list_report_groups, delete_report_group
+from app.services.report_grouping import delete_report_group, get_report_group, list_report_groups
+from app.services.analysis_jobs import (
+    cancel_job, create_job, enqueue_answer, enqueue_job, enqueue_prescription, enqueue_retry, get_job, list_jobs,
+    require_analysis_consent,
+)
 from app.core.config import get_settings
 from app.models.analysis_report import AnalysisReport
 from app.services.crud_service import CrudService
 
 router = APIRouter(prefix="/analysis", tags=["Analysis"])
+
+
+async def _legacy_consent(
+    user: dict = Depends(get_current_user),
+    job_id: str | None = Header(None, alias="X-Analysis-Job-Id"),
+) -> None:
+    await require_analysis_consent(user["id"], job_id)
 
 
 class AnalysisRequest(BaseModel):
@@ -42,7 +54,7 @@ class AnalysisRequest(BaseModel):
         return values
 
 
-@router.post("/start")
+@router.post("/start", dependencies=[Depends(_legacy_consent)])
 @limiter.limit("5/minute")
 async def start_analysis(
     request: Request,
@@ -67,7 +79,7 @@ async def start_analysis(
             **result
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=public_analysis_error(e)) from e
 
 class AnswerRequest(BaseModel):
     answers: dict
@@ -102,7 +114,78 @@ class MultiAnalysisRequest(BaseModel):
         return self
 
 
-@router.post("/start-multi")
+class ConsentRequest(BaseModel):
+    agreementVersion: str = Field(min_length=1, max_length=40)
+    accepted: StrictBool
+    requestId: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+class JobAnswerRequest(AnswerRequest):
+    policyId: str | None = None
+
+
+class JobPrescriptionRequest(BaseModel):
+    prescriptionPath: str
+
+
+class JobRetryRequest(BaseModel):
+    policyId: str
+
+
+@router.post("/jobs", status_code=201)
+@limiter.limit("10/minute")
+async def create_analysis_job(request: Request, body: ConsentRequest, user: dict = Depends(get_current_user)):
+    return await create_job(user["id"], body.agreementVersion, body.accepted, body.requestId)
+
+
+@router.get("/jobs")
+async def list_analysis_jobs(user: dict = Depends(get_current_user)):
+    return {"jobs": await list_jobs(user["id"])}
+
+
+@router.get("/jobs/{job_id}")
+async def read_analysis_job(job_id: str, user: dict = Depends(get_current_user)):
+    return await get_job(user["id"], job_id)
+
+
+@router.post("/jobs/{job_id}/start", status_code=202)
+@limiter.limit("10/minute")
+async def start_analysis_job(
+    request: Request, job_id: str, body: MultiAnalysisRequest, user: dict = Depends(get_current_user),
+):
+    return await enqueue_job(user["id"], job_id, body.prescriptionPath, body.policyIds)
+
+
+@router.post("/jobs/{job_id}/prescription", status_code=202)
+@limiter.limit("10/minute")
+async def prepare_analysis_prescription(
+    request: Request, job_id: str, body: JobPrescriptionRequest, user: dict = Depends(get_current_user),
+):
+    return await enqueue_prescription(user["id"], job_id, body.prescriptionPath)
+
+
+@router.post("/jobs/{job_id}/answer", status_code=202)
+@limiter.limit("30/minute")
+async def answer_analysis_job(
+    request: Request, job_id: str, body: JobAnswerRequest, user: dict = Depends(get_current_user),
+):
+    return await enqueue_answer(user["id"], job_id, body.policyId, body.answers)
+
+
+@router.post("/jobs/{job_id}/retry", status_code=202)
+@limiter.limit("10/minute")
+async def retry_analysis_job(
+    request: Request, job_id: str, body: JobRetryRequest, user: dict = Depends(get_current_user),
+):
+    return await enqueue_retry(user["id"], job_id, body.policyId)
+
+
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_analysis_job(job_id: str, user: dict = Depends(get_current_user)):
+    return await cancel_job(user["id"], job_id)
+
+
+@router.post("/start-multi", dependencies=[Depends(_legacy_consent)])
 @limiter.limit("5/minute")
 async def start_multi_analysis(
     request: Request,
@@ -131,7 +214,7 @@ async def start_multi_analysis(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=public_analysis_error(e)) from e
 
 
 @router.get("/multi/{session_id}")
@@ -148,10 +231,10 @@ async def get_multi_analysis(
     except PermissionError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=public_analysis_error(e)) from e
 
 
-@router.post("/multi/{session_id}/{policy_id}/answer")
+@router.post("/multi/{session_id}/{policy_id}/answer", dependencies=[Depends(_legacy_consent)])
 @limiter.limit("30/minute")
 async def answer_multi_clarification(
     request: Request,
@@ -179,7 +262,7 @@ async def answer_multi_clarification(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=public_analysis_error(e)) from e
 
 
 class BatchDeleteGroupsRequest(BaseModel):
@@ -199,6 +282,14 @@ async def list_grouped_analyses(
     group; classic single-policy reports are returned as groups of one.
     """
     return await list_report_groups(current_user["id"], page=page, limit=limit)
+
+
+@router.get("/grouped/{group_id}")
+async def get_grouped_analysis(group_id: str, current_user: dict = Depends(get_current_user)):
+    group = await get_report_group(current_user["id"], group_id)
+    if group is None:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    return group
 
 
 @router.post("/grouped/batch-delete")
@@ -235,7 +326,7 @@ async def delete_grouped_analysis(
     return {"success": True, **result}
 
 
-@router.post("/multi/{session_id}/{policy_id}/retry")
+@router.post("/multi/{session_id}/{policy_id}/retry", dependencies=[Depends(_legacy_consent)])
 @limiter.limit("30/minute")
 async def retry_multi_policy(
     request: Request,
@@ -259,11 +350,11 @@ async def retry_multi_policy(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=public_analysis_error(e)) from e
 
 
 
-@router.post("/{session_id}/answer")
+@router.post("/{session_id}/answer", dependencies=[Depends(_legacy_consent)])
 @limiter.limit("5/minute")
 async def answer_clarification(
     request: Request,
@@ -287,7 +378,7 @@ async def answer_clarification(
             **result
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=public_analysis_error(e)) from e
 
 
 @router.get("")
@@ -379,11 +470,6 @@ async def get_analysis(
             pass
     if not d.get("updatedAt") and d.get("createdAt"):
         d["updatedAt"] = d["createdAt"]
-
-    # No built-in benchmark comparison is returned, also for reports stored before it
-    # was removed (their stored data is left untouched in the database).
-    from app.services.coverage.report_generator import REFERENCE_COMPARISON_DISABLED
-    d["referenceComparison"] = dict(REFERENCE_COMPARISON_DISABLED)
 
     # Policy Continuity: manual inputs are checked first (original start date and renewal break).
     # If not declared, evaluated across the session for multi-policy or computed on read.
