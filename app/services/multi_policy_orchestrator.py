@@ -29,6 +29,7 @@ from app.core.sanitize import sanitize_nulls as _sanitize_nulls
 from app.core.telemetry import record_failure
 from app.models.analysis_report import AnalysisReport
 from app.models.analysis_session import AnalysisSession
+from app.core.language import Language
 from app.models.multi_policy_session import MultiPolicyAnalysisSession, PolicyAnalysisEntry
 from app.models.policy import Policy
 from app.models.prescription import Prescription
@@ -466,6 +467,8 @@ async def _refresh_parent_status(
 def _entry_from_result(entry: PolicyAnalysisEntry, result: dict) -> PolicyAnalysisEntry:
     """Map the single-policy pipeline's return payload onto a policy entry."""
     status = str(result.get("status") or "").lower()
+    if result.get("responseLanguage") in ("en", "ta"):
+        entry.response_language = result["responseLanguage"]
 
     if status == "needs_clarification":
         entry.status = "waiting_for_user"
@@ -591,6 +594,7 @@ async def _analyze_one_policy(
     background_tasks: Optional[BackgroundTasks],
     lock: Optional[asyncio.Lock] = None,
     running_status: str = "analyzing",
+    response_language: Language | None = None,
 ) -> Optional[PolicyAnalysisEntry]:
     """
     Run the full existing pipeline for exactly one policy, in its own child session.
@@ -626,8 +630,11 @@ async def _analyze_one_policy(
                     id=child_id, user_id=user_id, policy_id=policy_id,
                     prescription_id=parent.prescription_id, parent_session_id=parent_id,
                     durable_job=parent.durable_job, status="extracting",
+                    response_language=response_language or parent.response_language,
                 )
                 await finish_analysis_write(session.insert())
+            elif response_language is not None:
+                session.response_language = response_language
             await _update_entry(parent, policy_id, lock, session_id=str(session.id))
 
             # Isolate the cost tracker per policy. contextvars are copied per
@@ -736,6 +743,7 @@ async def create_multi_policy_session(
     policy_ids: List[str],
     durable_id: ObjectId | None = None,
     prepared_rx: Prescription | None = None,
+    response_language: Language = "en",
 ) -> MultiPolicyAnalysisSession:
     """
     Validate ownership and create the parent session with one queued slot per
@@ -761,6 +769,7 @@ async def create_multi_policy_session(
     parent = MultiPolicyAnalysisSession(
         id=durable_id,
         durable_job=durable_id is not None,
+        response_language=response_language,
         user_id=user_id,
         prescription_id=prescription_id,
         status="analyzing" if prepared_rx else "extracting",
@@ -809,6 +818,7 @@ async def _recover_durable_entry(parent: MultiPolicyAnalysisSession, entry: Poli
                 entry.status = "waiting_for_user"
                 entry.stage = "waiting_for_user"
                 entry.questions = pending
+                entry.response_language = child.response_language
                 await _write_entry(parent.id, entry)
                 return True
     return False
@@ -1007,6 +1017,7 @@ async def _run_claimed_resume(
     answers: dict,
     background_tasks: Optional[BackgroundTasks],
     recovering: bool = False,
+    response_language: Language | None = None,
 ) -> MultiPolicyAnalysisSession:
     """Re-analyse one policy whose slot this caller has already claimed."""
     parent_id = str(parent.id)
@@ -1026,6 +1037,7 @@ async def _run_claimed_resume(
                 background_tasks=background_tasks,
                 on_stage=_on_stage,
                 **({"recovering": True} if recovering else {}),
+                **({"response_language": response_language} if response_language is not None else {}),
             )
             async with lock:
                 entry = parent.get_entry(policy_id)
@@ -1063,6 +1075,7 @@ async def resume_policy_analysis(
     answers: dict,
     background_tasks: Optional[BackgroundTasks] = None,
     wait: bool = True,
+    response_language: Language | None = None,
 ) -> dict:
     """
     Answer clarification questions for ONE policy inside a multi-policy session.
@@ -1110,18 +1123,23 @@ async def resume_policy_analysis(
 
     if not wait:
         _detach(
-            _run_claimed_resume(parent, policy_id, child_session_id, user_id, answers, None),
+            _run_claimed_resume(
+                parent, policy_id, child_session_id, user_id, answers, None, response_language=response_language,
+            ),
             f"session={parent.id} policy={policy_id} resume",
         )
         return serialize_multi_session(await _reload(parent))
 
     fresh = await _run_claimed_resume(
-        parent, policy_id, child_session_id, user_id, answers, background_tasks
+        parent, policy_id, child_session_id, user_id, answers, background_tasks, response_language=response_language,
     )
     return serialize_multi_session(fresh)
 
 
-async def resume_durable_policy_analysis(parent: MultiPolicyAnalysisSession, policy_id: str, answers: dict) -> dict:
+async def resume_durable_policy_analysis(
+    parent: MultiPolicyAnalysisSession, policy_id: str, answers: dict, *,
+    response_language: Language | None = None,
+) -> dict:
     """Resume work already claimed by the MongoDB job lease."""
     entry = parent.get_entry(policy_id)
     if not entry:
@@ -1141,6 +1159,7 @@ async def resume_durable_policy_analysis(parent: MultiPolicyAnalysisSession, pol
     )
     fresh = await _run_claimed_resume(
         parent, policy_id, str(child_id), parent.user_id, answers, None, recovering=True,
+        response_language=response_language,
     )
     return serialize_multi_session(fresh)
 
@@ -1150,6 +1169,7 @@ async def _run_claimed_retry(
     policy_id: str,
     user_id: str,
     background_tasks: Optional[BackgroundTasks],
+    response_language: Language | None = None,
 ) -> MultiPolicyAnalysisSession:
     """Analyse one policy again whose slot this caller has already claimed."""
     parent_id = str(parent.id)
@@ -1193,19 +1213,22 @@ async def _run_claimed_retry(
             prescription_json=prescription_json,
             semaphore=asyncio.Semaphore(1),
             background_tasks=background_tasks,
+            response_language=response_language,
         )
         return await _refresh_parent_status(parent)
     finally:
         _mark_active(parent_id, -1)
 
 
-async def retry_durable_policy_analysis(parent: MultiPolicyAnalysisSession, policy_id: str) -> dict:
+async def retry_durable_policy_analysis(
+    parent: MultiPolicyAnalysisSession, policy_id: str, *, response_language: Language | None = None,
+) -> dict:
     entry = parent.get_entry(policy_id)
     if entry is None:
         raise ValueError("Policy not found in analysis job")
     if await _recover_durable_entry(parent, entry):
         return serialize_multi_session(await _refresh_parent_status(parent))
-    fresh = await _run_claimed_retry(parent, policy_id, parent.user_id, None)
+    fresh = await _run_claimed_retry(parent, policy_id, parent.user_id, None, response_language=response_language)
     return serialize_multi_session(fresh)
 
 
@@ -1215,6 +1238,7 @@ async def retry_policy_analysis(
     user_id: str,
     background_tasks: Optional[BackgroundTasks] = None,
     wait: bool = True,
+    response_language: Language | None = None,
 ) -> dict:
     """
     Retry a single failed policy without touching its siblings.
@@ -1260,12 +1284,12 @@ async def retry_policy_analysis(
 
     if not wait:
         _detach(
-            _run_claimed_retry(parent, policy_id, user_id, None),
+            _run_claimed_retry(parent, policy_id, user_id, None, response_language=response_language),
             f"session={parent.id} policy={policy_id} retry",
         )
         return serialize_multi_session(await _reload(parent))
 
-    fresh = await _run_claimed_retry(parent, policy_id, user_id, background_tasks)
+    fresh = await _run_claimed_retry(parent, policy_id, user_id, background_tasks, response_language=response_language)
     return serialize_multi_session(fresh)
 
 
@@ -1357,6 +1381,7 @@ def serialize_multi_session(
         "sessionId": str(parent.id),
         "prescriptionId": parent.prescription_id,
         "status": status,
+        "responseLanguage": parent.response_language,
         "isManualPrescription": parent.is_manual_prescription,
         "totalProcessingTimeMs": parent.total_processing_time_ms,
         "errorMessage": parent.error_message or "",
@@ -1378,6 +1403,7 @@ def serialize_multi_session(
                 "insuranceCompany": e.insurance_company or "",
                 "status": e.status,
                 "overallStatus": e.overall_status or "",
+                "responseLanguage": e.response_language or parent.response_language,
                 "decisionType": e.decision_type or "",
                 "dominanceScore": e.dominance_score or 0.0,
                 "reportId": e.report_id or "",

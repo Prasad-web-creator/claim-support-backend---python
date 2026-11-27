@@ -5,11 +5,12 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from app.core.config import settings
+from app.core.language import Language
 from app.core.security import create_access_token, generate_refresh_token, get_refresh_token_expiry, hash_refresh_token
 from app.models.user import User
 from app.schemas.auth import (
@@ -44,6 +45,7 @@ def _user_payload(user: User) -> dict:
         "phone": user.phone,
         "emailVerified": bool(user.email_verified),
         "googleLinked": bool(user.google_subject),
+        "preferredLanguage": user.preferred_language,
     }
 
 
@@ -106,7 +108,7 @@ async def _check_not_registered(phone: Optional[str], email: str) -> None:
 @limiter.limit(lambda: settings.OTP_SEND_RATE_LIMIT)
 async def send_otp_route(request: Request, body: SendOtpRequest):
     """Send a login or registration OTP by email."""
-    return _sent_payload(await send_otp(normalize_email(body.email), body.purpose))
+    return _sent_payload(await send_otp(normalize_email(body.email), body.purpose, body.language))
 
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
@@ -249,8 +251,17 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 
 class UpdateProfileRequest(BaseModel):
-    name: str
-    email: EmailStr
+    name: str | None = None
+    email: EmailStr | None = None
+    preferredLanguage: Language | None = None
+
+    @model_validator(mode="after")
+    def validate_update(self):
+        if (self.name is None) != (self.email is None):
+            raise ValueError("Name and email are required when updating the name.")
+        if self.name is None and self.preferredLanguage is None:
+            raise ValueError("Provide a profile update.")
+        return self
 
 
 class ChangeEmailSendOtpRequest(BaseModel):
@@ -265,11 +276,16 @@ class ChangeEmailVerifyRequest(BaseModel):
 
 @router.put("/me", response_model=UserResponse)
 async def update_me(request: UpdateProfileRequest, current_user: dict = Depends(get_current_user)):
-    """Update the profile name. Email changes use the verified change-email flow."""
+    """Update the name or language preference."""
     user = await _current(current_user)
-    if normalize_email(request.email) != normalize_email(user.email):
+    if request.email is not None and normalize_email(request.email) != normalize_email(user.email):
         raise HTTPException(status_code=400, detail="Verify your new email address before changing it.")
-    user = await _patch_user(user, {"name": request.name}, expected={"email": user.email})
+    changes = {}
+    if request.name is not None:
+        changes["name"] = request.name
+    if request.preferredLanguage is not None:
+        changes["preferredLanguage"] = request.preferredLanguage
+    user = await _patch_user(user, changes, expected={"email": user.email} if request.email else None)
     return UserResponse(**_user_payload(user))
 
 
@@ -291,7 +307,7 @@ async def send_change_email_otp(
     """Send an OTP to verify a new email address before updating profile."""
     user = await _current(current_user)
     new_email = normalize_email(body.newEmail)
-    return _sent_payload(await send_otp(new_email, f"change_email:{user.id}"))
+    return _sent_payload(await send_otp(new_email, f"change_email:{user.id}", user.preferred_language))
 
 
 @router.post("/me/change-email/verify", response_model=UserResponse)
@@ -332,7 +348,7 @@ async def send_verification_otp(
 ):
     """Send an OTP to the signed-in user's unverified email address."""
     user = await _current(current_user)
-    return _sent_payload(await send_otp(_verification_target(user), f"verify:{user.id}"))
+    return _sent_payload(await send_otp(_verification_target(user), f"verify:{user.id}", user.preferred_language))
 
 
 @router.post("/me/verify", response_model=UserResponse)

@@ -25,6 +25,7 @@ from app.services.analysis_jobs import (
     require_analysis_consent,
 )
 from app.core.config import get_settings
+from app.core.language import preferred_language
 from app.models.analysis_report import AnalysisReport
 from app.services.crud_service import CrudService
 
@@ -71,7 +72,7 @@ async def start_analysis(
             policy_file_id=body.policyPath,
             policy_doc_id=body.policyId,
             prescription_id=body.prescriptionPath,
-            background_tasks=background_tasks
+            background_tasks=background_tasks,
         )
         # It could be needs_clarification or complete
         return {
@@ -206,6 +207,7 @@ async def start_multi_analysis(
             user_id=current_user["id"],
             prescription_id=body.prescriptionPath,
             policy_ids=body.policyIds,
+            response_language=await preferred_language(current_user["id"]),
         )
         schedule_multi_policy_analysis(session, current_user["id"])
         return {"success": True, **serialize_multi_session(session)}
@@ -255,6 +257,7 @@ async def answer_multi_clarification(
             # Re-analysis runs in the background; the app follows it by polling,
             # so a long AI step can never time out the request.
             wait=False,
+            response_language=await preferred_language(current_user["id"]),
         )
         return {"success": True, **result}
     except PermissionError as e:
@@ -343,6 +346,7 @@ async def retry_multi_policy(
             user_id=current_user["id"],
             background_tasks=background_tasks,
             wait=False,
+            response_language=await preferred_language(current_user["id"]),
         )
         return {"success": True, **result}
     except PermissionError as e:
@@ -371,7 +375,8 @@ async def answer_clarification(
             session_id=session_id,
             user_id=current_user["id"],
             answers=body.answers,
-            background_tasks=background_tasks
+            background_tasks=background_tasks,
+            response_language=await preferred_language(current_user["id"]),
         )
         return {
             "success": True,

@@ -9,11 +9,14 @@ from beanie import Document, Indexed
 from pydantic import Field
 from pymongo import ASCENDING, IndexModel
 
+from app.core.language import Language
+
 
 class User(Document):
     """User account document stored in MongoDB."""
 
     name: str
+    preferred_language: Language = Field(default="en", alias="preferredLanguage")
     email: Indexed(str, unique=True)  # type: ignore[valid-type]
     phone: Optional[Indexed(str)] = None  # type: ignore[valid-type]
     # None indicates an account created before email verification was tracked.

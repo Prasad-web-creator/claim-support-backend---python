@@ -3,6 +3,8 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+
+from app.core.language import preferred_language
 import json
 from uuid import uuid4
 
@@ -166,7 +168,8 @@ async def enqueue_job(user_id: str, job_id: str, prescription_id: str, policy_id
             raise HTTPException(404, "Policy not found.")
     updated = await _jobs().find_one_and_update(
         {"_id": job["_id"], "status": "created", "expiresAt": {"$gt": _utcnow()}},
-        {"$set": {"status": "queued", "inputs": requested, "updatedAt": _utcnow()}},
+        {"$set": {"status": "queued", "inputs": requested, "updatedAt": _utcnow(),
+                  "responseLanguage": await preferred_language(user_id)}},
         return_document=ReturnDocument.AFTER,
     )
     final_job = updated or await _find_owned(user_id, job_id)
@@ -324,7 +327,8 @@ async def enqueue_answer(user_id: str, job_id: str, policy_id: str | None, answe
         raise HTTPException(422, "Answer all required clarification questions.")
     updated = await _jobs().find_one_and_update(
         {"_id": job["_id"], "status": "waiting_for_user"},
-        {"$set": {"status": "reanalyzing", "pendingAnswer": pending, "updatedAt": _utcnow()}},
+        {"$set": {"status": "reanalyzing", "pendingAnswer": pending, "updatedAt": _utcnow(),
+                  "operationLanguage": await preferred_language(user_id)}},
         return_document=ReturnDocument.AFTER,
     )
     if updated is None:
@@ -343,7 +347,8 @@ async def enqueue_retry(user_id: str, job_id: str, policy_id: str) -> dict:
         raise HTTPException(409, "Only a failed policy analysis can be retried.")
     updated = await _jobs().find_one_and_update(
         {"_id": job["_id"], "status": job["status"], "leaseToken": None},
-        {"$set": {"status": "reanalyzing", "pendingRetry": policy_id, "updatedAt": _utcnow()},
+        {"$set": {"status": "reanalyzing", "pendingRetry": policy_id, "updatedAt": _utcnow(),
+                  "operationLanguage": await preferred_language(user_id)},
          "$unset": {"error": ""}},
         return_document=ReturnDocument.AFTER,
     )
@@ -406,12 +411,17 @@ async def _process_job(job: dict) -> dict:
                 prepared = rx
         parent = await create_multi_policy_session(
             job["userId"], prescription_id, inputs["policyIds"], durable_id=job["_id"], prepared_rx=prepared,
+            response_language=job.get("responseLanguage", "en"),
         )
     pending = job.get("pendingAnswer")
     if pending:
-        result = await resume_durable_policy_analysis(parent, pending["policyId"], pending["answers"])
+        result = await resume_durable_policy_analysis(
+            parent, pending["policyId"], pending["answers"], response_language=job.get("operationLanguage"),
+        )
     elif job.get("pendingRetry"):
-        result = await retry_durable_policy_analysis(parent, job["pendingRetry"])
+        result = await retry_durable_policy_analysis(
+            parent, job["pendingRetry"], response_language=job.get("operationLanguage"),
+        )
     else:
         result = await run_multi_policy_analysis(parent, job["userId"])
     return {"status": _job_status(result)}

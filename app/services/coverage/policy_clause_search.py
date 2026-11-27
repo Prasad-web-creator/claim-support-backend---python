@@ -10,10 +10,12 @@ the policy is dropped, so only the policy's own wording is ever shown.
 
 import json
 import re
+import unicodedata
 from datetime import datetime
 from typing import Any, List, Optional
 
 from app.core.logging import logger
+from app.services.coverage.verification import NEEDS_VERIFICATION, item_questions, normalize_decisive_question
 from app.services.llm.ai_client import extract_json_with_retry
 
 # Large enough for a full policy wording with annexures.
@@ -90,11 +92,14 @@ that this policy does not state. Use the dates and the COVER DURATION in CLAIM D
   - When an exclusion or benefit decides the item from ONE specific fact that CLAIM DETAILS do not state (for
     example "refractive error less than 7.5 dioptres", a BMI threshold, accident vs illness, alcohol vs another
     cause, cosmetic vs reconstructive, or which insured member is the patient) and that fact changes the result ->
-    "Needs Verification", and state the condition and the outcomes in the reason. Read thresholds exactly: "less
-    than 7.5 dioptres" excludes only values below 7.5.
+    "Needs Verification". In reason, name the missing fact and explain how each answer changes coverage.
+    Supply decisiveQuestion with one answer per side of the condition, plus "Don't know". Copy any number,
+    unit, and comparison boundary from the exact quoted clause. The outcomes must account for the other
+    governing policy terms. "Don't know" stays "Needs Verification".
   - Never assume the deciding fact from the item's name ("jaw fracture" does not prove an accident; "liver
     cirrhosis" neither proves nor rules out alcohol) and never assume who the patient is when CLAIM DETAILS do not
     name them. A benefit limited to a cause (for example "Dental (Accident only)") is a condition too.
+  - Use facts already supplied in USER CLARIFICATIONS. A "Don't know" answer leaves the fact unresolved.
   decision is exactly one of "Covered", "Not Covered", "Partially Covered", "Needs Verification".
   reason is plain, friendly English that names the clauses relied on.
 
@@ -105,6 +110,8 @@ For each clause:
   effect      - one of "Excludes", "Covers", "Waiting Period", "Condition", "Limit", "Definition"
   explanation - plain English: how this passage applies to the item on the evaluation date
   decisive    - true when this passage decides the outcome
+  pageNumber  - include only when the supplied document text explicitly identifies the page
+  clauseNumber - include only when the quoted wording gives an explicit clause number
 List direct mentions first, then decisive clauses, then the rest.
 
 OUTPUT
@@ -116,6 +123,10 @@ OUTPUT
       "directMention": true,
       "decision": "",
       "reason": "",
+      "decisiveQuestion": {
+        "id": "", "title": "", "question": "", "reason": "", "options": [],
+        "outcomes": [{"option": "", "coverageStatus": "", "coverageStatusReason": ""}]
+      },
       "clauses": [
         {"section": "", "quote": "", "effect": "", "explanation": "", "decisive": true}
       ]
@@ -188,7 +199,8 @@ def _claim_details(prescription_json: dict, policy_json: dict, is_manual: bool) 
 
 
 def _alnum(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+    normalized = unicodedata.normalize("NFC", str(text)).casefold()
+    return "".join(char for char in normalized if unicodedata.category(char)[0] in ("L", "M", "N"))
 
 
 def quote_in_policy(quote: str, policy_alnum: str) -> bool:
@@ -199,6 +211,8 @@ def quote_in_policy(quote: str, policy_alnum: str) -> bool:
 
 def _clean_result(raw: dict, policy_text: str) -> List[dict]:
     policy_alnum = _alnum(policy_text)
+    sections = re.split(r"(?im)^\s*--- PAGE (\d+) ---\s*$", policy_text)
+    pages = {int(number): _alnum(text) for number, text in zip(sections[1::2], sections[2::2])}
     items = []
     for it in (raw or {}).get("items") or []:
         if not isinstance(it, dict) or not str(it.get("item") or "").strip():
@@ -217,23 +231,35 @@ def _clean_result(raw: dict, policy_text: str) -> List[dict]:
                 continue
             seen.add(key)
             effect = str(cl.get("effect") or "").strip().title()
-            clauses.append({
+            clause = {
                 "section": str(cl.get("section") or "").strip(),
                 "quote": quote,
                 "effect": effect if effect in CLAUSE_EFFECTS else "Condition",
                 "explanation": str(cl.get("explanation") or "").strip(),
                 "decisive": cl.get("decisive") is True,
-            })
+            }
+            page = cl.get("pageNumber")
+            if type(page) is int and quote_in_policy(quote, pages.get(page, "")):
+                clause["pageNumber"] = page
+            reference = cl.get("clauseNumber")
+            if isinstance(reference, str) and reference.strip() and reference.strip() in quote:
+                clause["clauseNumber"] = reference.strip()
+            clauses.append(clause)
         if dropped:
             logger.info(f"[Policy Clause Search] Dropped {dropped} quote(s) for '{it.get('item')}' not found in the policy text.")
-        items.append({
+        item = {
             "item": str(it["item"]).strip(),
             "relatedTerms": [str(t) for t in (it.get("relatedTerms") or []) if t],
             "directMention": it.get("directMention") is True,
             "decision": str(it.get("decision") or "").strip(),
             "reason": str(it.get("reason") or "").strip(),
             "clauses": clauses,
-        })
+        }
+        if item["decision"] == NEEDS_VERIFICATION and any(clause["decisive"] for clause in clauses):
+            question = normalize_decisive_question(it.get("decisiveQuestion"), item["item"])
+            if question:
+                item["decisiveQuestion"] = question
+        items.append(item)
     return items
 
 
@@ -244,6 +270,8 @@ async def search_policy_clauses(
     is_manual: bool,
     *,
     prescription_text: str = "",
+    clarification_history: Optional[list] = None,
+    response_language: str = "en",
 ) -> List[dict]:
     """Returns one entry per checked item with its decision and verified policy clauses. Never raises."""
     if not policy_text or not prescription_json:
@@ -256,15 +284,31 @@ async def search_policy_clauses(
     prescription_block = (
         f"UPLOADED PRESCRIPTION TEXT\n{prescription_text}\n\n" if prescription_text and not is_manual else ""
     )
+    answers_block = (
+        f"USER CLARIFICATIONS\n{json.dumps(clarification_history, ensure_ascii=False, default=str)}\n\n"
+        if clarification_history else ""
+    )
     user_content = (
         f"CLAIM DETAILS\n{_claim_details(prescription_json, policy_json, is_manual)}\n\n"
         f"{prescription_block}"
+        f"{answers_block}"
         f"==================================================\n\n"
         f"FULL POLICY TEXT\n{policy_text[:MAX_POLICY_CHARS]}"
     )
+    system_prompt = POLICY_CLAUSE_SEARCH_PROMPT
+    if response_language == "ta":
+        system_prompt += """
+
+For each decisiveQuestion, also provide localizedTitle, localizedQuestion and
+localizedReason in natural Tamil, with displayOptions mapping every exact option
+value to its Tamil label. This includes clauses about Annexure I, non-payable
+items and surgical package consumables. Keep option values, outcomes, numbers,
+policy references and original quotations unchanged. These extra fields are
+for presentation only and must not change the coverage decision.
+"""
     try:
         result = await extract_json_with_retry(
-            system_prompt=POLICY_CLAUSE_SEARCH_PROMPT,
+            system_prompt=system_prompt,
             user_content=user_content,
             max_tokens=8192,
             operation_name="Policy Clause Search",
@@ -288,7 +332,11 @@ def format_for_prompt(items: List[dict]) -> str:
 
 
 def _norm_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9 ]+", " ", str(name).lower()).strip()
+    normalized = unicodedata.normalize("NFC", str(name)).casefold()
+    return " ".join("".join(
+        char if unicodedata.category(char)[0] in ("L", "M", "N") else " "
+        for char in normalized
+    ).split())
 
 
 def match_search_item(item_name: str, items: List[dict], only_one_card: bool = False) -> Optional[dict]:
@@ -320,6 +368,29 @@ def attach_policy_clauses(comparison: List[dict], items: List[dict]) -> List[dic
             card["directPolicyMention"] = found["directMention"]
             # The search's own decision, used by the report's consistency checks.
             card["policyClauseDecision"] = found.get("decision") or ""
+            if card["policyClauseDecision"] == NEEDS_VERIFICATION:
+                card["policyClauseReason"] = found["reason"]
+                source_question = found.get("decisiveQuestion")
+                if source_question and not item_questions(card):
+                    card["decisiveQuestion"] = source_question
+                elif source_question:
+                    candidates = [card.get("decisiveQuestion")]
+                    if isinstance(card.get("decisiveQuestions"), list):
+                        candidates.extend(card["decisiveQuestions"])
+                    for candidate in candidates:
+                        normalized = normalize_decisive_question(candidate)
+                        if not normalized or (
+                            normalized["question"] != source_question["question"]
+                            or normalized["options"] != source_question["options"]
+                        ):
+                            continue
+                        for field in ("localizedTitle", "localizedQuestion", "localizedReason"):
+                            if not candidate.get(field) and source_question.get(field):
+                                candidate[field] = source_question[field]
+                        labels = source_question.get("displayOptions")
+                        existing = candidate.get("displayOptions")
+                        if isinstance(labels, dict):
+                            candidate["displayOptions"] = {**labels, **(existing if isinstance(existing, dict) else {})}
     return comparison
 
 
@@ -343,9 +414,10 @@ def comparison_from_search(items: List[dict]) -> List[dict]:
             "directPolicyMention": it["directMention"],
             "policyClauseDecision": it["decision"],
         }
-        if it["decision"] == "Needs Verification":
-            # No decisive question here; the reason states the condition.
+        if it["decision"] == NEEDS_VERIFICATION:
             card["verificationCondition"] = it["reason"]
+            if it.get("decisiveQuestion"):
+                card["decisiveQuestion"] = it["decisiveQuestion"]
             decisive = next((c for c in it["clauses"] if c["decisive"]), None)
             if decisive and decisive.get("section"):
                 card["verificationClause"] = decisive["section"]

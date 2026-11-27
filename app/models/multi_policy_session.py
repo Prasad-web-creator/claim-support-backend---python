@@ -7,6 +7,7 @@ policy, so every policy keeps its own status, clarification state and report.
 """
 
 from datetime import datetime, timezone
+from app.core.language import Language
 from typing import Any, Optional, List
 
 from beanie import Document, Indexed, before_event, Insert, Replace, SaveChanges, Update
@@ -31,6 +32,7 @@ class PolicyAnalysisEntry(BaseModel):
 
     session_id: Optional[str] = Field(default="", alias="sessionId")
     report_id: Optional[str] = Field(default="", alias="reportId")
+    response_language: Optional[Language] = Field(default=None, alias="responseLanguage")
 
     # Mirrors the AnalysisSession status vocabulary, plus "queued" before it starts.
     status: str = Field(default="queued")
@@ -63,6 +65,7 @@ class MultiPolicyAnalysisSession(Document):
     user_id: Indexed(str) = Field(alias="userId")  # type: ignore[valid-type]
     prescription_id: Optional[str] = Field(default="", alias="prescriptionId")
     durable_job: bool = Field(default=False, alias="durableJob")
+    response_language: Language = Field(default="en", alias="responseLanguage")
 
     # queued | extracting | analyzing | waiting_for_user | completed | partial | failed
     status: str = Field(default="queued")

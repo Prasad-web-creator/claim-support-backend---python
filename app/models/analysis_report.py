@@ -4,6 +4,7 @@ Stores the complete output of the AI analysis pipeline.
 """
 
 from datetime import datetime, timezone
+from app.core.language import Language
 from typing import Any, Optional, Union, List
 
 from beanie import Document, Indexed, before_event, Insert, Replace, SaveChanges, Update
@@ -29,6 +30,7 @@ class AnalysisReport(Document):
 
     # ─── Pipeline Status ──────────────────────────────────────────────────────
     status: str = Field(default="pending")  # pending | extracting | analyzing | completed | failed | manual_review_required
+    response_language: Language = Field(default="en", alias="responseLanguage")
     analysis_version: str = Field(default="2.1.0", alias="analysisVersion")
     model: Optional[str] = Field(default="gemini-2.5-flash", alias="model")
     model_version: Optional[str] = Field(default="2.5-flash", alias="modelVersion")
@@ -61,6 +63,7 @@ class AnalysisReport(Document):
     # ─── Snapshot Caches ──────────────────────────────────────────────────────
     policy_json: Optional[dict] = Field(default_factory=dict, alias="policyJson")
     prescription_json: Optional[dict] = Field(default_factory=dict, alias="prescriptionJson")
+    localized_prescription: dict = Field(default_factory=dict, alias="localizedPrescription")
     policy_text: Optional[str] = Field(default="", alias="policyText")
     prescription_text: Optional[str] = Field(default="", alias="prescriptionText")
 

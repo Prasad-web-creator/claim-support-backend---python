@@ -157,6 +157,20 @@ def _fmt(d: Optional[date]) -> str:
     return d.strftime("%d %b %Y") if d else "an unstated date"
 
 
+def _fmt_ta(d: Optional[date]) -> str:
+    return d.strftime("%d/%m/%Y") if d else "குறிப்பிடப்படாத தேதி"
+
+
+_TA_CLAIM_SOURCE = {
+    "Admission date": "மருத்துவமனையில் அனுமதிக்கப்பட்ட தேதி",
+    "Hospitalization date": "மருத்துவமனையில் அனுமதிக்கப்பட்ட தேதி",
+    "Treatment date": "சிகிச்சை தேதி",
+    "Visit date": "மருத்துவரைச் சந்தித்த தேதி",
+    "Consultation date": "மருத்துவ ஆலோசனை தேதி",
+    "Prescription date": "மருந்துச் சீட்டு தேதி",
+}
+
+
 def resolve_claim_date(prescription_json: Optional[dict]) -> Tuple[Optional[date], str]:
     """The claim/hospitalization date and the field it came from."""
     rx = prescription_json or {}
@@ -277,7 +291,7 @@ class _Evaluation:
         self.periods: List[_Period] = []
         self.by_key: Dict[str, _Period] = {}
         self.links: Dict[Tuple[str, str], str] = {}     # (earlier, later) -> kind
-        self.conflicts: List[Tuple[set, str]] = []      # (involved keys, text)
+        self.conflicts: List[Tuple[set, str, str]] = []  # (involved keys, English, Tamil)
         self.notes: List[Tuple[set, str]] = []          # (involved keys, text)
         self.excluded: List[dict] = []                  # undated / duplicate inputs
 
@@ -338,6 +352,7 @@ def _build(policies: List[dict]) -> _Evaluation:
             ev.conflicts.append((
                 {period.key},
                 f"{period.label}: policy end date {_fmt(period.end)} is before its start date {_fmt(period.start)}.",
+                f"{period.label}: காப்பீடு முடியும் தேதி {_fmt_ta(period.end)}, தொடக்கத் தேதி {_fmt_ta(period.start)}க்கு முன் உள்ளது.",
             ))
             period.end = None
             continue
@@ -378,12 +393,16 @@ def _build(policies: List[dict]) -> _Evaluation:
                     {p.key, matched.key},
                     f"{p.label} states the previous policy ended on {_fmt(p.previous_end)}, "
                     f"but {matched.label} ends on {_fmt(matched.end)}.",
+                    f"{p.label} முந்தைய காப்பீடு {_fmt_ta(p.previous_end)} அன்று முடிந்ததாகக் கூறுகிறது. "
+                    f"{matched.label} ஆவணத்தில் முடிவுத் தேதி {_fmt_ta(matched.end)} என உள்ளது.",
                 ))
             if p.previous_start and matched.start and p.previous_start != matched.start:
                 ev.conflicts.append((
                     {p.key, matched.key},
                     f"{p.label} states the previous policy started on {_fmt(p.previous_start)}, "
                     f"but {matched.label} starts on {_fmt(matched.start)}.",
+                    f"{p.label} முந்தைய காப்பீடு {_fmt_ta(p.previous_start)} அன்று தொடங்கியதாகக் கூறுகிறது. "
+                    f"{matched.label} ஆவணத்தில் தொடக்கத் தேதி {_fmt_ta(matched.start)} என உள்ளது.",
                 ))
             continue
         declared = _Period(
@@ -420,6 +439,8 @@ def _build(policies: List[dict]) -> _Evaluation:
                         {a.key, b.key},
                         f"{a.label} and {b.label} carry the same policy number but have overlapping, "
                         f"different periods ({_fmt(a.start)} – {_fmt(a.end)} and {_fmt(b.start)} – {_fmt(b.end)}).",
+                        f"{a.label}, {b.label} ஆகியவற்றில் ஒரே காப்பீட்டு எண் உள்ளது. அவற்றின் வெவ்வேறு காலங்கள் ஒன்றுடன் ஒன்று ஒட்டுகின்றன "
+                        f"({_fmt_ta(a.start)} – {_fmt_ta(a.end)} மற்றும் {_fmt_ta(b.start)} – {_fmt_ta(b.end)}).",
                     ))
 
             _consider_consecutive(ev, a, b)
@@ -432,6 +453,7 @@ def _build(policies: List[dict]) -> _Evaluation:
                 {k1, k2},
                 f"{later.label} is described as a fresh (non-renewal) policy, but the documents link it to "
                 f"{ev.by_key[k1].label}.",
+                f"{later.label} புதிய காப்பீடாகக் குறிப்பிடப்பட்டுள்ளது. ஆவணங்கள் அதை {ev.by_key[k1].label} உடன் இணைக்கின்றன.",
             ))
 
     return ev
@@ -596,48 +618,68 @@ def declared_policy_continuity(policy_json: Optional[dict], prescription_json: O
     if not claim:
         status = STATUS_UNKNOWN
         summary = "The admission or consultation date is not available, so continuity up to the claim date cannot be checked."
+        summary_ta = "மருத்துவமனையில் அனுமதிக்கப்பட்ட தேதியோ ஆலோசனை தேதியோ கிடைக்கவில்லை. கோரிக்கை தேதி வரை காப்பீடு தொடர்ந்ததா எனச் சரிபார்க்க முடியவில்லை."
     elif not start or not end:
         status = STATUS_UNKNOWN
         summary = "The current policy period could not be read from the uploaded policy document."
+        summary_ta = "பதிவேற்றிய ஆவணத்திலிருந்து தற்போதைய காப்பீட்டுக் காலத்தைப் படிக்க முடியவில்லை."
     elif claim < inception:
         status = STATUS_UNKNOWN
         summary = (f"The claim date {_fmt(claim)} is before the policy inception date you entered "
                    f"({_fmt(inception)}), so it is not covered by this policy.")
+        summary_ta = f"கோரிக்கை தேதி {_fmt_ta(claim)}, நீங்கள் உள்ளிட்ட தொடக்கத் தேதி {_fmt_ta(inception)}க்கு முன் வருகிறது. அந்தத் தேதிக்கு இந்தக் காப்பீடு பொருந்தாது."
     elif claim > end:
         status = STATUS_GAP
         summary = f"The current policy ended on {_fmt(end)}, before the claim date {_fmt(claim)}."
+        summary_ta = f"கோரிக்கை தேதி {_fmt_ta(claim)}க்கு முன், {_fmt_ta(end)} அன்று தற்போதைய காப்பீடு முடிந்தது."
         gaps.append({"from": _iso(end + timedelta(days=1)), "to": _iso(claim), "days": (claim - end).days,
-                     "description": "No active policy on the claim date."})
+                     "description": "No active policy on the claim date.",
+                     "descriptionTa": "கோரிக்கை தேதியில் நடைமுறையில் இருந்த காப்பீடு இல்லை."})
     elif break_applies and claim < start:
         status = STATUS_GAP
         # After a break, cover is counted only from the uploaded policy's start date.
         summary = (f"You have a coverage gap in your policy continuity since it was first taken on "
                    f"{_fmt(inception)}. Cover is counted from the uploaded policy's start date ({_fmt(start)}), "
                    f"which is after the claim date {_fmt(claim)}, so this policy does not cover that date.")
+        summary_ta = (
+            f"முதல் தொடக்கத் தேதி {_fmt_ta(inception)}க்குப் பிறகு காப்பீட்டில் இடைவெளி ஏற்பட்டுள்ளது. "
+            f"பதிவேற்றிய காப்பீடு {_fmt_ta(start)} அன்றுதான் தொடங்குகிறது. அதற்கு முந்தைய கோரிக்கை தேதி {_fmt_ta(claim)}க்கு இது பொருந்தாது."
+        )
     elif break_applies:
         status = STATUS_GAP
         # The break dates are not asked: cover is counted from the uploaded policy's start date.
         summary = (f"You have a coverage gap in your policy continuity since it was first taken on "
                    f"{_fmt(inception)}. So your prescription is analysed against this policy from the "
                    f"uploaded policy's start date ({_fmt(start)}); waiting periods count from that date.")
+        summary_ta = (
+            f"முதல் தொடக்கத் தேதி {_fmt_ta(inception)}க்குப் பிறகு காப்பீட்டில் இடைவெளி ஏற்பட்டுள்ளது. "
+            f"பதிவேற்றிய காப்பீடு தொடங்கிய {_fmt_ta(start)} தேதியிலிருந்து மருந்துச் சீட்டு மதிப்பிடப்படும். காத்திருப்புக் காலம் அன்றிலிருந்து கணக்கிடப்படும்."
+        )
         # The break's dates are not known, so no gap row is listed; the summary explains it.
     elif is_new:
         status = STATUS_VERIFIED
         summary = (f"This is a new policy, first taken on {_fmt(inception)}. Cover has been active from that date "
                    f"to the claim date {_fmt(claim)}.")
+        summary_ta = f"இது புதிய காப்பீடு. {_fmt_ta(inception)} முதல் கோரிக்கை தேதி {_fmt_ta(claim)} வரை காப்பீடு நடைமுறையில் இருந்தது."
     elif renewal is True and not has_earlier_periods:
         status = STATUS_VERIFIED
         summary = (f"This is a renewed policy. Cover is counted from {_fmt(inception)}, the start of the uploaded "
                    f"policy period and the earliest start date known, and has been active from then to the claim "
                    f"date {_fmt(claim)}.")
+        summary_ta = (
+            f"இது புதுப்பிக்கப்பட்ட காப்பீடு. பதிவேற்றிய ஆவணத்தில் கிடைத்த முதல் தொடக்கத் தேதி {_fmt_ta(inception)}. "
+            f"அன்றிலிருந்து கோரிக்கை தேதி {_fmt_ta(claim)} வரை காப்பீடு நடைமுறையில் இருந்தது."
+        )
     else:
         status = STATUS_VERIFIED
         summary = f"Cover has continued without interruption from {_fmt(inception)} to the claim date {_fmt(claim)}."
+        summary_ta = _verified_summary_ta(inception, claim)
 
     return {
         "status": status,
         "statusCode": STATUS_CODES[status],
         "summary": summary,
+        "summaryTa": summary_ta,
         "declared": True,
         "originalPolicyStartDate": _iso(inception),
         "originalPolicyStartSource": "Entered by you",
@@ -645,9 +687,11 @@ def declared_policy_continuity(policy_json: Optional[dict], prescription_json: O
         "coverRestartDate": None,
         "breakStartDate": None,
         "isRenewal": None if pj.get("isRenewal") is None else _bool(pj.get("isRenewal")),
-        "currentPolicy": {"label": label, "startDate": _iso(start), "endDate": _iso(end)},
+        "currentPolicy": {"label": label, "labelTa": label if insurer or number else "தற்போதைய காப்பீடு",
+                          "startDate": _iso(start), "endDate": _iso(end)},
         "claimDate": _iso(claim),
         "claimDateSource": claim_source,
+        "claimDateSourceTa": _TA_CLAIM_SOURCE.get(claim_source, ""),
         "coverageGaps": gaps,
         "continuityConflicts": [],
         "missingInformation": [],
@@ -711,16 +755,20 @@ def evaluate_policy_continuity(
 
     evidence: List[dict] = []
     missing: List[str] = []
+    missing_ta: List[str] = []
     gaps: List[dict] = []
 
     if claim_date is None:
         missing.append("Claim/hospitalization date is not available from the prescription.")
+        missing_ta.append("கோரிக்கை அல்லது மருத்துவமனை அனுமதி தேதி மருந்துச் சீட்டில் கிடைக்கவில்லை.")
     if target is None:
         missing.append("The policy's start date is not stated, so its period cannot be placed on a timeline.")
+        missing_ta.append("காப்பீட்டுத் தொடக்கத் தேதி குறிப்பிடப்படவில்லை. அதன் காலத்தை வரிசைப்படுத்த முடியவில்லை.")
 
     # Conflicts/notes only matter when they touch this policy's lineage.
     scope = component_keys or ({target.key} if target else set())
-    conflicts = [text for keys, text in ev.conflicts if keys & scope]
+    conflicts = [text for keys, text, _ in ev.conflicts if keys & scope]
+    conflicts_ta = [text for keys, _, text in ev.conflicts if keys & scope]
     for keys, text in ev.notes:
         if keys & scope:
             evidence.append({"type": "note", "description": text, "policyLabels": []})
@@ -730,6 +778,7 @@ def evaluate_policy_continuity(
     later: List[_Period] = []
     claim_covered = False
     unverified_links: List[str] = []
+    unverified_links_ta: List[str] = []
     continuous_from = None
 
     if target is not None and claim_date is not None:
@@ -754,6 +803,7 @@ def evaluate_policy_continuity(
                 unverified_links.append(
                     f"The end date before {p.label} is not stated, so the step into it cannot be checked."
                 )
+                unverified_links_ta.append(f"{p.label}க்கு முந்தைய காப்பீட்டின் முடிவுத் தேதி குறிப்பிடப்படவில்லை. காப்பீடு தொடர்ந்ததா என்று சரிபார்க்க முடியவில்லை.")
             elif p.start and (p.start - frontier).days > MAX_CONTINUOUS_STEP_DAYS:
                 _add_gap(gaps, frontier, p.start, p, timeline)
                 continuous_from = p.start
@@ -782,13 +832,16 @@ def evaluate_policy_continuity(
                         f"No cover between {_fmt(frontier + timedelta(days=1))} and "
                         f"{_fmt(next_start - timedelta(days=1))}, which includes the claim date."
                     ),
+                    "descriptionTa": "கோரிக்கை தேதி காப்பீடு இல்லாத இந்த இடைவெளியில் வருகிறது.",
                 })
             elif frontier is None and timeline and timeline[-1].end is None:
                 missing.append(
                     f"The end date of {timeline[-1].label} is not stated, so cover on the claim date cannot be confirmed."
                 )
+                missing_ta.append(f"{timeline[-1].label} முடியும் தேதி குறிப்பிடப்படவில்லை. கோரிக்கை தேதியில் காப்பீடு இருந்ததா என்பதை உறுதிப்படுத்த முடியவில்லை.")
             else:
                 missing.append("None of the evaluated policies covers the claim/hospitalization date.")
+                missing_ta.append("மதிப்பிட்ட காப்பீடுகளில் எதுவும் கோரிக்கை அல்லது மருத்துவமனை அனுமதி தேதிக்குப் பொருந்தவில்லை.")
 
         if claim_covered:
             evidence.append({
@@ -825,6 +878,7 @@ def evaluate_policy_continuity(
                     f"{p.label} states continuous coverage since {_fmt(p.continuous_since)}, "
                     f"which is after its own start date {_fmt(p.start)}."
                 )
+                conflicts_ta.append(f"{p.label} காப்பீடு {_fmt_ta(p.continuous_since)} முதல் தொடர்வதாகக் கூறுகிறது. அந்தத் தேதி அதன் தொடக்கத் தேதி {_fmt_ta(p.start)}க்குப் பிறகு வருகிறது.")
             else:
                 contradicting = [
                     g for g in gaps
@@ -838,6 +892,10 @@ def evaluate_policy_continuity(
                         f"{p.label} states continuous coverage since {_fmt(p.continuous_since)}, but the "
                         f"policy periods show a gap from {_fmt(parse_policy_date(g['from']))} to "
                         f"{_fmt(parse_policy_date(g['to']))}."
+                    )
+                    conflicts_ta.append(
+                        f"{p.label} காப்பீடு {_fmt_ta(p.continuous_since)} முதல் தொடர்வதாகக் கூறுகிறது. "
+                        f"ஆவணங்களில் {_fmt_ta(parse_policy_date(g['from']))} முதல் {_fmt_ta(parse_policy_date(g['to']))} வரை இடைவெளி உள்ளது."
                     )
                 else:
                     origin_candidates.append((p.continuous_since, f"continuous coverage date stated in {p.label}"))
@@ -888,9 +946,16 @@ def evaluate_policy_continuity(
                     f"{current.label} is a renewal, but the previous policy period is not documented, "
                     "so the original start date cannot be confirmed."
                 )
+                missing_ta.append(
+                    f"{current.label} புதுப்பிக்கப்பட்ட காப்பீடு. முந்தைய காப்பீட்டுக் காலம் ஆவணத்தில் இல்லாததால் "
+                    "முதல் தொடக்கத் தேதியை உறுதிப்படுத்த முடியவில்லை."
+                )
             else:
                 missing.append(
                     f"{current.label} does not state whether it is a renewal, and no earlier policy was provided."
+                )
+                missing_ta.append(
+                    f"{current.label} புதுப்பிக்கப்பட்டதா என்பது குறிப்பிடப்படவில்லை. முந்தைய காப்பீட்டு ஆவணமும் வழங்கப்படவில்லை."
                 )
 
     # ─── Status ──────────────────────────────────────────────────────────────
@@ -905,6 +970,7 @@ def evaluate_policy_continuity(
     else:
         status = STATUS_VERIFIED
     missing.extend(unverified_links)
+    missing_ta.extend(unverified_links_ta)
 
     established = status in (STATUS_VERIFIED, STATUS_GAP)
     earliest_documented = min(
@@ -918,6 +984,7 @@ def evaluate_policy_continuity(
         "status": status,
         "statusCode": STATUS_CODES[status],
         "summary": _summary(status, original_start, claim_date, gaps, conflicts, missing),
+        "summaryTa": _summary_ta(status, original_start, claim_date, gaps, conflicts_ta, missing_ta),
         # Only stated as the original start when the history supports it; the
         # earliest date the documents show is always available separately.
         "originalPolicyStartDate": _iso(original_start) if established else None,
@@ -927,11 +994,14 @@ def evaluate_policy_continuity(
         "currentPolicy": _current_row(current or target),
         "claimDate": _iso(claim_date),
         "claimDateSource": claim_source,
+        "claimDateSourceTa": _TA_CLAIM_SOURCE.get(claim_source, ""),
         "coverageGaps": gaps,
         "continuityConflicts": conflicts,
+        "continuityConflictsTa": conflicts_ta,
         "policiesEvaluated": policies_evaluated,
         "continuityEvidence": evidence,
         "missingInformation": missing,
+        "missingInformationTa": missing_ta,
         "engineVersion": ENGINE_VERSION,
         "evaluatedAt": datetime.now(timezone.utc).isoformat(),
     }
@@ -943,6 +1013,10 @@ def _current_row(p: Optional[_Period]) -> dict:
     return {
         "policyId": p.policy_id,
         "label": p.label,
+        "labelTa": (
+            f"காப்பீடு {p.number}" if p.label == f"Policy {p.number}" else
+            "காப்பீடு" if p.label == "Policy" else p.label
+        ),
         "policyNumber": p.number,
         "startDate": _iso(p.start),
         "endDate": _iso(p.end),
@@ -970,6 +1044,14 @@ def _add_gap(gaps: List[dict], frontier: date, next_start: date, p: _Period, tim
                 "continuity benefits were retained."
                 if days <= RENEWAL_GRACE_DAYS
                 else ""
+            )
+        ),
+        "descriptionTa": (
+            f"{previous.label + ' முடிந்த ' if previous else ''}{_fmt_ta(frontier)} தேதிக்கும் "
+            f"{p.label} தொடங்கிய {_fmt_ta(next_start)} தேதிக்கும் இடையில் {days} நாட்கள் காப்பீடு இல்லை."
+            + (
+                " இது வழக்கமான புதுப்பிப்புச் சலுகைக் காலத்திற்குள் உள்ளது. தொடர்ச்சிப் பலன்கள் நீடிக்கிறதா என்பதை காப்பீட்டு நிறுவனத்திடம் உறுதிப்படுத்தவும்."
+                if days <= RENEWAL_GRACE_DAYS else ""
             )
         ),
     })
@@ -1021,5 +1103,23 @@ def _summary(status, original_start, claim_date, gaps, conflicts, missing) -> st
         return "The policy documents disagree about the coverage history: " + conflicts[0]
     reason = missing[0] if missing else "The documents do not contain enough information."
     return "Continuity cannot be established from the documents provided. " + reason
+
+
+def _verified_summary_ta(original_start, claim_date) -> str:
+    return f"{_fmt_ta(original_start)} முதல் கோரிக்கை தேதி {_fmt_ta(claim_date)} வரை காப்பீடு இடைவெளியின்றித் தொடர்ந்தது."
+
+
+def _summary_ta(status, original_start, claim_date, gaps, conflicts, missing) -> str:
+    if status == STATUS_VERIFIED:
+        return _verified_summary_ta(original_start, claim_date)
+    if status == STATUS_GAP:
+        if any(gap.get("coversClaimDate") for gap in gaps):
+            return "கோரிக்கை தேதி காப்பீடு இல்லாத இடைவெளியில் வருகிறது."
+        total = sum(gap.get("days") or 0 for gap in gaps)
+        return f"கோரிக்கை தேதிக்கு முன் {len(gaps)} இடைவெளிகளில் மொத்தம் {total} நாட்கள் காப்பீடு இல்லை."
+    if status == STATUS_CONFLICT:
+        return f"காப்பீட்டுத் தொடர்ச்சி குறித்து ஆவணங்களில் முரண்பாடு உள்ளது. {conflicts[0]}"
+    detail = missing[0] if missing else "ஆவணங்களில் போதுமான தகவல் இல்லை."
+    return f"வழங்கிய ஆவணங்களிலிருந்து காப்பீட்டுத் தொடர்ச்சியை உறுதிப்படுத்த முடியவில்லை. {detail}"
 
 

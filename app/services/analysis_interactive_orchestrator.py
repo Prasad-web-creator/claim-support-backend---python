@@ -8,7 +8,9 @@ from beanie import PydanticObjectId as ObjectId
 from pymongo.errors import DuplicateKeyError
 import json
 import re
+import unicodedata
 from app.services.analysis_persistence import finish_analysis_write
+from app.core.language import Language, preferred_language
 from app.core.logging import logger, log_section
 from app.models.analysis_report import AnalysisReport
 from app.models.analysis_session import AnalysisSession, ClarificationQuestion, ClarificationAnswer
@@ -24,6 +26,7 @@ from app.services.coverage.business_rules import enforce_business_rules
 from app.services.coverage.coverage_analysis import analyze_coverage
 from app.services.coverage.policy_continuity import declared_policy_inputs
 from app.services.coverage.report_generator import generate_report
+from app.services.coverage.presentation_language import MANUAL_REVIEW, localize_question, localize_report, tamil_text
 from app.services.coverage.verification import (
     NEEDS_VERIFICATION,
     apply_decisive_answers,
@@ -636,6 +639,7 @@ async def _continue_renewed(session: AnalysisSession) -> Optional[dict]:
 
 async def _ask_clarification(session: AnalysisSession, questions: list) -> dict:
     """Store the questions on the session and pause it for the user's answers."""
+    questions = [localize_question(q, session.response_language) for q in questions]
     for q in questions:
         session.questions.append(ClarificationQuestion(
             id=q["id"],
@@ -649,12 +653,16 @@ async def _ask_clarification(session: AnalysisSession, questions: list) -> dict:
             initialDate=q.get("initialDate"),
             minDate=q.get("minDate"),
             maxDate=q.get("maxDate"),
+            displayOptions=q.get("displayOptions"),
+            responseLanguage=q["responseLanguage"],
+            canonicalQuestion=q.get("canonicalQuestion"),
         ))
     session.status = "waiting_for_user"
     await finish_analysis_write(session.save())
     return {
         "status": "needs_clarification",
         "sessionId": str(session.id),
+        "responseLanguage": session.response_language,
         "questions": questions,
     }
 
@@ -1042,7 +1050,7 @@ async def run_single_policy_analysis(
 
         # Do NOT store invalid coverage summary report in DB as per user requirement
         final_report["status"] = "complete"
-        return final_report
+        return localize_report(final_report, {}, session.response_language)
 
     # Policies extracted before the continuity check existed are read for their
     # coverage-history facts once; the result is cached on the Policy record.
@@ -1138,7 +1146,7 @@ async def start_analysis_session(
     prescription_id: str,
     policy_file_id: Optional[str] = None,
     policy_doc_id: Optional[str] = None,
-    background_tasks: Optional[BackgroundTasks] = None
+    background_tasks: Optional[BackgroundTasks] = None,
 ) -> dict:
     start_time = time.time()
     log_section("Claim Analysis Started")
@@ -1148,6 +1156,7 @@ async def start_analysis_session(
         user_id=user_id,
         policy_id=policy_doc_id or policy_file_id,
         prescription_id=prescription_id,
+        response_language=await preferred_language(user_id),
         status="extracting"
     )
     await finish_analysis_write(session.insert())
@@ -1247,15 +1256,41 @@ def _clarification_history(session: AnalysisSession) -> list:
             history.append({
                 "Question_ID": q.id,
                 "Title": q.title,
-                "Question": q.question,
+                "Question": getattr(q, "canonicalQuestion", None) or q.question,
                 "User_Answer": answer_obj.answer
             })
     return history
 
 
+def _clarification_display_history(session: AnalysisSession, history: list) -> list:
+    questions = {question.id: question for question in session.questions}
+    displayed = []
+    for row in history:
+        question = questions.get(row["Question_ID"])
+        if question is None or getattr(question, "responseLanguage", None) != "ta":
+            displayed.append(row)
+            continue
+        answer = row["User_Answer"]
+        labels = getattr(question, "displayOptions", None) or {}
+        displayed.append({
+            **row,
+            "responseLanguage": "ta",
+            "displayQuestion": question.question,
+            "displayAnswer": (
+                [labels.get(value, value) if isinstance(value, str) else value for value in answer]
+                if isinstance(answer, list) else labels.get(answer, answer) if isinstance(answer, str) else answer
+            ),
+        })
+    return displayed
+
+
 def _question_key(text) -> str:
     """Wording of a question reduced to letters/digits, to spot the same question re-asked."""
-    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).split())
+    normalized = unicodedata.normalize("NFC", str(text or "")).casefold()
+    return " ".join("".join(
+        char if unicodedata.category(char)[0] in ("L", "M", "N") else " "
+        for char in normalized
+    ).split())
 
 
 def _already_asked(session: AnalysisSession, q_data: dict, also: list = ()) -> bool:
@@ -1265,10 +1300,12 @@ def _already_asked(session: AnalysisSession, q_data: dict, also: list = ()) -> b
     re-asks an answered question with a new id; the user must never see it twice.
     """
     q_id = q_data.get("id")
-    key = _question_key(q_data.get("question"))
+    key = _question_key(q_data.get("canonicalQuestion") or q_data.get("question"))
     for q in list(session.questions) + list(also):
         other_id = q.id if hasattr(q, "id") else q.get("id")
-        other_text = q.question if hasattr(q, "question") else q.get("question")
+        other_text = (getattr(q, "canonicalQuestion", None) or q.question) if hasattr(q, "question") else (
+            q.get("canonicalQuestion") or q.get("question")
+        )
         if q_id and other_id == q_id:
             return True
         if key and key == _question_key(other_text):
@@ -1297,7 +1334,9 @@ DECIDE_WITH_ANSWERS_INSTRUCTION = (
 )
 
 
-def _manual_review_result(policy_json: dict, prescription_json: dict, br_results: dict, reason: str) -> dict:
+def _manual_review_result(
+    policy_json: dict, prescription_json: dict, br_results: dict, reason: str, language: Language,
+) -> dict:
     """A complete Coverage Summary for an undecided case, so the app never opens an empty screen."""
     report = generate_report(
         policy_json=policy_json or {},
@@ -1307,8 +1346,8 @@ def _manual_review_result(policy_json: dict, prescription_json: dict, br_results
         processing_time_ms=0,
     )
     report["status"] = "manual_review_required"
-    report["reason"] = reason
-    return report
+    report["reason"] = MANUAL_REVIEW if language == "ta" else reason
+    return localize_report(report, {"summary": report["reason"]}, language)
 
 
 async def _run_llm_analysis(
@@ -1333,6 +1372,7 @@ async def _run_llm_analysis(
         return _manual_review_result(
             policy_json, prescription_json, br_results,
             "The information provided was not enough to decide automatically. This case needs manual review.",
+            session.response_language,
         )
 
     clarification_history = _clarification_history(session)
@@ -1352,6 +1392,7 @@ async def _run_llm_analysis(
         policy_json=session.policy_json or {},
         # Reports the whole-policy clause search and coverage analysis stages.
         on_stage=lambda stage: _report_stage(on_stage, stage),
+        response_language=session.response_language,
     )
 
     # The AI only re-asked questions the user has already answered: run it once
@@ -1374,6 +1415,7 @@ async def _run_llm_analysis(
             policy_json=session.policy_json or {},
             on_stage=lambda stage: _report_stage(on_stage, stage),
             extra_instruction=DECIDE_WITH_ANSWERS_INSTRUCTION,
+            response_language=session.response_language,
         )
 
     llm_round_duration_ms = int((time.time() - llm_start_time) * 1000)
@@ -1413,6 +1455,7 @@ async def _run_llm_analysis(
                     logger.warning(f"[Claim Analysis] Session {session.id} reached max 10 questions.")
                     break
                 
+                q_data = localize_question(q_data, session.response_language)
                 session.questions.append(ClarificationQuestion(
                     id=q_id,
                     title=q_data.get("title", ""),
@@ -1421,7 +1464,10 @@ async def _run_llm_analysis(
                     category=q_data.get("category"),
                     required=q_data.get("required", True),
                     options=q_data.get("options", []),
-                    reason=q_data.get("reason", "")
+                    reason=q_data.get("reason", ""),
+                    displayOptions=q_data.get("displayOptions"),
+                    responseLanguage=q_data["responseLanguage"],
+                    canonicalQuestion=q_data.get("canonicalQuestion"),
                 ))
                 filtered_questions.append(q_data)
         
@@ -1435,6 +1481,7 @@ async def _run_llm_analysis(
             return _manual_review_result(
                 policy_json, prescription_json, br_results,
                 "Coverage could not be decided automatically from the information provided. This case needs manual review.",
+                session.response_language,
             )
 
         session.status = "waiting_for_user"
@@ -1446,6 +1493,7 @@ async def _run_llm_analysis(
         return {
             "status": "needs_clarification",
             "sessionId": str(session.id),
+            "responseLanguage": session.response_language,
             "questions": filtered_questions
         }
 
@@ -1528,12 +1576,15 @@ async def _pause_for_decisive_questions(
         if not questions:
             return None
 
-        stored_analysis = json.loads(json.dumps(analysis_data, default=str))
+        # Keep the same questions and conditions the report checks prepared.
+        stored_analysis = json.loads(json.dumps({
+            **analysis_data, "comparison": preview["comparison"],
+        }, default=str))
     except Exception as e:
         logger.warning(f"[Claim Analysis] Could not prepare verification questions: {type(e).__name__}")
         return None
 
-    client_questions = [client_question(dq) for dq in questions]
+    client_questions = [localize_question(client_question(dq), session.response_language) for dq in questions]
     for q_data in client_questions:
         session.questions.append(ClarificationQuestion(
             id=q_data["id"],
@@ -1544,12 +1595,17 @@ async def _pause_for_decisive_questions(
             required=q_data.get("required", True),
             options=q_data.get("options", []),
             reason=q_data.get("reason", ""),
+            displayOptions=q_data.get("displayOptions"),
+            optionStatuses=q_data.get("optionStatuses"),
+            responseLanguage=q_data["responseLanguage"],
+            canonicalQuestion=q_data.get("canonicalQuestion"),
         ))
 
     session.pending_analysis = {
         "analysis": stored_analysis,
         "confidence": confidence,
         "questionIds": [q["id"] for q in client_questions],
+        "responseLanguage": session.response_language,
     }
     session.accumulated_processing_time_ms = total_processing_time
     session.status = "waiting_for_user"
@@ -1567,6 +1623,7 @@ async def _pause_for_decisive_questions(
     return {
         "status": "needs_clarification",
         "sessionId": str(session.id),
+        "responseLanguage": session.response_language,
         "questions": client_questions,
     }
 
@@ -1592,6 +1649,7 @@ async def _complete_from_decisive_answers(
     pending = session.pending_analysis or {}
     question_ids = pending.get("questionIds") or []
     analysis_data = copy.deepcopy(pending.get("analysis") or {})
+    response_language = pending.get("responseLanguage") or session.response_language
     session.pending_analysis = {}
 
     resolved, unresolved = apply_decisive_answers(
@@ -1634,6 +1692,7 @@ async def _complete_from_decisive_answers(
         error_reason=None,
         background_tasks=background_tasks,
         on_stage=on_stage,
+        response_language=response_language,
     )
 
 
@@ -1652,8 +1711,10 @@ async def _complete_with_report(
     error_reason: Optional[str],
     background_tasks: Optional[BackgroundTasks],
     on_stage: Optional[Callable[[str], Awaitable[None]]] = None,
+    response_language: Language | None = None,
 ) -> dict:
     """Generate, persist and return the final report of a session."""
+    language = response_language or session.response_language
     await _report_stage(on_stage, "report")
     session.accumulated_processing_time_ms = total_processing_time
     session.status = "completed" if next_action == "generate_report" else "manual_review_required"
@@ -1668,6 +1729,9 @@ async def _complete_with_report(
         coverage_analysis=analysis_data,
         processing_time_ms=total_processing_time
     )
+    localize_report(final_report, analysis_data, language)
+    if language == "ta" and error_reason:
+        error_reason = tamil_text(error_reason) or MANUAL_REVIEW
 
     if str(final_report.get("overallStatus", "")).startswith("Invalid"):
         logger.info("[Claim Analysis] Invalid report status; skipping DB insertion as requested.")
@@ -1678,6 +1742,7 @@ async def _complete_with_report(
         user_id=session.user_id,
         policy_id=session.policy_id,
         prescription_id=session.prescription_id,
+        response_language=language,
         status="completed" if next_action == "generate_report" else "manual_review_required",
         analysis_version="2.1.0",
         model="gemini-2.5-flash",
@@ -1689,6 +1754,7 @@ async def _complete_with_report(
         policy_json=policy_json,
         prescription_json=prescription_json,
         business_rules=br_results,
+        localized_prescription=final_report.get("localizedPrescription") or {},
         coverage_analysis=analysis_data,
         document_validity=final_report.get("documentValidity"),
         overall_status=final_report.get("overallStatus"),
@@ -1706,7 +1772,7 @@ async def _complete_with_report(
         confidence_score=confidence,
         policy_clauses_used=analysis_data.get("policyClausesUsed", []),
         prescription_evidence=analysis_data.get("prescriptionEvidence", []),
-        clarification_answers_used=clarification_history,
+        clarification_answers_used=_clarification_display_history(session, clarification_history),
         session_id=str(session.id),
         parent_session_id=session.parent_session_id or "",
         error_message=error_reason
@@ -1834,6 +1900,7 @@ async def resume_analysis_session(
     background_tasks: Optional[BackgroundTasks] = None,
     on_stage: Optional[Callable[[str], Awaitable[None]]] = None,
     recovering: bool = False,
+    response_language: Language | None = None,
 ) -> dict:
     log_section("Clarification Session")
     logger.info(f"[Clarification] Resuming session {session_id} with {len(answers)} user answers")
@@ -1847,6 +1914,9 @@ async def resume_analysis_session(
     if session.status not in allowed_statuses:
         logger.warning(f"[Clarification] Session {session_id} has unexpected status '{session.status}'")
         raise ValueError(f"Session is not waiting for user input (current status: {session.status})")
+
+    if response_language is not None:
+        session.response_language = response_language
 
     tracker = AnalysisCostTracker(session_id=str(session.id))
     if session.cost_steps:

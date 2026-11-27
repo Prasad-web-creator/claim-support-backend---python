@@ -7,6 +7,7 @@ answers, report roll-up) and the session flow: the analysis is held back while
 the user answers, then finished from the stored outcomes without another AI call.
 """
 
+import pytest
 import pytest_asyncio
 
 from tests.conftest import VALID_POLICY_JSON
@@ -17,6 +18,7 @@ from app.models.analysis_session import AnalysisSession
 from app.models.policy import Policy
 from app.models.prescription import Prescription
 from app.services.coverage.report_generator import generate_report
+from app.services.coverage.policy_clause_search import _clean_result, attach_policy_clauses
 from app.services.coverage.verification import (
     NEEDS_VERIFICATION,
     apply_consistency_checks,
@@ -314,6 +316,66 @@ async def test_manual_prescription_is_asked_the_decisive_question(flow):
     assert session.status == "waiting_for_user"
     assert session.pending_analysis["questionIds"] == ["verify_refractive_error"]
     assert await AnalysisReport.find(AnalysisReport.user_id == USER).count() == 0
+
+
+@pytest.mark.parametrize(("cutoff", "choice", "expected"), [
+    ("7.5", "Less than {cutoff} dioptres", "Not Covered"),
+    ("8.5", "{cutoff} dioptres or more", "Covered"),
+    ("8.5", "Don't know", NEEDS_VERIFICATION),
+])
+async def test_clause_search_question_and_outcomes_survive_resume(flow, cutoff, choice, expected):
+    quote = REFRACTIVE_CLAUSE["quote"].replace("7.5", cutoff)
+    question = lasik_question()
+    question["options"] = [option.replace("7.5", cutoff) for option in question["options"]]
+    for outcome in question["outcomes"]:
+        for field in ("option", "coverageStatusReason"):
+            outcome[field] = outcome[field].replace("7.5", cutoff)
+    reason = f"Eye power is missing. The policy excludes LASIK below {cutoff} dioptres and covers it from {cutoff} dioptres."
+    items = _clean_result({"items": [{
+        "item": "lasik surgery", "decision": NEEDS_VERIFICATION, "reason": reason,
+        "decisiveQuestion": question, "clauses": [dict(REFRACTIVE_CLAUSE, quote=quote)],
+    }]}, quote)
+    flow["result"]["analysis"]["comparison"] = attach_policy_clauses(
+        [{"item": "lasik surgery", "coverageStatus": "Covered"}], items,
+    )
+    flow["result"]["analysis"]["coveredTreatments"] = ["lasik surgery"]
+    started = await flow["start"]()
+    assert started["status"] == "needs_clarification"
+    [asked] = started["questions"]
+    assert asked["optionStatuses"] == {
+        f"Less than {cutoff} dioptres": "Not Covered",
+        f"{cutoff} dioptres or more": "Covered",
+        "Don't know": NEEDS_VERIFICATION,
+    }
+    session = await AnalysisSession.get(started["sessionId"])
+    assert session.questions[0].optionStatuses == asked["optionStatuses"]
+
+    result = await aio.resume_analysis_session(
+        session_id=started["sessionId"], user_id=USER,
+        answers={asked["id"]: choice.format(cutoff=cutoff)},
+    )
+    assert flow["calls"] == 1
+    assert result["overallStatus"] == expected
+    assert f"{int(expected == 'Covered')} items are covered" in result["summary"]
+    if expected == NEEDS_VERIFICATION:
+        assert reason in result["comparison"][0]["verificationCondition"]
+
+
+def test_report_recovers_from_wrong_example_cutoff_using_the_verified_quote():
+    clause = dict(
+        REFRACTIVE_CLAUSE,
+        quote=REFRACTIVE_CLAUSE["quote"].replace("less than 7.5", "up to 8.5"),
+    )
+    [card] = _report([lasik_item(policyClauses=[clause])])["comparison"]
+    [question] = pending_decisive_questions([card])
+    assert question["options"] == ["8.5 dioptres or less", "More than 8.5 dioptres", "Don't know"]
+    assert "7.5" not in card["coverageStatusReason"]
+    assert "8.5" in card["verificationCondition"]
+    resolved, unresolved = apply_decisive_answers([card], {question["id"]: "8.5 dioptres or less"})
+    assert resolved[0]["coverageStatus"] == "Not Covered"
+    assert not unresolved
+    _, unresolved = apply_decisive_answers([card], {question["id"]: "More than 8.5 dioptres"})
+    assert unresolved == [question["id"]]
 
 
 def _accident_and_admission_item():

@@ -53,12 +53,26 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
+def _error_code(status: int) -> str:
+    return {
+        400: "INVALID_REQUEST",
+        401: "AUTHENTICATION_REQUIRED",
+        403: "FORBIDDEN",
+        404: "NOT_FOUND",
+        409: "CONFLICT",
+        413: "FILE_SIZE_EXCEEDED",
+        415: "UNSUPPORTED_FILE_FORMAT",
+        422: "INVALID_REQUEST",
+        429: "TOO_MANY_REQUESTS",
+    }.get(status, "INTERNAL_ERROR" if status >= 500 else "REQUEST_FAILED")
+
+
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
     """Handle AppError exceptions with structured JSON responses."""
     logger.warning("[AppError] {}", exc.status_code)
     return JSONResponse(
         status_code=exc.status_code,
-        content={"success": False, "message": exc.message},
+        content={"success": False, "message": exc.message, "errorCode": _error_code(exc.status_code)},
     )
 
 
@@ -67,7 +81,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
     logger.warning("[HTTPException] {}", exc.status_code)
     return JSONResponse(
         status_code=exc.status_code,
-        content={"success": False, "message": str(exc.detail)},
+        content={"success": False, "message": str(exc.detail), "errorCode": _error_code(exc.status_code)},
     )
 
 
@@ -83,7 +97,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     logger.warning("[ValidationError] Request rejected")
     return JSONResponse(
         status_code=422,
-        content={"success": False, "message": error_summary, "errors": errors},
+        content={"success": False, "message": error_summary, "errors": errors, "errorCode": "INVALID_REQUEST"},
     )
 
 
@@ -93,5 +107,5 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
     record_failure("backend_exception", exc)
     return JSONResponse(
         status_code=500,
-        content={"success": False, "message": "Internal Server Error"},
+        content={"success": False, "message": "Internal Server Error", "errorCode": "INTERNAL_ERROR"},
     )

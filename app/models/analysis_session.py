@@ -5,6 +5,7 @@ from pydantic import Field, BaseModel, field_validator
 
 
 from app.core.sanitize import sanitize_nulls as _sanitize_nulls
+from app.core.language import Language
 
 
 class ClarificationQuestion(BaseModel):
@@ -16,6 +17,12 @@ class ClarificationQuestion(BaseModel):
     required: bool = True
     options: Optional[List[str]] = Field(default_factory=list)
     reason: str = ""
+    displayOptions: Optional[dict[str, str]] = None
+    optionStatuses: Optional[dict[str, str]] = None
+    responseLanguage: Optional[Language] = None
+    canonicalQuestion: Optional[str] = None
+    questionTranslationMissing: bool = False
+    untranslatedOptions: list[str] = Field(default_factory=list)
     # Date questions only (YYYY-MM-DD): where the calendar opens and the dates it allows.
     initialDate: Optional[str] = None
     minDate: Optional[str] = None
@@ -39,6 +46,7 @@ class AnalysisSession(Document):
     # Empty string for every classic single-policy session (including historical ones).
     parent_session_id: Optional[str] = Field(default="", alias="parentSessionId")
     durable_job: bool = Field(default=False, alias="durableJob")
+    response_language: Language = Field(default="en", alias="responseLanguage")
 
     status: str = Field(default="created") # created | extracting_documents | analyzing | waiting_for_user | reanalyzing | completed | failed | manual_review_required | cancelled | expired
     

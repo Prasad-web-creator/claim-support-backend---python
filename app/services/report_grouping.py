@@ -64,12 +64,13 @@ def _clean(value) -> str:
     return text
 
 
-def _prescription_summary(prescription_json: Optional[dict]) -> dict:
+def _prescription_summary(prescription_json: Optional[dict], diagnoses: Optional[dict] = None) -> dict:
     rx = prescription_json or {}
     return {
         "diagnosis": _clean(rx.get("diagnosis")),
         "patientName": _clean(rx.get("patientName") or rx.get("patient")),
         "visitDate": _clean(rx.get("visitDate") or rx.get("consultationDate")),
+        **({"localizedDiagnoses": diagnoses} if diagnoses else {}),
     }
 
 
@@ -96,6 +97,7 @@ def _policy_row_from_report(report: AnalysisReport) -> dict:
         "policyEndDate": _clean(policy_json.get("policyEndDate") or policy_json.get("endDate") or policy_json.get("effectiveTo")),
         "status": report.status or "completed",
         "overallStatus": report.overall_status or "",
+        "responseLanguage": report.response_language,
         "outcome": classify_outcome(report.status or "completed", report.overall_status or ""),
         "decisionType": report.decision_type or "",
         "dominanceScore": report.dominance_score or 0.0,
@@ -134,6 +136,7 @@ def _policy_row_from_entry(entry, report: Optional[AnalysisReport]) -> dict:
         "policyEndDate": _clean(policy_json.get("policyEndDate") or policy_json.get("endDate") or policy_json.get("effectiveTo")),
         "status": entry.status,
         "overallStatus": entry.overall_status or "",
+        "responseLanguage": report.response_language if report else entry.response_language,
         "outcome": classify_outcome(entry.status, entry.overall_status or ""),
         "decisionType": entry.decision_type or "",
         "dominanceScore": entry.dominance_score or 0.0,
@@ -155,12 +158,15 @@ def _single_group(report: AnalysisReport) -> dict:
     """A classic single-policy analysis, rendered as a group of one."""
     row = _policy_row_from_report(report)
     created = _created_at(report)
+    localized = report.localized_prescription.get("diagnosis")
     return {
         "groupId": str(report.id),
         "groupType": "single",
         "sessionId": report.session_id or "",
         "prescriptionId": report.prescription_id or "",
-        "prescription": _prescription_summary(report.prescription_json),
+        "prescription": _prescription_summary(
+            report.prescription_json, {report.response_language: localized} if localized else None,
+        ),
         "status": report.status or "completed",
         "policyCount": 1,
         "completedCount": 1 if report.status in ("completed", "manual_review_required") else 0,
@@ -187,6 +193,11 @@ def _multi_group(session: MultiPolicyAnalysisSession, reports_by_id: dict) -> di
         if e.status in ("completed", "manual_review_required")
     )
     created = _created_at(session)
+    diagnoses = {}
+    for report_id in report_ids:
+        report = reports_by_id[report_id]
+        if diagnosis := report.localized_prescription.get("diagnosis"):
+            diagnoses.setdefault(report.response_language, diagnosis)
 
     return {
         "groupId": str(session.id),
@@ -194,7 +205,7 @@ def _multi_group(session: MultiPolicyAnalysisSession, reports_by_id: dict) -> di
         "isDurableJob": session.durable_job,
         "sessionId": str(session.id),
         "prescriptionId": session.prescription_id or "",
-        "prescription": _prescription_summary(session.prescription_json),
+        "prescription": _prescription_summary(session.prescription_json, diagnoses),
         "status": session.status,
         "policyCount": len(session.policy_analyses),
         "completedCount": completed,

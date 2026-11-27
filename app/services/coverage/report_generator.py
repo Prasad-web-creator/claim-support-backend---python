@@ -1,6 +1,7 @@
 from datetime import datetime
 from app.services.coverage.policy_continuity import evaluate_policy_continuity, declared_policy_continuity
 from app.services.coverage.verification import NEEDS_VERIFICATION, apply_consistency_checks
+from app.services.coverage.presentation_language import ADMISSION_NOTE
 
 
 def _is_meaningful(val) -> bool:
@@ -45,6 +46,9 @@ def build_major_terms(comparison: list[dict], blockers: list[str]) -> list[dict]
                 "explanation": cl.get("explanation") or "",
                 "items": [card.get("item")],
             }
+            for field in ("localizedText", "localizedSection", "localizedExplanation"):
+                if cl.get(field):
+                    term[field] = cl[field]
             by_quote[key] = term
             terms.append(term)
     if terms or not not_covered:
@@ -373,6 +377,10 @@ def generate_report(
         "manualText": prescription_json.get("manualText")
     }
 
+    verification_items = [
+        c for c in comparison
+        if c["coverageStatus"] == NEEDS_VERIFICATION or c.get("verificationResolved")
+    ]
     if is_blocked and not is_doc_invalid:
         matched_items = []
         excluded_items = [c["item"] for c in comparison] if comparison else (coverage_analysis.get("excludedTreatments", []) + coverage_analysis.get("coveredTreatments", []))
@@ -388,28 +396,32 @@ def generate_report(
                 f"Claim Assessment: Not Covered (0% Coverage). "
                 f"The claim is not covered under the terms and conditions of this policy."
             )
-    else:
-        matched_items = coverage_analysis.get("coveredTreatments", [c["item"] for c in comparison if c.get("isCovered")]) if not is_doc_invalid else []
-        excluded_items = coverage_analysis.get("excludedTreatments", [
+    elif not is_doc_invalid:
+        matched_items = [c["item"] for c in comparison if c.get("isCovered")]
+        excluded_items = [
             c["item"] for c in comparison
             if not c.get("isCovered") and c.get("coverageStatus") != NEEDS_VERIFICATION
-        ]) if not is_doc_invalid else []
+        ]
+        if not verification_items:
+            matched_items = coverage_analysis.get("coveredTreatments", matched_items)
+            excluded_items = coverage_analysis.get("excludedTreatments", excluded_items)
 
-        if not is_doc_invalid:
-            patient_clause = f"Patient {p_name}" if p_name else "Member"
-            diag_clause = f"diagnosed with {extracted_diag}" if extracted_diag else "requesting medical coverage"
-            verify_clause = (
-                f" {needs_verification_count} item{'s' if needs_verification_count != 1 else ''} need verification before coverage can be confirmed."
-                if needs_verification_count else ""
-            )
-
-            summary_text = (
-                f"Analysis complete with status: {overall_status}. "
-                f"{patient_clause} {diag_clause}. "
-                f"{len(matched_items)} items are covered, while {len(excluded_items)} items are not covered or excluded."
-                f"{verify_clause} "
-                f"Dominance Score: {dominance_score}."
-            )
+        patient_clause = f"Patient {p_name}" if p_name else "Member"
+        diag_clause = f"diagnosed with {extracted_diag}" if extracted_diag else "requesting medical coverage"
+        verify_clause = (
+            f" {needs_verification_count} item{'s' if needs_verification_count != 1 else ''} need verification before coverage can be confirmed."
+            if needs_verification_count else ""
+        )
+        summary_text = (
+            f"Analysis complete with status: {overall_status}. "
+            f"{patient_clause} {diag_clause}. "
+            f"{len(matched_items)} items are covered, while {len(excluded_items)} items are not covered or excluded."
+            f"{verify_clause} "
+            f"Dominance Score: {dominance_score}."
+        )
+    else:
+        matched_items = []
+        excluded_items = []
 
     recommendations = coverage_analysis.get("recommendation", "")
     if coverage_analysis.get("nextSteps") and isinstance(coverage_analysis["nextSteps"], list):
@@ -463,12 +475,20 @@ def generate_report(
         if b not in combined_blocked:
             combined_blocked.append(b)
 
-    final_summary = summary_text if (is_doc_invalid or is_blocked) else coverage_analysis.get("summary", summary_text)
+    if verification_items and not (is_doc_invalid or is_blocked):
+        details = [
+            f"{c['item']}: {c.get('verificationCondition') or c['coverageStatusReason']}"
+            if c["coverageStatus"] == NEEDS_VERIFICATION
+            else f"{c['item']}: {c['coverageStatusReason']}"
+            for c in verification_items
+        ]
+        summary_text = f"{summary_text}\n\n" + "\n".join(details)
+    final_summary = (
+        summary_text if (is_doc_invalid or is_blocked or verification_items)
+        else coverage_analysis.get("summary", summary_text)
+    )
     if prescription_json.get("admissionAssumed") and not is_doc_invalid:
-        admission_note = (
-            "This result assumes you are admitted to hospital (in-patient or day care). "
-            "An out-patient consultation alone is not covered under this policy."
-        )
+        admission_note = ADMISSION_NOTE
         final_summary = f"{final_summary} {admission_note}".strip()
         summary_text = f"{summary_text} {admission_note}".strip()
 

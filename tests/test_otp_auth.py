@@ -43,9 +43,9 @@ async def client(monkeypatch):
 
     real_deliver = otp_service._deliver
 
-    async def offline_delivery(target, code):
+    async def offline_delivery(target, code, language="en"):
         if settings.EMAIL_OTP_PROVIDER != "disabled":
-            await real_deliver(target, code)
+            await real_deliver(target, code, language)
 
     monkeypatch.setattr(otp_service, "_generate_code", lambda: "482913")
     monkeypatch.setattr(otp_service, "_deliver", offline_delivery)
@@ -159,6 +159,25 @@ async def _login_via(client, otp="482913", email=EMAIL):
 
 def _auth(token):
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.asyncio
+async def test_language_only_profile_update_is_persisted_across_login(client):
+    registered = await _register_via(client)
+    assert registered.status_code == 201
+    first = registered.json()
+    assert first["user"]["preferredLanguage"] == "en"
+    headers = {"Authorization": f"Bearer {first['token']}"}
+    updated = await client.put("/auth/me", json={"preferredLanguage": "ta"}, headers=headers)
+    assert updated.status_code == 200
+    assert updated.json()["preferredLanguage"] == "ta"
+    assert updated.json()["name"] == first["user"]["name"]
+    assert updated.json()["email"] == first["user"]["email"]
+    wrong = await client.put("/auth/me", json={"preferredLanguage": "fr"}, headers=headers)
+    assert wrong.status_code == 422
+    logged_in = await _login_via(client)
+    assert logged_in.status_code == 200
+    assert logged_in.json()["user"]["preferredLanguage"] == "ta"
 
 
 @pytest.mark.asyncio
@@ -386,7 +405,7 @@ async def test_otp_reservation_and_verification_are_atomic(client, monkeypatch):
     assert (await _register_via(client)).status_code == 201
     started, release = asyncio.Event(), asyncio.Event()
 
-    async def hold_delivery(target, code):
+    async def hold_delivery(target, code, language="en"):
         started.set()
         await release.wait()
 

@@ -1,9 +1,16 @@
 import json
 
+from app.core.language import Language
 from app.core.logging import logger
 from app.services.llm.ai_client import extract_json_with_retry
 
 from app.services.coverage.coverage_prompt import COVERAGE_ANALYSIS_SYSTEM_PROMPT
+from app.services.coverage.presentation_language import (
+    MANUAL_REVIEW,
+    attach_clause_translations,
+    capture_item_source,
+    prompt_language,
+)
 from app.services.coverage.verification import NEEDS_VERIFICATION
 
 async def analyze_coverage(
@@ -15,6 +22,7 @@ async def analyze_coverage(
     policy_json: dict = None,
     on_stage=None,
     extra_instruction: str = "",
+    response_language: Language = "en",
 ) -> dict:
     """`on_stage`, when given, is awaited as each real phase of this analysis
     begins, so callers can report progress that matches the work done."""
@@ -59,6 +67,8 @@ async def analyze_coverage(
     clause_search_items = await search_policy_clauses(
         policy_text, prescription_json or {}, policy_json or {}, is_manual_prescription,
         prescription_text=prescription_block if prescription_text else "",
+        clarification_history=clarification_history,
+        response_language=response_language,
     )
 
     # The complete policy wording, so nothing the policy says can be missed.
@@ -198,7 +208,9 @@ CRITICAL ADJUDICATION INSTRUCTIONS:
 5. Co-payment, deductibles, sub-limits and room rent: apply them only as THIS policy states them, including their
    conditions (for example a co-payment that applies only from a stated age at entry).
 6. Do not invent coverage terms or assume benefits not supported by the policy text.
-7. If the policy text is insufficient to decide an item, set "next_action": "manual_review".
+7. If the policy gives a deciding condition and only a user fact is missing, set "next_action": "generate_report"
+   with a Needs Verification comparison item and its decisive question. Use "manual_review" when the policy
+   text itself is insufficient to determine the applicable terms.
 8. In reasons, never call anything "statutory", "permanently excluded by law" or "non-payable" in general terms:
    always state what THIS policy says, quoting its clause.
 9. Report EVERY non-medicine item the PRESCRIPTION documents as its own "comparison" entry: each lab test, scan,
@@ -242,12 +254,13 @@ PREVIOUS CLARIFICATION HISTORY
 """
     if extra_instruction:
         user_prompt += f"\n==================================================\n{extra_instruction}\n"
+    system_prompt = COVERAGE_ANALYSIS_SYSTEM_PROMPT + "\n\n" + prompt_language(response_language)
 
     await _stage("coverage_analysis")
     try:
         # Increase token limit as analysis outputs can be quite large (up to 8000 tokens)
         result = await extract_json_with_retry(
-            system_prompt=COVERAGE_ANALYSIS_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             user_content=user_prompt,
             max_tokens=16384,
             operation_name="Coverage Analysis",
@@ -259,7 +272,7 @@ PREVIOUS CLARIFICATION HISTORY
         if is_manual_prescription and extracted.get("next_action") == "ask_questions":
             logger.info("[AI Analysis] Self-entered check returned questions; requesting the report directly.")
             result = await extract_json_with_retry(
-                system_prompt=COVERAGE_ANALYSIS_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 user_content=user_prompt + (
                     "\n\nSELF-ENTERED CHECK: questions are not allowed. Return next_action \"generate_report\" "
                     "with the full analysis now, evaluated for treatment today."
@@ -303,6 +316,10 @@ PREVIOUS CLARIFICATION HISTORY
                 comparison_from_search(clause_search_items) or _generate_fallback_comparison(prescription_json)
             )
         attach_policy_clauses(analysis_data["comparison"], clause_search_items)
+        attach_clause_translations(analysis_data, response_language)
+        for item in analysis_data["comparison"]:
+            if response_language == "ta" or item.get("localizedPolicyEvidence") or item.get("localizedItem"):
+                capture_item_source(item)
 
         # 2. Status normalization for backward compatibility
         for item in analysis_data.get("comparison", []):
@@ -443,9 +460,9 @@ PREVIOUS CLARIFICATION HISTORY
         return {
             "next_action": "manual_review",
             "confidence": 0,
-            "reason": f"Coverage analysis failed due to an error: {e}",
+            "reason": MANUAL_REVIEW if response_language == "ta" else "Coverage analysis could not be completed.",
             "analysis": {
-                "summary": f"Coverage analysis failed due to an error: {e}",
+                "summary": MANUAL_REVIEW if response_language == "ta" else "Coverage analysis could not be completed.",
                 "comparison": _generate_fallback_comparison(prescription_json, policy_json),
                 "reasoning": "AI analysis service encountered an error.",
                 "documentValidity": {

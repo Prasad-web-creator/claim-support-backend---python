@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr
+from html import escape
 
 import httpx
 from bson import ObjectId
@@ -18,6 +19,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from app.core.config import settings
+from app.core.language import Language
 from app.core.logging import logger
 from app.models.otp import OtpCode
 from app.services.gmail_delivery import GmailCredentials, GmailDelivery
@@ -62,18 +64,18 @@ def _generate_code() -> str:
     return "".join(secrets.choice("0123456789") for _ in range(settings.OTP_LENGTH))
 
 
-async def _deliver(target: str, code: str) -> None:
+async def _deliver(target: str, code: str, language: Language = "en") -> None:
     provider = settings.EMAIL_OTP_PROVIDER
     if provider in ("smtp", "smtp_oauth"):
-        await _send_email(target, code)
+        await _send_email(target, code, language)
     elif provider == "resend":
-        await _send_resend_email(target, code)
+        await _send_resend_email(target, code, language)
     elif provider == "gmail":
         credentials = GmailCredentials(
             settings.GMAIL_CLIENT_ID, settings.GMAIL_CLIENT_SECRET, settings.GMAIL_REFRESH_TOKEN
         )
         async with _http_client(trust_env=False) as client:
-            await _gmail_delivery.send(client, credentials, _email_message(target, code, settings.GMAIL_FROM_ADDRESS))
+            await _gmail_delivery.send(client, credentials, _email_message(target, code, settings.GMAIL_FROM_ADDRESS, language))
     else:
         raise HTTPException(status_code=503, detail="OTP service is not configured.")
 
@@ -124,36 +126,41 @@ async def _smtp_access_token() -> str | None:
         return await _microsoft_tokens.get(settings, client)
 
 
-def _email_message(email: str, code: str, sender: str | None = None) -> EmailMessage:
+def _email_message(email: str, code: str, sender: str | None = None, language: Language = "en") -> EmailMessage:
     app, minutes = settings.SMTP_FROM_NAME, _minutes()
     msg = EmailMessage()
-    msg["Subject"] = (
-        settings.OTP_EMAIL_SUBJECT.replace("{code}", code).replace("{minutes}", str(minutes)).replace("{app}", app)
-    )
+    if language == "ta":
+        msg["Subject"] = f"{app} சரிபார்ப்புக் குறியீடு"
+        intro = f"உங்கள் {app} சரிபார்ப்புக் குறியீடு {code}."
+        code_label = "உங்கள் சரிபார்ப்புக் குறியீடு:"
+        expiry = f"இந்தக் குறியீடு {minutes} நிமிடங்களுக்குச் செல்லும். இதை யாருடனும் பகிர வேண்டாம்."
+        unrequested = "இந்தக் குறியீட்டை நீங்கள் கோரவில்லை என்றால், இந்த மின்னஞ்சலைப் புறக்கணிக்கலாம்."
+    else:
+        msg["Subject"] = settings.OTP_EMAIL_SUBJECT.replace("{code}", code).replace("{minutes}", str(minutes)).replace("{app}", app)
+        intro = f"Your {app} verification code is {code}."
+        code_label = "Your verification code is:"
+        expiry = f"It is valid for {minutes} minutes. Do not share it with anyone."
+        unrequested = "If you did not request this code, you can ignore this email."
     msg["From"] = formataddr((app, sender or settings.SMTP_FROM_EMAIL or settings.SMTP_USERNAME))
     msg["To"] = email
-    msg.set_content(
-        f"Your {app} verification code is {code}.\n\n"
-        f"It is valid for {minutes} minutes. Do not share it with anyone.\n"
-        f"If you did not request this code, you can ignore this email."
-    )
+    msg.set_content(f"{intro}\n\n{expiry}\n{unrequested}")
     msg.add_alternative(
-        f"""<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:auto;color:#111827">
-  <h2 style="color:#2563EB;margin-bottom:4px">{app}</h2>
-  <p>Your verification code is:</p>
+        f"""<div lang="{language}" style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:auto;color:#111827">
+  <h2 style="color:#2563EB;margin-bottom:4px">{escape(app)}</h2>
+  <p>{code_label}</p>
   <p style="font-size:32px;font-weight:bold;letter-spacing:8px;margin:16px 0">{code}</p>
-  <p>It is valid for {minutes} minutes. Do not share it with anyone.</p>
-  <p style="color:#6B7280;font-size:13px">If you did not request this code, you can ignore this email.</p>
+  <p>{expiry}</p>
+  <p style="color:#6B7280;font-size:13px">{unrequested}</p>
 </div>""",
         subtype="html",
     )
     return msg
 
 
-def _send_email_sync(email: str, code: str, token: str | None = None) -> None:
+def _send_email_sync(email: str, code: str, token: str | None = None, language: Language = "en") -> None:
     server = _smtp_connect(token) if token is not None else _smtp_connect()
     try:
-        server.send_message(_email_message(email, code))
+        server.send_message(_email_message(email, code, language=language))
     finally:
         try:
             server.quit()
@@ -161,13 +168,13 @@ def _send_email_sync(email: str, code: str, token: str | None = None) -> None:
             pass
 
 
-async def _send_email(email: str, code: str) -> None:
+async def _send_email(email: str, code: str, language: Language = "en") -> None:
     """Send the OTP email; map SMTP failures to user-facing errors."""
     if settings.EMAIL_OTP_PROVIDER == "smtp" and not (settings.SMTP_USERNAME and settings.SMTP_PASSWORD):
         raise HTTPException(status_code=503, detail="Email OTP service is not configured.")
     try:
         token = await _smtp_access_token()
-        await asyncio.to_thread(_send_email_sync, email, code, token)
+        await asyncio.to_thread(_send_email_sync, email, code, token, language)
     except (MicrosoftTokenError, httpx.HTTPError) as exc:
         detail = str(exc) if isinstance(exc, MicrosoftTokenError) else type(exc).__name__
         logger.warning("Microsoft SMTP token request failed ({})", detail)
@@ -183,10 +190,10 @@ async def _send_email(email: str, code: str) -> None:
         raise HTTPException(status_code=502, detail="Could not send OTP email. Please try again.")
 
 
-async def _send_resend_email(email: str, code: str) -> None:
+async def _send_resend_email(email: str, code: str, language: Language = "en") -> None:
     if not settings.EMAIL_API_KEY or not settings.EMAIL_FROM_ADDRESS:
         raise HTTPException(status_code=503, detail="Email OTP service is not configured.")
-    message = _email_message(email, code, settings.EMAIL_FROM_ADDRESS)
+    message = _email_message(email, code, settings.EMAIL_FROM_ADDRESS, language)
     try:
         async with _http_client() as client:
             response = await client.post(
@@ -220,7 +227,7 @@ def _challenge_id(target: str, purpose: str) -> ObjectId:
     return ObjectId(digest[:12])
 
 
-async def send_otp(target: str, purpose: str) -> OtpSent:
+async def send_otp(target: str, purpose: str, language: Language = "en") -> OtpSent:
     """Reserve a challenge before delivery so overlapping sends cannot bypass the cooldown."""
     now = datetime.now(timezone.utc)
     cooldown = settings.OTP_RESEND_COOLDOWN_SECONDS
@@ -254,7 +261,7 @@ async def send_otp(target: str, purpose: str) -> OtpSent:
         ) from None
 
     try:
-        await _deliver(target, code)
+        await _deliver(target, code, language)
     except (Exception, asyncio.CancelledError):
         if previous is None:
             await collection.delete_one(current)

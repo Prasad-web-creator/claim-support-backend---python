@@ -213,6 +213,8 @@ Rules for the decisive question:
 • Ask for the FACT, in words a patient understands. Options are ranges or
   plain choices that map exactly onto the clause, for example
   "Less than 7.5 dioptres" / "7.5 dioptres or more". Always add "Don't know".
+  Copy the threshold, unit and inclusive or exclusive boundary from the actual
+  policy clause for this item. The numbers in these examples are illustrative.
 • One outcome per option, each a complete final result in the same style as
   any other item (status, reason, evidence, financial status). Each outcome's
   status is one of Covered / Partially Covered / Not Covered, except
@@ -2996,21 +2998,10 @@ MANDATORY QUESTIONNAIRE PER ANALYSIS TYPE (ROUND 1):
         "reason": "Required to verify policy active dates and check waiting periods from policy start date."
       }
    d) Decisive facts for conditional policy clauses (only when needed):
-      When a policy clause makes an item's coverage depend on a fact the document does not state (see the
-      NEEDS VERIFICATION section), add ONE question for that fact to this same "questions" array, with
-      "category": "verification", "type": "single_choice", plain options that map exactly onto the clause,
-      and a final "Don't know" option. At most 3 such questions. Example for LASIK under a
-      "refractive error less than 7.5 dioptres" exclusion:
-      {
-        "id": "verify_refractive_error",
-        "category": "verification",
-        "title": "Eye Power (Refractive Error)",
-        "question": "What is the eye power (refractive error) being corrected, as shown on your eye test report?",
-        "type": "single_choice",
-        "required": true,
-        "options": ["Less than 7.5 dioptres", "7.5 dioptres or more", "Don't know"],
-        "reason": "The policy excludes correction of refractive error less than 7.5 dioptres."
-      }
+      After any general questions above have been answered, return "generate_report". Put each undecided
+      item in analysis.comparison with "Needs Verification", the policy condition, and its decisive
+      question with answer outcomes. The app presents these questions from the comparison items as
+      described in the NEEDS VERIFICATION section.
 
 2. FOR MANUAL / SELF-ENTERED PRESCRIPTIONS: NO QUESTIONS.
    A self-entered prescription is a check made BEFORE treatment: "If I go to hospital for this today, is it covered?".

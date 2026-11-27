@@ -5,6 +5,8 @@ Authentication request/response schemas.
 from typing import Literal, Optional
 from pydantic import BaseModel, EmailStr, Field
 
+from app.core.language import Language
+
 
 PHONE_PATTERN = r"^[6-9]\d{9}$"  # Indian 10-digit mobile number (new registrations)
 
@@ -13,6 +15,7 @@ class SendOtpRequest(BaseModel):
     channel: Literal["email"] = "email"
     purpose: Literal["login", "register"]
     email: EmailStr
+    language: Language = "en"
 
 
 class RegisterRequest(BaseModel):
@@ -59,3 +62,4 @@ class UserResponse(BaseModel):
     phone: Optional[str] = None
     emailVerified: bool = False
     googleLinked: bool = False
+    preferredLanguage: Language = "en"

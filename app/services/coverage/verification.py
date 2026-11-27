@@ -13,7 +13,7 @@ For such an item the coverage analysis returns the status "Needs Verification",
 the condition in plain words, and ONE decisive question with the outcome for
 every answer. This module:
 
-  1. collects those questions so the user is asked once (at most 3 questions),
+  1. collects those questions so the user is asked once,
   2. applies the user's answers using the outcomes returned with the question,
      so no second AI call is needed,
   3. runs consistency checks on every item so a self-contradicting result
@@ -116,12 +116,25 @@ def normalize_decisive_question(dq: Any, item_name: str = "") -> Optional[dict]:
         "reason": str(dq.get("reason") or "").strip()
         or (f"Coverage for {item_name} depends on this detail." if item_name else "Coverage depends on this detail."),
         "outcomes": outcomes,
+        **{
+            field: dq[field] for field in (
+                "localizedTitle", "localizedQuestion", "localizedReason", "displayOptions",
+            ) if field in dq
+        },
     }
 
 
 def client_question(dq: dict) -> dict:
-    """The question as sent to the app (outcomes stay on the server)."""
-    return {k: v for k, v in dq.items() if k != "outcomes"}
+    """Expose the status per answer while keeping the decision details on the server."""
+    statuses = {}
+    for option in dq["options"]:
+        outcome = next((o for o in dq["outcomes"] if o["option"] == option), None)
+        status = (outcome or {}).get("coverageStatus")
+        if is_unknown_answer(option):
+            statuses[option] = NEEDS_VERIFICATION
+        elif status in (*_COVERED_STATUSES, "Not Covered", NEEDS_VERIFICATION):
+            statuses[option] = status
+    return {**{k: v for k, v in dq.items() if k != "outcomes"}, "optionStatuses": statuses}
 
 
 def item_questions(item: dict) -> List[dict]:
@@ -227,17 +240,32 @@ def apply_decisive_answers(comparison: List[dict], answers: Dict[str, Any]) -> T
             continue
 
         status = str((outcome or {}).get("coverageStatus") or "").strip()
-        if not outcome or not status:
+        if status not in (*_COVERED_STATUSES, "Not Covered", NEEDS_VERIFICATION):
             if dq["id"] not in unresolved:
                 unresolved.append(dq["id"])
             updated.append(item)
             continue
 
         item["coverageStatus"] = item["status"] = status
-        item["verificationResolved"] = True
+        item["verificationResolved"] = status != NEEDS_VERIFICATION
+        if item["verificationResolved"]:
+            # A conditionally payable amount cannot carry over into a final decision.
+            item.pop("financialDecision", None)
         for key in ("coverageStatusReason", "policyEvidence", "financialDecision"):
             if str(outcome.get(key) or "").strip():
                 item[key] = outcome[key]
+        if "_localizationSource" in item:
+            # The selected outcome replaces these fields. Its translations
+            # may only accompany those same source values.
+            source = item["_localizationSource"]
+            outcome_source = outcome.get("_localizationSource", {})
+            for key in ("localizedStatusReason", "localizedPolicyEvidence", "localizedFinancialStatus"):
+                item.pop(key, None)
+                source.pop(key, None)
+                if key in outcome_source:
+                    item[key] = outcome[key]
+                    source[key] = outcome_source[key]
+            item["_localizationStatus"] = status.lower()
         if str(outcome.get("coverageStatusReason") or "").strip():
             item["explanation"] = item["reason"] = outcome["coverageStatusReason"]
         updated.append(item)
@@ -290,7 +318,7 @@ def _to_needs_verification(item: dict, clause: Optional[dict]) -> dict:
     section = str((clause or {}).get("section") or item.get("verificationClause") or "").strip()
     condition = str(item.get("verificationCondition") or "").strip()
     if not condition:
-        explanation = str((clause or {}).get("explanation") or "").strip()
+        explanation = str(item.get("policyClauseReason") or (clause or {}).get("explanation") or "").strip()
         condition = (
             f"An exclusion in your policy{f' ({section})' if section else ''} may apply to {name}. "
             f"Coverage depends on whether this exclusion applies to your case."
@@ -305,6 +333,106 @@ def _to_needs_verification(item: dict, clause: Optional[dict]) -> dict:
         item["verificationClause"] = section
     item["coverageStatusReason"] = item["explanation"] = item["reason"] = reason
     item["financialDecision"] = "The payable amount depends on the detail that needs verification."
+    return item
+
+
+_REFRACTIVE_EXCLUSION = re.compile(
+    r"\brefractive error\s+(?:of\s+)?(less than(?: or equal to)?|below|up to|under)\s+"
+    r"(\d+(?:\.\d+)?)\s+(diopt(?:re|er)s?)\b",
+    re.IGNORECASE,
+)
+_DIOPTRE_VALUE = re.compile(r"(\d+(?:\.\d+)?)\s+diopt(?:re|er)s?\b", re.IGNORECASE)
+
+
+def _refractive_range(option: str) -> str:
+    """Normalize common wording for the four sides of a cutoff."""
+    wording = _DIOPTRE_VALUE.sub("cutoff", " ".join(option.lower().split()))
+    ranges = {
+        "less than cutoff": "below",
+        "under cutoff": "below",
+        "below cutoff": "below",
+        "cutoff or less": "at_or_below",
+        "up to cutoff": "at_or_below",
+        "less than or equal to cutoff": "at_or_below",
+        "more than cutoff": "above",
+        "greater than cutoff": "above",
+        "above cutoff": "above",
+        "cutoff or more": "at_or_above",
+        "at least cutoff": "at_or_above",
+        "cutoff or higher": "at_or_above",
+        "greater than or equal to cutoff": "at_or_above",
+    }
+    return ranges.get(wording, "")
+
+
+def _prepare_verification(item: dict) -> dict:
+    """Recover a missing question, or correct a sample cutoff using the policy quote."""
+    clauses = [
+        clause for clause in item.get("policyClauses") or []
+        if isinstance(clause, dict) and clause.get("decisive") is True
+    ]
+    questions = item_questions(item)
+    clause = clauses[0] if clauses else {}
+    if is_needs_verification(item.get("policyClauseDecision")) and len(clauses) == 1 and clause.get("effect") == "Excludes":
+        match = _REFRACTIVE_EXCLUSION.search(str(clause.get("quote") or ""))
+        if match:
+            operator, value, unit = match.groups()
+            bound = f"{value} {unit.lower()}"
+            inclusive = operator.lower() in ("less than or equal to", "up to")
+            excluded = f"{bound} or less" if inclusive else f"Less than {bound}"
+            other = f"More than {bound}" if inclusive else f"{bound} or more"
+            wrong_question = False
+            if len(questions) == 1:
+                question = questions[0]
+                options = question["options"]
+                thresholds = set(_DIOPTRE_VALUE.findall(" ".join([question["question"], *options])))
+                expected_ranges = {"at_or_below", "above"} if inclusive else {"below", "at_or_above"}
+                ranges = {_refractive_range(option) for option in options if not is_unknown_answer(option)}
+                wrong_question = bool(thresholds) and (thresholds != {value} or ranges != expected_ranges)
+            if not questions or wrong_question:
+                condition = (
+                    f"The policy excludes refractive error correction at this eye power: {excluded.lower()}. "
+                    f"At {other.lower()}, coverage depends on the rest of the policy terms."
+                )
+                reason = f"Your eye power (refractive error) is needed to apply this exclusion. {condition}"
+                item.update(
+                    coverageStatusReason=reason,
+                    explanation=reason,
+                    reason=reason,
+                    verificationCondition=condition,
+                    verificationClause=clause.get("section") or "",
+                    decisiveQuestion={
+                        "id": questions[0]["id"] if questions else "verify_refractive_error",
+                        "title": "Eye power",
+                        "question": f"What is the eye power (refractive error) being corrected for {item.get('item') or 'this treatment'}?",
+                        "reason": reason,
+                        "options": [excluded, other],
+                        "outcomes": [{
+                            "option": excluded,
+                            "coverageStatus": "Not Covered",
+                            "coverageStatusReason": f"The policy excludes refractive error correction at this eye power: {excluded.lower()}.",
+                        }],
+                        "localizedTitle": "கண்ணின் ஒளிவிலகல் அளவு",
+                        "localizedQuestion": "சிகிச்சை அளிக்கப்படும் கண்ணின் ஒளிவிலகல் அளவு என்ன?",
+                        "localizedReason": (
+                            f"{value} டையாப்டர்கள்{' அல்லது அதற்குக் குறைவான' if inclusive else ' அளவுக்குக் குறைவான'} "
+                            "ஒளிவிலகல் பிழைக்கான சிகிச்சையை பாலிசி விலக்குகிறது."
+                        ),
+                        "displayOptions": {
+                            excluded: f"{value} டையாப்டர்கள்{' அல்லது அதற்குக் குறைவு' if inclusive else ' அளவுக்குக் குறைவு'}",
+                            other: f"{value} டையாப்டர்கள்{' அளவுக்கு மேல்' if inclusive else ' அல்லது அதற்கு மேல்'}",
+                        },
+                    },
+                )
+                item.pop("decisiveQuestions", None)
+                return item
+    if not item.get("verificationCondition"):
+        question_reason = questions[0]["reason"] if questions else ""
+        item["verificationCondition"] = (
+            item.get("policyClauseReason") or clause.get("explanation") or item.get("coverageStatusReason") or question_reason
+        )
+    if not item.get("verificationClause") and clause.get("section"):
+        item["verificationClause"] = clause["section"]
     return item
 
 
@@ -332,8 +460,12 @@ def apply_consistency_checks(comparison: List[dict]) -> List[dict]:
             clause = _deciding_exclusion(item)
             if clause is not None or is_needs_verification(item.get("policyClauseDecision")):
                 item["consistencyCheck"] = "exclusion_conflict"
-                checked.append(_to_needs_verification(item, clause))
+                checked.append(_prepare_verification(_to_needs_verification(item, clause)))
                 continue
+
+        if is_needs_verification(status):
+            checked.append(_prepare_verification(item))
+            continue
 
         if status == "Covered":
             text = f"{item.get('coverageStatusReason') or ''} {item.get('financialDecision') or ''}"
